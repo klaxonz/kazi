@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-17
+
+### Added
+
+- **Session naming redesign**: `kazi chat [topic]` names the session after the
+  topic (slugified, filesystem-safe, 32-char cap); the banner shows the
+  current session name; `kazi sessions` lists each session's first user
+  message as a scan-friendly topic line.
+- `/new [topic]` — start a fresh named session inside the REPL without
+  restarting the process (`/clear` keeps the session file as before).
+- Fresh session names never clobber an existing file (suffix `-2`, `-3`, ...).
+
+### Fixed
+
+- Exporting to a nested path now creates missing parent directories.
+- `/help` now lists `/new`; tests use `is_none()` clippy-cleanly.
+
 ## [0.4.1] - 2026-10-17
 
 ### Fixed

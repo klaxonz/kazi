@@ -51,7 +51,12 @@ pub struct EngineArgs {
 pub enum Command {
     /// Interactive chat session (the default when no subcommand is given)
     #[command(name = "chat")]
-    Chat(EngineArgs),
+    Chat {
+        /// Topic to name the new session after (slugified; bare = timestamp)
+        topic: Option<String>,
+        #[command(flatten)]
+        args: EngineArgs,
+    },
     /// Run one task, stream progress, print the final answer, exit 0/1/2
     #[command(name = "run")]
     Run {
@@ -99,8 +104,8 @@ pub enum OutputFmt {
 /// Dispatch; returns the process exit code.
 pub async fn execute(cli: Cli) -> anyhow::Result<u8> {
     match cli.command {
-        None => chat(&EngineArgs::default(), cli.config.as_deref()).await,
-        Some(Command::Chat(args)) => chat(&args, cli.config.as_deref()).await,
+        None => chat(&EngineArgs::default(), None, cli.config.as_deref()).await,
+        Some(Command::Chat { topic, args }) => chat(&args, topic, cli.config.as_deref()).await,
         Some(Command::Run { task, args, output }) => {
             run_once(
                 &task,
@@ -118,13 +123,18 @@ pub async fn execute(cli: Cli) -> anyhow::Result<u8> {
     }
 }
 
-async fn chat(args: &EngineArgs, cfg_path: Option<&Path>) -> anyhow::Result<u8> {
+async fn chat(
+    args: &EngineArgs,
+    topic: Option<String>,
+    cfg_path: Option<&Path>,
+) -> anyhow::Result<u8> {
     let (cfg, _) = config::load(cfg_path)?;
     repl::chat_loop(
         cfg,
         args.provider.clone(),
         args.model.clone(),
         args.yolo,
+        topic,
         args.resume.clone(),
     )
     .await
@@ -294,11 +304,10 @@ fn sessions_cmd() -> anyhow::Result<u8> {
         return Ok(0);
     }
     for s in summaries {
+        let topic = s.topic.unwrap_or_else(|| "-".into());
         println!(
-            "{CYAN}{:<24}{RESET} {} messages, saved {}s ago",
-            s.name,
-            s.messages,
-            crate::agent::session::now_secs().saturating_sub(s.saved_at)
+            "{CYAN}{:<24}{RESET} {:>3} msgs  {DIM}{}{RESET}",
+            s.name, s.messages, topic
         );
     }
     Ok(0)
@@ -320,6 +329,9 @@ fn export_cmd(session: &str, out: Option<&Path>) -> anyhow::Result<u8> {
     let target = out
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from(format!("{name}.md")));
+    if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
     std::fs::write(&target, md)?;
     println!("wrote {}", target.display());
     Ok(0)

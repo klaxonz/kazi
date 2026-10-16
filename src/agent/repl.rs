@@ -60,14 +60,15 @@ const HELP: &str = "\
 commands:
   /help               show this help
   /exit | /quit       save session and leave (Ctrl-D also quits)
-  /clear              forget the conversation, keep the system prompt
+  /new [topic]        start a fresh named session (keep the current one)
+  /clear              forget the conversation, keep the session file
   /compact            drop oldest turns under the context budget
   /save [name]        save the session under a name
-  /resume <name>      load a stored session
+  /resume <name>      load a stored session (prefix works)
   /provider <nick>    switch provider (see `kazi providers`)
   /model <name>       override the current provider's model
-  /tools              list built-in tools
-  /status             provider, model, rounds, estimated context";
+  /tools              list built-in tools (+ MCP servers)
+  /status             provider, model, rounds, usage, session";
 
 /// Everything slash-commands may mutate across agent rebuilds.
 pub struct ChatState {
@@ -108,6 +109,11 @@ impl ChatState {
         }
     }
 
+    /// (/new) points future auto-saves at a different session file.
+    pub fn session_name_mut(&mut self) -> &mut String {
+        &mut self.session_name
+    }
+
     async fn rebuild(&self) -> anyhow::Result<LiveAgent> {
         Agent::default_cli(
             &self.cfg,
@@ -146,16 +152,60 @@ impl LiveAgent {
     }
 }
 
+/// Turn a user-supplied topic into a safe file/stem name:
+/// keep letters/digits (incl. CJK), spaces→`-`, drops filesystem-hostile
+/// chars, trims to 32 chars, falls back to `""` when nothing survives.
+pub fn slugify(topic: &str) -> String {
+    let banned = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+    let cleaned: String = topic
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .filter(|c| !banned.contains(c) && !c.is_control())
+        .map(|c| if c == ' ' { '-' } else { c })
+        .collect();
+    let trimmed = cleaned
+        .trim_matches('-')
+        .chars()
+        .take(32)
+        .collect::<String>();
+    trimmed.trim_end_matches(['-', '.', ' ']).to_string()
+}
+
+/// Resolve the session name for a fresh chat: explicit topic slug, or the
+/// timestamp default when the topic has nothing usable.
+fn fresh_session_name(topic: Option<&str>) -> String {
+    let base = match topic.map(slugify).filter(|s| !s.is_empty()) {
+        Some(n) => n,
+        None => return session::default_name(),
+    };
+    // same policy as /new: never clobber an existing session file
+    let mut name = base.clone();
+    let mut n = 2;
+    while session::load(&name).is_ok() {
+        name = format!("{base}-{n}");
+        n += 1;
+    }
+    name
+}
+
 /// Run the interactive loop; returns the process exit code.
 pub async fn chat_loop(
     cfg: Config,
     provider: Option<String>,
     model: Option<String>,
     yolo: bool,
+    topic: Option<String>,
     resume: Option<String>,
 ) -> anyhow::Result<u8> {
-    let session_name = resume.clone().unwrap_or_else(session::default_name);
-    let mut state = ChatState::new(cfg, provider, model, yolo, session_name);
+    // explicit --resume wins; otherwise a fresh named session from the topic
+    let session_name = match resume.as_deref() {
+        Some(name) => session::resolve(name).unwrap_or_else(|| name.to_string()),
+        None => fresh_session_name(topic.as_deref()),
+    };
+    let mut state = ChatState::new(cfg, provider, model, yolo, session_name.clone());
     let mut live = state.rebuild().await?;
 
     if let Some(name) = &resume {
@@ -174,9 +224,10 @@ pub async fn chat_loop(
         }
     }
     println!(
-        "{CYAN}kazi{RESET} v{} — {}\n{DIM}{HELP}{RESET}",
+        "{CYAN}kazi{RESET} v{} — {}{DIM}\nsession: {}{RESET}\n{DIM}{HELP}{RESET}",
         env!("CARGO_PKG_VERSION"),
-        live.describe()
+        live.describe(),
+        state.session_name
     );
 
     let mut rl = rustyline::DefaultEditor::new()?;
@@ -234,6 +285,10 @@ pub async fn chat_loop(
         }
     }
 
+    // empty sessions (no messages) never touch the disk — /save overrides
+    if live.history().msgs_len() == 0 {
+        return Ok(0);
+    }
     let _ = session::save(
         &state.session_name,
         live.history().system.as_deref(),
@@ -278,7 +333,22 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
         ("/exit", _) | ("/quit", _) => return Flow::Exit,
         ("/clear", _) => {
             live.agent.reset();
-            println!("history cleared");
+            println!("history cleared (same session)");
+        }
+        ("/new", topic) => {
+            let mut name = slugify(topic);
+            if name.is_empty() {
+                name = session::default_name();
+            }
+            // colliding stem: attach a suffix rather than clobbering history
+            let mut n = 2;
+            while session::load(&name).is_ok() {
+                name = format!("{name}-{n}");
+                n += 1;
+            }
+            *state.session_name_mut() = name;
+            live.agent.reset();
+            println!("new session -> {}", state.session_name);
         }
         ("/compact", _) => {
             live.agent.compact();
@@ -337,4 +407,36 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
         _ => println!("{YELLOW}unknown command — /help{RESET}"),
     }
     Flow::Continue
+}
+
+#[cfg(test)]
+mod slug_tests {
+    use super::slugify;
+
+    #[test]
+    fn keeps_cjk_and_words_with_dash() {
+        assert_eq!(slugify("修 kproxy 的代理问题"), "修-kproxy-的代理问题");
+        assert_eq!(slugify("fix kproxy proxy"), "fix-kproxy-proxy");
+    }
+
+    #[test]
+    fn strips_filesystem_hostile_chars() {
+        assert_eq!(slugify("fix:kproxy/proxy?*"), "fixkproxyproxy");
+        assert_eq!(slugify("a<b>c\"d"), "abcd");
+        assert_eq!(slugify("x\\y|z"), "xyz");
+    }
+
+    #[test]
+    fn empty_and_junk_topics_fall_back() {
+        assert_eq!(slugify(""), "");
+        assert_eq!(slugify("///:"), "");
+        assert_eq!(slugify(" leading space "), "leading-space");
+    }
+
+    #[test]
+    fn truncates_to_32_chars() {
+        let long = "abcdefgh".repeat(6);
+        assert_eq!(slugify(&long).chars().count(), 32);
+        assert!(!slugify(&long).ends_with('-'));
+    }
 }

@@ -70,17 +70,18 @@ pub fn list() -> Vec<String> {
     list_summaries().into_iter().map(|s| s.name).collect()
 }
 
-/// One row of `kazi sessions`.
+/// One row of `kazi sessions`. `topic` = first user message (a quick scan hint).
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub name: String,
     pub messages: usize,
     pub saved_at: u64,
+    pub topic: Option<String>,
 }
 
 /// Stored sessions newest-first, with message counts and save times.
 pub fn list_summaries() -> Vec<SessionSummary> {
-    let mut out: Vec<(u64, usize, String)> = vec![];
+    let mut out: Vec<(u64, usize, String, Option<String>)> = vec![];
     if let Ok(dir) = sessions_dir() {
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for e in entries.flatten() {
@@ -94,12 +95,17 @@ pub fn list_summaries() -> Vec<SessionSummary> {
                     .unwrap_or(0);
                 if let Some(n) = name {
                     if let Some(stem) = n.strip_suffix(".json") {
-                        let messages = std::fs::File::open(e.path())
+                        let parsed = std::fs::File::open(e.path())
                             .ok()
-                            .and_then(|f| serde_json::from_reader::<_, SessionFile>(f).ok())
-                            .map(|f| f.messages.len())
-                            .unwrap_or(0);
-                        out.push((mtime, messages, stem.to_string()));
+                            .and_then(|f| serde_json::from_reader::<_, SessionFile>(f).ok());
+                        let messages = parsed.as_ref().map(|f| f.messages.len()).unwrap_or(0);
+                        let topic = parsed.as_ref().and_then(|f| {
+                            f.messages
+                                .iter()
+                                .find(|m| m.role == crate::llm::Role::User)
+                                .map(|m| m.text().chars().take(40).collect::<String>())
+                        });
+                        out.push((mtime, messages, stem.to_string(), topic));
                     }
                 }
             }
@@ -107,10 +113,11 @@ pub fn list_summaries() -> Vec<SessionSummary> {
     }
     out.sort_by_key(|e| std::cmp::Reverse(e.0));
     out.into_iter()
-        .map(|(mtime, messages, name)| SessionSummary {
+        .map(|(mtime, messages, name, topic)| SessionSummary {
             name,
             messages,
             saved_at: mtime,
+            topic,
         })
         .collect()
 }
@@ -242,7 +249,7 @@ mod tests {
         // exact wins; unique prefix resolves; ambiguous prefix is None
         assert_eq!(resolve(&a).as_deref(), Some(a.as_str()));
         assert!(
-            !resolve(&format!("{base}-")).is_some(),
+            resolve(&format!("{base}-")).is_none(),
             "two matches → ambiguous"
         );
         assert_eq!(resolve(&format!("{base}-b")).as_deref(), Some(b.as_str()));

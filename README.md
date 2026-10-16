@@ -143,8 +143,10 @@ a single server can answer several calls from one model round at once.
 Saved conversations are visible and exportable:
 
 ```sh
-kazi sessions                 # list: name, message count, saved time
-kazi export chat-abc notes.md # markdown export (roles, tool calls, results)
+kazi chat "fix kproxy delay"  # session named after the topic
+kazi> /new refac-todo         # switch sessions without leaving the REPL
+kazi sessions                 # list: name, message count, first message as topic
+kazi export fix-kproxy-delay notes.md
 ```
 
 `--resume <prefix>` accepts any unambiguous name prefix.
