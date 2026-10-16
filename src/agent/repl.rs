@@ -674,6 +674,14 @@ pub async fn chat_loop(
                     &live.history().msgs,
                 );
             }
+            Err(AgentError::Cancelled) => {
+                println!("\n{DIM}cancelled{RESET}");
+                let _ = session::save(
+                    &state.session_name,
+                    live.history().system.as_deref(),
+                    &live.history().msgs,
+                );
+            }
         }
     }
 

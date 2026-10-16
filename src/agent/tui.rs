@@ -46,6 +46,178 @@ enum LineKind {
     Warn,
 }
 
+/// Single-line editor state: text + a char-indexed caret + recallable history
+/// (↑/↓), with readline-style shortcuts (Ctrl+A/E/U/K/W).
+#[derive(Default)]
+struct Input {
+    text: String,
+    /// caret position in CHARS (not bytes); always <= char count
+    cursor: usize,
+    history: Vec<String>,
+    /// `Some(i)` while browsing history; the live draft is stashed meanwhile.
+    hist_pos: Option<usize>,
+    draft: String,
+}
+
+impl Input {
+    fn byte_of(&self, ci: usize) -> usize {
+        self.text
+            .char_indices()
+            .nth(ci)
+            .map(|(b, _)| b)
+            .unwrap_or(self.text.len())
+    }
+
+    fn chars_len(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    fn insert(&mut self, ch: char) {
+        let b = self.byte_of(self.cursor);
+        self.text.insert(b, ch);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let b = self.byte_of(self.cursor - 1);
+        self.text.remove(b);
+        self.cursor -= 1;
+    }
+
+    fn delete(&mut self) {
+        if self.cursor >= self.chars_len() {
+            return;
+        }
+        let b = self.byte_of(self.cursor);
+        self.text.remove(b);
+    }
+
+    fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn right(&mut self) {
+        if self.cursor < self.chars_len() {
+            self.cursor += 1;
+        }
+    }
+
+    fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn end(&mut self) {
+        self.cursor = self.chars_len();
+    }
+
+    fn kill_to_start(&mut self) {
+        let b = self.byte_of(self.cursor);
+        self.text.drain(..b);
+        self.cursor = 0;
+    }
+
+    fn kill_to_end(&mut self) {
+        let b = self.byte_of(self.cursor);
+        self.text.truncate(b);
+    }
+
+    /// Delete the whitespace-delimited word before the caret.
+    fn delete_word(&mut self) {
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut i = self.cursor.min(chars.len());
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        let (bs, be) = (self.byte_of(i), self.byte_of(self.cursor));
+        self.text.replace_range(bs..be, "");
+        self.cursor = i;
+    }
+
+    /// Trimmed submission; empty input clears without pushing history.
+    fn submit(&mut self) -> Option<String> {
+        let t = self.text.trim().to_string();
+        if !t.is_empty() {
+            self.history.push(t.clone());
+        }
+        self.text.clear();
+        self.cursor = 0;
+        self.hist_pos = None;
+        self.draft.clear();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
+    }
+
+    fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let pos = match self.hist_pos {
+            None => {
+                self.draft = self.text.clone();
+                self.history.len() - 1
+            }
+            Some(0) => return,
+            Some(p) => p - 1,
+        };
+        self.hist_pos = Some(pos);
+        self.text = self.history[pos].clone();
+        self.end();
+    }
+
+    fn history_next(&mut self) {
+        let Some(p) = self.hist_pos else { return };
+        if p + 1 >= self.history.len() {
+            self.hist_pos = None;
+            self.text = std::mem::take(&mut self.draft);
+        } else {
+            self.hist_pos = Some(p + 1);
+            self.text = self.history[p + 1].clone();
+        }
+        self.end();
+    }
+}
+
+/// Horizontal window that keeps the caret visible inside `budget` columns.
+/// Returns the visible slice plus the caret's column offset inside it.
+fn window_for_cursor(text: &str, cursor: usize, budget: usize) -> (String, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor.min(chars.len());
+    if budget == 0 {
+        return (String::new(), 0);
+    }
+    let mut start = 0usize;
+    let mut pre: usize = chars[..cursor]
+        .iter()
+        .map(|&c| UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum();
+    // shift the window right until the caret's prefix fits
+    while start < cursor && pre > budget {
+        pre -= UnicodeWidthChar::width(chars[start]).unwrap_or(0);
+        start += 1;
+    }
+    // extend to the right while columns remain
+    let mut end = cursor;
+    let mut total = pre;
+    while end < chars.len() {
+        let cw = UnicodeWidthChar::width(chars[end]).unwrap_or(0);
+        if total + cw > budget {
+            break;
+        }
+        total += cw;
+        end += 1;
+    }
+    (chars[start..end].iter().collect(), pre)
+}
+
 /// Everything needed to render one screenful.
 struct Screen {
     provider_desc: String,
@@ -53,7 +225,7 @@ struct Screen {
     max_rounds: u32,
     /// (kind, text) transcript lines; scrolling shows the tail.
     lines: Vec<(LineKind, String)>,
-    input: String,
+    input: Input,
     /// Running task stats from the latest events.
     rounds: u32,
     tokens_in: u64,
@@ -74,7 +246,7 @@ impl Screen {
             session_name: session_name.to_string(),
             max_rounds,
             lines: Vec::new(),
-            input: String::new(),
+            input: Input::default(),
             rounds: 0,
             tokens_in: 0,
             tokens_out: 0,
@@ -160,14 +332,9 @@ impl Screen {
 
     /// Submit the current input as a user task.
     fn take_input(&mut self) -> Option<String> {
-        let t = self.input.trim().to_string();
-        self.input.clear();
-        if t.is_empty() {
-            None
-        } else {
-            self.push(LineKind::User, format!("you> {t}"));
-            Some(t)
-        }
+        let t = self.input.submit()?;
+        self.push(LineKind::User, format!("you> {t}"));
+        Some(t)
     }
 
     /// Paint one frame. Height budget: status 1, input 3, transcript = rest.
@@ -236,13 +403,10 @@ impl Screen {
         // -- input box -------------------------------------------------------
         let prompt = if self.busy { " [busy] " } else { " kazi> " };
         let budget = (input.width as usize)
-            .saturating_sub(2)
+            .saturating_sub(1)
             .saturating_sub(UnicodeWidthStr::width(prompt));
-        let shown: String = if UnicodeWidthStr::width(&*self.input) > budget {
-            tail_by_width(&self.input, budget)
-        } else {
-            self.input.clone()
-        };
+        let (shown, caret_in_window) =
+            window_for_cursor(&self.input.text, self.input.cursor, budget);
         let input_text = Line::from(vec![
             Span::styled(prompt, Style::default().fg(CYAN).bold()),
             Span::raw(&shown),
@@ -252,21 +416,11 @@ impl Screen {
             input,
         );
 
-        // cursor: sits right after the typed text. The block has no left
-        // border, so the paragraph starts at `input.x` itself — adding an
-        // extra column here left a visible gap before the caret.
-        f.set_cursor_position(ratatui::layout::Position {
-            x: cursor_col(input.x, input.right(), prompt, &shown),
-            y: input.y + 1,
-        });
+        // caret sits at the window offset (display columns), clamped inside
+        let x = (input.x + UnicodeWidthStr::width(prompt) as u16 + caret_in_window as u16)
+            .min(input.right().saturating_sub(1));
+        f.set_cursor_position(ratatui::layout::Position { x, y: input.y + 1 });
     }
-}
-
-/// Column for the caret: input origin + prompt width + typed width, clamped
-/// one short of the right edge. Pure so it can be regression-tested.
-fn cursor_col(input_x: u16, input_right: u16, prompt: &str, shown: &str) -> u16 {
-    let x = input_x + UnicodeWidthStr::width(prompt) as u16 + UnicodeWidthStr::width(shown) as u16;
-    x.min(input_right.saturating_sub(1))
 }
 
 /// Opt-in key-event tracing to diagnose terminal quirks: set
@@ -350,22 +504,6 @@ fn wrap_text(s: &str, max: usize) -> Vec<String> {
         out.push(cur);
     }
     out
-}
-
-/// Tail of `s` that fits into `max` display columns (for the input box).
-fn tail_by_width(s: &str, max: usize) -> String {
-    let mut picked: Vec<char> = Vec::new();
-    let mut w = 0usize;
-    for ch in s.chars().rev() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if w + cw > max {
-            break;
-        }
-        w += cw;
-        picked.push(ch);
-    }
-    picked.reverse();
-    picked.into_iter().collect()
 }
 
 /// Park-and-run helper: kept for library users who want the simple blocking
@@ -519,6 +657,8 @@ async fn tui_inner(
     // bounded by the answer length, so unbounded is safe here.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Pump>();
     let mut runner: Option<tokio::task::JoinHandle<()>> = None;
+    // Cancellation handle of the in-flight task (Esc mid-run sets it).
+    let mut current_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
 
     // crossterm's async event stream (event-stream feature)
     let mut events = EventStream::new();
@@ -533,13 +673,18 @@ async fn tui_inner(
                 Some(Pump::Done(res)) => {
                     screen.flush_streaming();
                     // agent is already parked back by the runner
-                    if let Err(e) = res {
-                        screen.push(LineKind::Warn, format!("error: {e}"));
+                    match res {
+                        Err(super::AgentError::Cancelled) => {
+                            screen.push(LineKind::Dim, "(cancelled)".to_string());
+                        }
+                        Err(e) => screen.push(LineKind::Warn, format!("error: {e}")),
+                        Ok(_) => {}
                     }
                     screen.busy = false;
                     runner = None;
+                    current_cancel = None;
                 }
-                None => { screen.busy = false; runner = None; }
+                None => { screen.busy = false; runner = None; current_cancel = None; }
             },
 
             // ---- input pump (async EventStream) ----------------------------
@@ -548,8 +693,15 @@ async fn tui_inner(
                     log_key_event(&key);
                     match key.code {
                     KeyCode::Esc => {
-                        screen.quit = true;
-                        if let Some(r) = runner.take() { r.abort(); }
+                        if screen.busy {
+                            // interrupt the running task, keep the session
+                            if let Some(flag) = &current_cancel {
+                                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                screen.push(LineKind::Dim, "(cancelling…)".to_string());
+                            }
+                        } else {
+                            screen.quit = true;
+                        }
                     }
                     KeyCode::Enter if !screen.busy => {
                         if let Some(task) = screen.take_input() {
@@ -557,6 +709,7 @@ async fn tui_inner(
                             // take agent out of the slot for the runner
                             let taken = shared_agent.lock().await.take();
                             if let Some(owned) = taken {
+                                current_cancel = Some(owned.cancel_token());
                                 let slot = shared_agent.clone();
                                 let tx = tx.clone();
                                 runner = Some(tokio::spawn(async move {
@@ -571,16 +724,33 @@ async fn tui_inner(
                             }
                         }
                     }
-                    KeyCode::Backspace => { screen.input.pop(); }
+                    KeyCode::Backspace => screen.input.backspace(),
+                    KeyCode::Delete => screen.input.delete(),
+                    KeyCode::Left => screen.input.left(),
+                    KeyCode::Right => screen.input.right(),
+                    KeyCode::Home => screen.input.home(),
+                    KeyCode::End => screen.input.end(),
+                    KeyCode::Up => screen.input.history_prev(),
+                    KeyCode::Down => screen.input.history_next(),
                     KeyCode::Char(c)
-                        if key.modifiers.contains(ratatui::crossterm::event::KeyModifiers::CONTROL)
-                            && c == 'l' =>
+                        if key
+                            .modifiers
+                            .contains(ratatui::crossterm::event::KeyModifiers::CONTROL) =>
                     {
-                        screen.lines.clear();
+                        match c {
+                            'c' => screen.quit = true,
+                            'l' => screen.lines.clear(),
+                            'a' => screen.input.home(),
+                            'e' => screen.input.end(),
+                            'u' => screen.input.kill_to_start(),
+                            'k' => screen.input.kill_to_end(),
+                            'w' => screen.input.delete_word(),
+                            _ => {}
+                        }
                     }
                     code => {
                         if let Some(ch) = accepted_char(&code, key.modifiers) {
-                            screen.input.push(ch);
+                            screen.input.insert(ch);
                         }
                     }
                     }
@@ -604,6 +774,15 @@ async fn tui_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Input pre-filled with `s`, caret at the end.
+    fn input_with(s: &str) -> Input {
+        Input {
+            text: s.to_string(),
+            cursor: s.chars().count(),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn wrap_breaks_long_words_and_joins_short() {
@@ -651,12 +830,114 @@ mod tests {
     #[test]
     fn take_input_trims_and_clears() {
         let mut s = Screen::new("p", "sess", 30);
-        s.input = "  hello  ".into();
+        s.input.text = "  hello  ".into();
+        s.input.end();
         let task = s.take_input().unwrap();
         assert_eq!(task, "hello");
-        assert!(s.input.is_empty());
+        assert!(s.input.text.is_empty());
+        assert_eq!(s.input.cursor, 0);
         assert!(s.lines.last().unwrap().1.contains("you> hello"));
         assert!(s.take_input().is_none(), "empty input = no task");
+    }
+
+    #[test]
+    fn input_editing_moves_the_caret_and_edits_mid_text() {
+        let mut i = Input::default();
+        for c in "hello".chars() {
+            i.insert(c);
+        }
+        i.left();
+        i.left();
+        i.insert('X'); // "helXlo"
+        assert_eq!(i.text, "helXlo");
+        assert_eq!(i.cursor, 4);
+        i.backspace(); // "hello"
+        assert_eq!(i.text, "hello");
+        i.home();
+        i.delete(); // "ello"
+        assert_eq!(i.text, "ello");
+        i.end();
+        i.insert('!');
+        assert_eq!(i.text, "ello!");
+        i.left();
+        i.kill_to_end(); // drops "!"
+        assert_eq!(i.text, "ello");
+        i.kill_to_start();
+        assert_eq!(i.text, "");
+    }
+
+    #[test]
+    fn input_cjk_caret_is_char_indexed() {
+        let mut i = Input::default();
+        for c in "你好".chars() {
+            i.insert(c);
+        }
+        i.left();
+        i.backspace(); // deletes 你 → "好"
+        assert_eq!(i.text, "好");
+        assert_eq!(i.cursor, 0);
+        i.insert('a'); // "a好"
+        assert_eq!(i.text, "a好");
+    }
+
+    #[test]
+    fn input_delete_word_stops_at_whitespace() {
+        let mut i = Input::default();
+        for c in "cargo test --lib".chars() {
+            i.insert(c);
+        }
+        i.delete_word(); // drop "--lib"
+        assert_eq!(i.text, "cargo test ");
+        i.delete_word(); // drop "test" + trailing space
+        assert_eq!(i.text, "cargo ");
+    }
+
+    #[test]
+    fn input_history_recall_roundtrip() {
+        let mut i = input_with("first");
+        i.submit();
+        i.text = "second".into();
+        i.end();
+        i.submit();
+
+        i.history_prev();
+        assert_eq!(i.text, "second");
+        i.history_prev();
+        assert_eq!(i.text, "first");
+        i.history_prev(); // already oldest: stays
+        assert_eq!(i.text, "first");
+        i.history_next();
+        assert_eq!(i.text, "second");
+        i.history_next(); // back to the (empty) live draft
+        assert_eq!(i.text, "");
+    }
+
+    #[test]
+    fn input_draft_survives_history_browsing() {
+        let mut i = input_with("old");
+        i.submit();
+        i.text = "half-typed".into();
+        i.end();
+        i.history_prev();
+        assert_eq!(i.text, "old");
+        i.history_next();
+        assert_eq!(i.text, "half-typed", "draft restored after browsing");
+    }
+
+    #[test]
+    fn window_keeps_caret_visible() {
+        // caret at the end of a long line: window shows the tail
+        let (win, caret) = window_for_cursor("abcdefghij", 10, 4);
+        assert_eq!(win, "ghij");
+        assert_eq!(caret, 4);
+        // caret in the middle: window recentred to include it
+        let (win, caret) = window_for_cursor("你好世界你好世界", 4, 6);
+        assert!(UnicodeWidthStr::width(win.as_str()) <= 6);
+        assert!(caret <= 6);
+        // whole string when it fits
+        let (win, caret) = window_for_cursor("hi", 1, 10);
+        assert_eq!(win, "hi");
+        assert_eq!(caret, 1);
     }
 
     /// The TUI runner's event callback runs synchronously inside a runtime
@@ -689,22 +970,6 @@ mod tests {
             "width overflow: {lines:?}"
         );
         assert_eq!(lines.join(""), text, "wrapping must not lose characters");
-    }
-
-    #[test]
-    fn tail_by_width_counts_cjk_as_two() {
-        // "路径abc" = 2+2+1+1+1 columns; keep the last 5: "径abc"
-        assert_eq!(tail_by_width("路径abc", 5), "径abc");
-        assert_eq!(tail_by_width("ab", 5), "ab");
-        assert_eq!(tail_by_width("中文", 1), "");
-    }
-
-    #[test]
-    fn cursor_sits_right_after_text() {
-        // " kazi> " = 7 columns, "你好" = 4 → caret column 11
-        assert_eq!(cursor_col(0, 80, " kazi> ", "你好"), 11);
-        // clamps one short of the right edge
-        assert_eq!(cursor_col(70, 80, " kazi> ", "12345"), 79);
     }
 
     #[test]

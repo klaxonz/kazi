@@ -18,6 +18,7 @@ pub mod repl;
 pub mod session;
 pub mod tui;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -71,6 +72,9 @@ pub enum AgentError {
         "reached the {0}-round budget without a final answer — narrow the task, or raise agent.max_rounds in config"
     )]
     RoundsExceeded(u32),
+    /// Stopped on request (Esc in the TUI / cancel token). History is kept.
+    #[error("task cancelled")]
+    Cancelled,
 }
 
 /// What the UI wants to know while a task runs.
@@ -113,6 +117,10 @@ pub struct Agent {
     max_parallel_tools: usize,
     /// Token usage of the CURRENT task (reset at run_task start).
     usage: Usage,
+    /// Set by any UI to interrupt a running task; checked between rounds and
+    /// while streaming (the in-flight provider response is dropped, the
+    /// agent and its history survive).
+    cancel: Arc<AtomicBool>,
 }
 
 impl Agent {
@@ -156,7 +164,22 @@ impl Agent {
             max_context_tokens,
             max_parallel_tools: max_parallel_tools.max(1),
             usage: Usage::default(),
+            cancel: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Handle for interrupting a running task (Esc in the TUI).
+    pub fn cancel_token(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+
+    /// Clear the flag; call before starting a new task.
+    pub fn clear_cancel(&self) {
+        self.cancel.store(false, Ordering::Relaxed);
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
     }
 
     pub fn provider(&self) -> &Arc<dyn Provider> {
@@ -318,8 +341,12 @@ impl Agent {
     ) -> Result<String, AgentError> {
         self.history.push(Message::user(task.to_string()));
         self.usage = Usage::default();
+        self.clear_cancel();
 
         for round in 0..self.max_rounds {
+            if self.cancelled() {
+                return Err(AgentError::Cancelled);
+            }
             let req = LlmRequest {
                 messages: self.history.messages(),
                 tools: self.registry.specs(),
@@ -440,6 +467,13 @@ impl Agent {
                     _ => closed = true,
                 },
                 r = &mut fut => break r?,
+                // cancellation: poll the flag twice a second while streaming;
+                // dropping `fut` cancels the in-flight HTTP response
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                    if self.cancelled() {
+                        return Err(AgentError::Cancelled);
+                    }
+                }
             }
             if closed {
                 // Sender vanished with the future still pending: stop waiting
@@ -1009,6 +1043,40 @@ mod tests {
         assert_eq!(ran.tool_call_id.as_deref(), Some("c-b"));
         assert!(!ran.is_error, "read_file must still have run");
         assert!(ran.text().contains("first line"));
+    }
+
+    #[tokio::test]
+    async fn cancel_token_stops_the_task_between_rounds() {
+        let script = vec![
+            LlmResponse {
+                tool_calls: vec![ToolCall {
+                    id: "a".into(),
+                    name: "list_dir".into(),
+                    arguments: json!({}),
+                }],
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some("should never be reached".into()),
+                ..Default::default()
+            },
+        ];
+        let mut a = agent_with(script);
+        let flag = a.cancel_token();
+        let out = a
+            .run_task("work then cancel", move |ev| {
+                if matches!(ev, AgentEvent::ToolStart { .. }) {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            })
+            .await;
+        assert!(matches!(out.unwrap_err(), AgentError::Cancelled));
+        // the conversation is preserved (user + assistant-with-calls + tool)
+        assert!(a
+            .history
+            .messages()
+            .iter()
+            .any(|m| m.role == crate::llm::Role::User));
     }
 
     #[tokio::test]
