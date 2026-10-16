@@ -139,6 +139,18 @@ pub fn resolve(name: &str) -> Option<String> {
     }
 }
 
+/// Delete a stored session file. Resolves prefixes like [`resolve`].
+/// `Ok(Some(dirty))` = deleted, `Ok(None)`: ambiguous, `Err`: not found.
+pub fn delete(name: &str) -> Result<Option<String>, SessionError> {
+    let dir = sessions_dir()?;
+    let resolved = resolve(name).ok_or_else(|| SessionError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("no session matches `{name}` (or the prefix is ambiguous)"),
+    )))?;
+    std::fs::remove_file(dir.join(format!("{resolved}.json")))?;
+    Ok(Some(resolved))
+}
+
 /// Render a saved session as readable markdown:
 /// `## user` / `## assistant` (with tool calls as a bullet list) / blockquote
 /// tool results, tied to the *tool name* via the assistant call above them.
@@ -257,8 +269,14 @@ mod tests {
         let summaries = list_summaries();
         assert!(summaries.iter().any(|s| s.name == a));
 
+        // delete: ambiguous prefix errors, then unique prefix deletes
+        assert!(delete(&format!("{base}-")).is_err(), "ambiguous prefix");
+        let deleted = delete(&format!("{base}-b")).unwrap().unwrap();
+        assert_eq!(deleted, b);
+        assert!(load(&b).is_err(), "file must be gone");
+        assert!(delete(&b).is_err(), "already deleted → missing name");
+
         std::fs::remove_file(sessions_dir().unwrap().join(format!("{a}.json"))).unwrap();
-        std::fs::remove_file(sessions_dir().unwrap().join(format!("{b}.json"))).unwrap();
     }
 
     #[test]

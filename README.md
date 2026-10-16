@@ -61,7 +61,7 @@ allow_commands = ["cargo build", "cargo test", "git status"]  # auto-approved
 ## Use
 
 Interactive REPL (streaming, `/compact`, `/model`, `/resume`, TAB completion
-on slash commands):
+on slash commands, multiline tasks with trailing `\`):
 
 ```sh
 kazi chat

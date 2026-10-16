@@ -10,6 +10,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Auto-compact**: when history reaches 80% of `agent.max_context_tokens`
+  mid-task, older completed rounds are summarized into the system prompt
+  automatically before the next provider call (manual `/compact` unchanged).
+  Round-boundary slicing keeps the newest round intact; summarizer failure
+  falls back to plain trimming. New events `auto_compact_started` /
+  `auto_compact_done`; the REPL renders `>> auto-compact`.
+- **Multiline input**: a trailing `\` joins the next line (shell style, with
+  a `kazi…` continuation prompt); Ctrl-C aborts the whole entry. History
+  recalls the joined logical line.
+- **`/model` validated before switching**: one minimal probe round against
+  the rebuilt provider; a rejected model name keeps the current agent and
+  its context instead of failing on the next real call.
+
+### Added
+
+- **`kazi rm <prefix>`**: delete a stored session (prefix-resolved like
+  `--resume`).
+
+## [0.7.0] - 2026-10-16
+
+### Changed
+
 - **Slash-command redesign** (REPL):
   - Table-driven commands: one `COMMANDS` table now feeds `/help`, TAB
     completion, ghost-text argument hints, usage errors, and the startup

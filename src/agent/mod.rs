@@ -80,12 +80,17 @@ pub enum AgentEvent {
     TextDelta { text: String },
     /// A tool call is starting.
     ToolStart { name: String },
-    /// A tool call finished: error flag + one-line preview of its output.
+    /// Tool call finished: error flag + one-line preview of its output.
     ToolEnd {
         name: String,
         is_error: bool,
         preview: String,
     },
+    /// Auto-compact kicking in between rounds (proactive, at 80% budget).
+    AutoCompactStarted,
+    /// Auto-compact finished: `note` describes what happened, `est_tokens`
+    /// is the post-compaction context estimate.
+    AutoCompactDone { note: String, est_tokens: u64 },
 }
 
 pub struct Agent {
@@ -212,13 +217,27 @@ impl Agent {
         self.history.reset_msgs();
     }
 
+    /// Minimal provider reachability/model-validity probe: one non-streaming
+    /// round with a trivial prompt and no tools. Used by `/model` (and any
+    /// embedder) to verify a model name BEFORE switching, since an invalid
+    /// name otherwise surfaces only on the next real call. Never touches
+    /// history or usage.
+    pub async fn probe(&mut self) -> Result<(), AgentError> {
+        let req = LlmRequest {
+            messages: vec![Message::user("ping")],
+            tools: vec![],
+        };
+        self.provider.complete(req).await?;
+        Ok(())
+    }
+
     /// Manual compaction (`/compact`): pull overshooting turns OUT of the
     /// history, ask the provider to compress them into a short summary, and
     /// splice the summary into the system prompt. Plain trimming remains the
     /// fallback when the summarizer call fails — compaction never loses the
     /// latest turn either way.
     pub async fn compact(&mut self) -> Result<String, AgentError> {
-        let Some(dropped) = self.history.take_overshoot_text(self.max_context_tokens) else {
+        let Some(dropped) = self.history.take_beyond_text(self.max_context_tokens) else {
             return Ok("nothing to compact — context is already under budget".into());
         };
         match self.summarize_dropped(&dropped).await {
@@ -228,6 +247,47 @@ impl Agent {
             }
             _ => Ok("compacted: dropped turns without summary (summarizer unavailable)".into()),
         }
+    }
+
+    /// Auto-compact trigger point: at this share of the token budget the next
+    /// round preemptively compacts (summary replaces dropped turns) instead of
+    /// letting plain trimming silently lose them mid-task.
+    const COMPACT_THRESHOLD: f64 = 0.8;
+
+    /// Proactive compaction, called between rounds inside `run_task`. Returns
+    /// `Some(note)` when it acted. Compacts whatever overshoots the budget so
+    /// the summary has headroom before the next provider call. On summarizer
+    /// failure plain `trim_to_tokens` remains the safety net (same as the
+    /// manual path).
+    pub async fn maybe_auto_compact(
+        &mut self,
+        on_event: &mut impl FnMut(AgentEvent),
+    ) -> Option<String> {
+        let budget = self.max_context_tokens;
+        if (self.history.estimate_tokens() as f64) < budget as f64 * Self::COMPACT_THRESHOLD {
+            return None;
+        }
+        let Some(dropped) = self.history.take_beyond_text(budget) else {
+            return None;
+        };
+        on_event(AgentEvent::AutoCompactStarted);
+        let note: String = match self.summarize_dropped(&dropped).await {
+            Ok(summary) if !summary.is_empty() => {
+                self.history.insert_summary(summary);
+                "auto-compacted: older turns replaced by a summary".into()
+            }
+            _ => {
+                // summarizer unavailable → fall back to silent trimming so
+                // the next round still fits
+                self.history.trim_to_tokens(budget);
+                "auto-compacted: older turns dropped (summarizer unavailable)".into()
+            }
+        };
+        on_event(AgentEvent::AutoCompactDone {
+            note: note.clone(),
+            est_tokens: self.history.estimate_tokens(),
+        });
+        Some(note)
     }
 
     const SUMMARY_PROMPT: &'static str = "Compress the following agent conversation transcript for a compacted context window. Keep, as terse bullets: the user's goal, decisions taken, important file paths and messages, open questions, and pending steps. Max 30 lines. No prose introductions.";
@@ -338,6 +398,13 @@ impl Agent {
                 ));
             }
             self.history.trim_to_tokens(self.max_context_tokens);
+
+            // Proactive compaction AFTER the tool round (before the next
+            // provider call): once history sits at ≥80% of the budget, older
+            // turns become a summary instead of the next trim silently
+            // dropping them. Placed here — not at loop top — so the ordering
+            // with the scripted-provider test responses stays intuitive.
+            self.maybe_auto_compact(&mut on_event).await;
         }
         Err(AgentError::RoundsExceeded(self.max_rounds))
     }
@@ -609,6 +676,205 @@ mod tests {
         a.run_task("tiny", |_| {}).await.unwrap();
         let note = a.compact().await.unwrap();
         assert!(note.starts_with("nothing to compact"), "got: {note}");
+    }
+
+    #[tokio::test]
+    async fn auto_compact_fires_at_threshold_mid_task() {
+        // Direct trigger test: pad history past 80% of a tight budget, then a
+        // provider call (the summarizer) must compress older turns in place.
+        let pad = " ".repeat(600); // ≈ 180 tokens
+        let script = vec![
+            LlmResponse {
+                content: Some("round one checking".into()),
+                tool_calls: vec![ToolCall {
+                    id: "t1".into(),
+                    name: "list_dir".into(),
+                    arguments: json!({"path": "."}),
+                }],
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some("round two checking".into()),
+                tool_calls: vec![ToolCall {
+                    id: "t2".into(),
+                    name: "list_dir".into(),
+                    arguments: json!({"path": "."}),
+                }],
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some("SUMMARY-BULLETS".into()), // summarizer after round 2
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some("done".into()),
+                ..Default::default()
+            },
+        ];
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(script));
+        let mut agent = Agent::with_parallel(
+            provider,
+            ToolRegistry::builtin(),
+            test_ctx(),
+            Some("sys".into()),
+            10,
+            400, // 0.8 × 400 = 320 triggers the check
+            4,
+        );
+        agent.ctx.cwd = scratch().to_path_buf();
+        let answer = agent
+            .run_task(&format!("big task {pad}"), |_| {})
+            .await
+            .unwrap();
+        // Round 3's final answer comes after the between-rounds compaction
+        assert_eq!(answer, "done");
+        // round-1/2 tool rounds are already summarized; verify splicing here
+        assert!(
+            agent
+                .history
+                .messages()
+                .iter()
+                .any(|m| m.role == crate::llm::Role::System
+                    && m.text().contains("SUMMARY-BULLETS")),
+            "summary must have been spliced by run_task's auto-compact"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_compact_runs_between_rounds_of_run_task() {
+        // Wires the loop-level trigger through run_task: two tool-bearing
+        // rounds push the history across the threshold, the between-rounds
+        // check must consume the summarizer response and splice the summary,
+        // and the task then finishes with round 3's answer.
+        let big = " ".repeat(300); // a few hundred tokens of padding per turn
+        let script = vec![
+            LlmResponse {
+                content: Some(format!("checking {big}")),
+                tool_calls: vec![ToolCall {
+                    id: "t1".into(),
+                    name: "list_dir".into(),
+                    arguments: json!({"path": "."}),
+                }],
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some(format!("still checking {big}")),
+                tool_calls: vec![ToolCall {
+                    id: "t2".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "Cargo.toml"}),
+                }],
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some("SUMMARY-BULLETS".into()), // summarizer between rounds
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some("done".into()),
+                ..Default::default()
+            },
+        ];
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(script));
+        let mut agent = Agent::with_parallel(
+            provider,
+            ToolRegistry::builtin(),
+            test_ctx(),
+            Some("sys".into()),
+            5,
+            600, // trigger at 480; two padded tool rounds blow past it
+            4,
+        );
+        agent.ctx.cwd = scratch().to_path_buf();
+
+        let events: std::sync::Arc<std::sync::Mutex<Vec<AgentEvent>>> = Default::default();
+        let sink = events.clone();
+        let answer = agent
+            .run_task(&format!("huge {big}"), move |ev| {
+                sink.lock().unwrap().push(ev);
+            })
+            .await
+            .unwrap();
+        assert_eq!(answer, "done", "run must finish after compaction");
+        let evs = events.lock().unwrap();
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, AgentEvent::AutoCompactStarted)),
+            "run_task must trigger auto-compact between rounds, events: {evs:?}"
+        );
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, AgentEvent::AutoCompactDone { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_compact_falls_back_to_trim_when_summarizer_fails() {
+        // Script exhausted after round 1's tool call → summarizer call errors
+        // → fallback path must silently trim, and the task must still finish.
+        let pad = " ".repeat(600);
+        let script = vec![LlmResponse {
+            content: Some("checking".into()),
+            tool_calls: vec![ToolCall {
+                id: "t1".into(),
+                name: "list_dir".into(),
+                arguments: json!({"path": "."}),
+            }],
+            ..Default::default()
+        }];
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(script));
+        let mut agent = Agent::with_parallel(
+            provider,
+            ToolRegistry::builtin(),
+            test_ctx(),
+            Some("sys".into()),
+            3,
+            400,
+            4,
+        );
+        agent.ctx.cwd = scratch().to_path_buf();
+
+        let result = agent.run_task(&format!("big task {pad}"), |_| {}).await;
+        // MockProvider errors when the script runs dry → the run ends with a
+        // Provider error, not a context blowup — trim kept the request legal.
+        assert!(result.is_err(), "script runs dry: {result:?}");
+        let est = agent.history.estimate_tokens();
+        assert!(est <= 400, "fallback trim must bring context under the budget: {est}");
+    }
+
+    #[tokio::test]
+    async fn auto_compact_silent_when_small() {
+        let script = vec![LlmResponse {
+            content: Some("tiny answer".into()),
+            ..Default::default()
+        }];
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(script));
+        let mut agent = Agent::with_parallel(
+            provider,
+            ToolRegistry::builtin(),
+            test_ctx(),
+            Some("sys".into()),
+            5,
+            60_000,
+            4,
+        );
+        agent.ctx.cwd = scratch().to_path_buf();
+        let events: std::sync::Arc<std::sync::Mutex<Vec<AgentEvent>>> = Default::default();
+        let sink = events.clone();
+        agent
+            .run_task("tiny", move |ev| {
+                sink.lock().unwrap().push(ev);
+            })
+            .await
+            .unwrap();
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AutoCompactStarted)),
+            "small task must never trigger auto-compact"
+        );
     }
 
     #[tokio::test]

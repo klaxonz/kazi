@@ -70,6 +70,14 @@ pub fn render_event(ev: &AgentEvent) {
             let (sym, col) = if *is_error { ("x", RED) } else { ("ok", GREEN) };
             println!(" {col}[{sym}]{RESET} {DIM}{preview}{RESET}");
         }
+        AgentEvent::AutoCompactStarted => {
+            println!();
+            print!("{YELLOW}>> auto-compact{RESET}");
+            let _ = std::io::stdout().flush();
+        }
+        AgentEvent::AutoCompactDone { note, est_tokens } => {
+            println!(" {DIM}{note} (est. {est_tokens} tokens){RESET}");
+        }
     }
 }
 
@@ -455,6 +463,15 @@ fn pick_session_name(topic: Option<&str>) -> String {
     name
 }
 
+/// Trailing-backslash continuation: `Some(text_without_backslash)` when the
+/// line ends with `\` (logical-line join request, shell style). A lone `\`
+/// still counts so a purely-continued block can't sneak an empty task in.
+fn strip_continuation(line: &str) -> Option<&str> {
+    let trimmed_end = line.trim_end();
+    let body = trimmed_end.strip_suffix('\\')?;
+    Some(body.trim_end())
+}
+
 /// Load a stored session into the live agent, keeping the current system
 /// prompt when the file has none. Shared by the startup `--resume` path
 /// and the `/resume` command.
@@ -525,6 +542,36 @@ pub async fn chat_loop(
             }
         };
         let line = line.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Continuation lines: a trailing backslash swallows the newline and
+        // keeps reading; history stores the JOINED text so ↑ recalls the
+        // whole logical line.
+        let mut line = line;
+        while let Some(without_escape) = strip_continuation(&line) {
+            let next = match rl.readline("kazi… ") {
+                Ok(l) => l,
+                Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
+                    // abort the entry entirely — nothing half-submitted
+                    println!("{DIM}(input cancelled){RESET}");
+                    line = String::new();
+                    break;
+                }
+                Err(e) => {
+                    println!("{YELLOW}input error: {e}{RESET}");
+                    line = String::new();
+                    break;
+                }
+            };
+            let next = next.trim();
+            if next.is_empty() {
+                line = without_escape.to_string();
+                break;
+            }
+            line = format!("{without_escape}\n{next}");
+        }
         if line.is_empty() {
             continue;
         }
@@ -681,9 +728,22 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
                 let mut next = state.clone();
                 next.model = Some(m.to_string());
                 match next.rebuild().await {
-                    Ok(new) => {
-                        println!("switched -> {}", new.describe());
-                        *live = new;
+                    Ok(mut new) => {
+                        // Dry-run before committing: a wrong model name only
+                        // fails at the next API call otherwise (HTTP 4xx with
+                        // context now gone). One tiny probe round verifies the
+                        // model exists on this provider; failure keeps the
+                        // current live agent untouched.
+                        match new.agent.probe().await {
+                            Ok(()) => {
+                                println!("switched -> {}", new.describe());
+                                *live = new;
+                            }
+                            Err(e) => println!(
+                                "{RED}model rejected by provider, staying on {}{RESET}\n{DIM}{e}{RESET}",
+                                live.describe()
+                            ),
+                        }
                     }
                     Err(e) => println!("{RED}switch failed: {e}{RESET}"),
                 }
@@ -734,6 +794,16 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuation_backslash_detected() {
+        assert_eq!(strip_continuation("refactor this \\"), Some("refactor this"));
+        assert_eq!(strip_continuation("a\\\\b"), None, "escaped backslash, not EOL");
+        // terminal backslash with spaces before it still joins
+        assert_eq!(strip_continuation("x  \\  "), Some("x"));
+        assert_eq!(strip_continuation("plain"), None);
+        assert_eq!(strip_continuation("\\"), Some(""));
+    }
 
     #[test]
     fn table_feeds_complete_help() {

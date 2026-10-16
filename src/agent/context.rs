@@ -63,17 +63,16 @@ impl History {
     /// turn is never dropped — even if that means overshooting.
     pub fn trim_to_tokens(&mut self, budget: u64) {
         while self.estimate_tokens() > budget {
-            let cut = match self.trim_point() {
-                Some(i) => i,
+            match self.turn_cut() {
+                Some(i) => self.msgs.drain(0..i),
                 None => break,
             };
-            self.msgs.drain(0..cut);
         }
     }
 
     /// Index of the *second* user message, i.e. the boundary after the first
     /// complete turn, or `None` when fewer than two turns exist.
-    fn trim_point(&self) -> Option<usize> {
+    fn turn_cut(&self) -> Option<usize> {
         let users: Vec<usize> = self
             .msgs
             .iter()
@@ -84,17 +83,50 @@ impl History {
         users.get(1).copied()
     }
 
-    /// /compact path: extract whole turns from the oldest end (serialized as
-    /// a transcript for summarization) until the estimate fits `budget`.
-    /// `None` = nothing needed / nothing droppable (single turn).
-    pub fn take_overshoot_text(&mut self, budget: u64) -> Option<String> {
-        if self.estimate_tokens() <= budget {
-            return None;
+    /// Compaction path: extract droppable messages from the oldest end
+    /// (serialized as a transcript for summarization).
+    ///
+    /// Two granularities, whichever yields something:
+    /// 1. **Whole completed turns** — everything before the second user
+    ///    message (multi-task histories).
+    /// 2. **Completed tool ROUNDS inside the current task** — a long single
+    ///    task has one user message but many assistant/tool round-trips;
+    ///    everything before the *second-to-last* `assistant_with_calls`
+    ///    boundary is a finished round whose results the model no longer
+    ///    needs verbatim. The latest round (with its pending tool results)
+    ///    is always kept intact so the next provider call stays legal.
+    ///
+    /// `None` = nothing droppable (fewer than two rounds).
+    pub fn take_beyond_text(&mut self, _budget: u64) -> Option<String> {
+        if let Some(cut) = self.turn_cut() {
+            let text = serialize_turns(&self.msgs[..cut]);
+            self.msgs.drain(0..cut);
+            return Some(text);
         }
-        let cut = self.trim_point()?;
-        let text = serialize_turns(&self.msgs[..cut]);
+        // single task in flight: cut at the last round boundary, keeping the
+        // final (assistant-with-calls → tool results) group intact
+        let cut = self.last_round_cut()?;
+        let text = serialize_rounds(&self.msgs[..cut]);
         self.msgs.drain(0..cut);
         Some(text)
+    }
+
+    /// Boundary before the second-to-last assistant-with-tool-calls message,
+    /// so everything before it (older rounds) can be summarized away while
+    /// the newest round — and whatever it is still executing — stays whole.
+    fn last_round_cut(&self) -> Option<usize> {
+        let calls: Vec<usize> = self
+            .msgs
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| !m.tool_calls.is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        if calls.len() < 2 {
+            return None;
+        }
+        // everything from the second-to-last call boundary onward stays
+        Some(cutsweep(calls))
     }
 
     /// Append a compaction summary to the system prompt — it rides along on
@@ -106,6 +138,33 @@ impl History {
             None => label,
         });
     }
+}
+
+/// For boundaries `[c0, c1, ..., cn]` return `c(n-1)` — the older side of it
+/// is droppable, everything from it onward is the newest round.
+fn cutsweep(calls: Vec<usize>) -> usize {
+    calls[calls.len() - 2]
+}
+
+/// Serialize round-trip messages (user task intro, assistant text, tool
+/// calls/results) — same content as [`serialize_turns`] but tolerates a
+/// history that starts mid-task (no leading user message).
+fn serialize_rounds(msgs: &[Message]) -> String {
+    if msgs.first().map(|m| m.role) == Some(Role::User) {
+        return serialize_turns(msgs);
+    }
+    // No user message at the head: emit only assistant/tool bodies so the
+    // summary prompt sees something coherent.
+    let mut text = String::new();
+    for m in msgs {
+        match m.role {
+            Role::User => {}
+            _ => {
+                text.push_str(&serialize_turns(std::slice::from_ref(m)));
+            }
+        }
+    }
+    text
 }
 
 fn serialize_turns(msgs: &[Message]) -> String {

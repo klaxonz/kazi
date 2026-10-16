@@ -82,6 +82,12 @@ pub enum Command {
     /// List saved sessions
     #[command(name = "sessions")]
     Sessions,
+    /// Delete a saved session by name (exact or unambiguous prefix)
+    #[command(name = "rm")]
+    Rm {
+        /// Session name (exact or unambiguous prefix)
+        session: String,
+    },
     /// Export a saved session as markdown
     #[command(name = "export")]
     Export {
@@ -119,6 +125,7 @@ pub async fn execute(cli: Cli) -> anyhow::Result<u8> {
         Some(Command::Providers) => providers_cmd(cli.config.as_deref()),
         Some(Command::Tools) => tools_cmd(),
         Some(Command::Sessions) => sessions_cmd(),
+        Some(Command::Rm { session }) => rm_cmd(&session),
         Some(Command::Export { session, out }) => export_cmd(&session, out.as_deref()),
     }
 }
@@ -311,6 +318,21 @@ fn sessions_cmd() -> anyhow::Result<u8> {
         );
     }
     Ok(0)
+}
+
+/// Delete a saved session (`kazi rm <name-prefix>`).
+fn rm_cmd(session: &str) -> anyhow::Result<u8> {
+    match crate::agent::session::delete(session) {
+        Ok(Some(name)) => {
+            println!("deleted {name}");
+            Ok(0)
+        }
+        Ok(None) => Ok(0), // unreachable today; keep exhaustive anyway
+        Err(e) => {
+            println!("{RED}rm failed: {e}{RESET}");
+            Ok(1)
+        }
+    }
 }
 
 fn export_cmd(session: &str, out: Option<&Path>) -> anyhow::Result<u8> {
