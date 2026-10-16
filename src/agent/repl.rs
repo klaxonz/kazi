@@ -78,6 +78,7 @@ pub fn render_event(ev: &AgentEvent) {
         AgentEvent::AutoCompactDone { note, est_tokens } => {
             println!(" {DIM}{note} (est. {est_tokens} tokens){RESET}");
         }
+        AgentEvent::RoundDone { .. } => {} // classic REPL stays quiet
     }
 }
 

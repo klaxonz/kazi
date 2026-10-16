@@ -16,6 +16,7 @@
 pub mod context;
 pub mod repl;
 pub mod session;
+pub mod tui;
 
 use std::sync::Arc;
 
@@ -91,6 +92,13 @@ pub enum AgentEvent {
     /// Auto-compact finished: `note` describes what happened, `est_tokens`
     /// is the post-compaction context estimate.
     AutoCompactDone { note: String, est_tokens: u64 },
+    /// A provider round completed: `round` is 1-based, `usage` is the
+    /// running per-task totals. Lets UIs show progress during long runs.
+    RoundDone {
+        round: u32,
+        usage: crate::llm::Usage,
+        est_tokens: u64,
+    },
 }
 
 pub struct Agent {
@@ -313,13 +321,18 @@ impl Agent {
         self.history.push(Message::user(task.to_string()));
         self.usage = Usage::default();
 
-        for _ in 0..self.max_rounds {
+        for round in 0..self.max_rounds {
             let req = LlmRequest {
                 messages: self.history.messages(),
                 tools: self.registry.specs(),
             };
             let resp = self.stream_round(&req, &mut on_event).await?;
             self.usage.add(&resp.usage);
+            on_event(AgentEvent::RoundDone {
+                round: round + 1,
+                usage: self.usage.clone(),
+                est_tokens: self.history.estimate_tokens(),
+            });
 
             if !resp.has_tool_calls() {
                 let text = resp.text_or_empty().to_string();
@@ -558,10 +571,13 @@ mod tests {
         assert!(out.contains("first line"));
         assert_eq!(a.history_msgs_len(), 4); // user, assistant(calls), tool, assistant
         let evs = events.lock().unwrap();
-        assert!(matches!(evs[0], AgentEvent::ToolStart { ref name } if name == "read_file"));
-        assert!(
-            matches!(evs[1], AgentEvent::ToolEnd { is_error: false, ref name, .. } if name == "read_file")
-        );
+        // RoundDone (new progress event) may interleave; match presence, not position
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolStart { ref name } if name == "read_file")));
+        assert!(evs.iter().any(
+            |e| matches!(e, AgentEvent::ToolEnd { is_error: false, ref name, .. } if name == "read_file")
+        ));
         assert!(evs
             .iter()
             .any(|e| matches!(e, AgentEvent::TextDelta { text } if text.contains("note says"))));

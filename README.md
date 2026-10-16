@@ -67,6 +67,15 @@ on slash commands, multiline tasks with trailing `\`):
 kazi chat
 ```
 
+Full-screen TUI (same engine: status bar with round/token counters, scrolling
+transcript with live tool activity, input stays responsive while a task
+streams; falls back to the line REPL on terminals without alternate-screen
+support — sessions and flags are identical):
+
+```sh
+kazi chat --tui
+```
+
 Headless (exit code 0 + final answer → scriptable):
 
 ```sh

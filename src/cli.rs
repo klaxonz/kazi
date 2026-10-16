@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
-use crate::agent::{context::History, repl, session, Agent, AgentError, AgentEvent};
+use crate::agent::{context::History, repl, session, tui, Agent, AgentError, AgentEvent};
 use crate::config;
 use crate::tools::ToolRegistry;
 
@@ -45,6 +45,10 @@ pub struct EngineArgs {
     /// Auto-approve run_command without asking (dangerous)
     #[arg(long)]
     pub yolo: bool,
+    /// Full-screen TUI instead of the classic line REPL (`kazi chat` only;
+    /// falls back gracefully if the terminal can't do alternate screens)
+    #[arg(long)]
+    pub tui: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -136,6 +140,17 @@ async fn chat(
     cfg_path: Option<&Path>,
 ) -> anyhow::Result<u8> {
     let (cfg, _) = config::load(cfg_path)?;
+    if args.tui {
+        return tui::chat_loop_with(
+            cfg,
+            args.provider.clone(),
+            args.model.clone(),
+            args.yolo,
+            topic,
+            args.resume.clone(),
+        )
+        .await;
+    }
     repl::chat_loop(
         cfg,
         args.provider.clone(),

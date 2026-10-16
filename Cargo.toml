@@ -51,6 +51,8 @@ futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "6"
+ratatui = "0.29.0"
+crossterm = { version = "0.28.1", features = ["event-stream"] }
 
 [profile.release]
 lto = true

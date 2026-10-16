@@ -25,6 +25,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`kazi chat --tui`**: full-screen TUI on ratatui + crossterm — status bar
+  (provider, session, round counter, context ~tokens), scrolling transcript
+  with live streamed text and `>> tool [ok] preview` activity lines, single
+  input row. Agent tasks run in a spawned tokio task streaming events over
+  an mpsc channel; the UI loop `select!`s between the event stream and
+  crossterm's async `EventStream`, so the screen keeps redrawn during
+  streaming and Esc stays responsive mid-task (the agent is handed to the
+  runner through a shared slot and parked back for the session save).
+  Terminals that can't enter the alternate screen fall back to the classic
+  line REPL automatically.
+- **`RoundDone { round, usage, est_tokens }` agent event**: emitted after
+  each provider round; powers the TUI status bar and is available to any
+  future UI.
 - **`kazi rm <prefix>`**: delete a stored session (prefix-resolved like
   `--resume`).
 
