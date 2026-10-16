@@ -262,6 +262,46 @@ impl Screen {
     }
 }
 
+/// Opt-in key-event tracing to diagnose terminal quirks: set
+/// `KAZI_TUI_DEBUG=1` and every key event lands in
+/// `<temp>/kazi-tui-keys.log`. Zero cost when the env var is absent.
+fn log_key_event(key: &ratatui::crossterm::event::KeyEvent) {
+    if std::env::var_os("KAZI_TUI_DEBUG").is_none() {
+        return;
+    }
+    let path = std::env::temp_dir().join("kazi-tui-keys.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(
+            f,
+            "code={:?} mods={:?} kind={:?}",
+            key.code, key.modifiers, key.kind
+        );
+    }
+}
+
+/// Which key presses become literal text in the input box.
+///
+/// Modifier combinations are *not* text: terminals deliver IME switches and
+/// other shortcuts as `Char`, e.g. `Ctrl+Space` (switch input method) arrives
+/// as `Char(' ') + CONTROL` and `Shift+Space` as `Char(' ') + SHIFT`. Typing
+/// them verbatim is what produced stray spaces during Chinese input. NUL is
+/// an unknown-key artifact. Plain characters (optionally shifted for
+/// punctuation) pass through.
+fn accepted_char(code: &KeyCode, mods: ratatui::crossterm::event::KeyModifiers) -> Option<char> {
+    use ratatui::crossterm::event::KeyModifiers as M;
+    match code {
+        KeyCode::Char('\0') => None,
+        KeyCode::Char(c) if mods.intersects(M::CONTROL | M::ALT) => None,
+        KeyCode::Char(' ') if mods.contains(M::SHIFT) => None,
+        KeyCode::Char(c) => Some(*c),
+        _ => None,
+    }
+}
+
 /// Word-ish wrap by DISPLAY width (CJK glyphs are double-width): break
 /// preferentially at spaces, hard-break long words glyph by glyph — never by
 /// bytes, which would panic on multi-byte chars.
@@ -497,7 +537,9 @@ async fn tui_inner(
 
             // ---- input pump (async EventStream) ----------------------------
             maybe_ev = events.next() => match maybe_ev {
-                Some(Ok(CtEvent::Key(key))) if key.kind != KeyEventKind::Release => match key.code {
+                Some(Ok(CtEvent::Key(key))) if key.kind != KeyEventKind::Release => {
+                    log_key_event(&key);
+                    match key.code {
                     KeyCode::Esc => {
                         screen.quit = true;
                         if let Some(r) = runner.take() { r.abort(); }
@@ -529,10 +571,13 @@ async fn tui_inner(
                     {
                         screen.lines.clear();
                     }
-                    KeyCode::Char('\0') => {} // NUL: IME/unknown-key artifact
-                    KeyCode::Char(c) => screen.input.push(c),
-                    _ => {}
-                },
+                    code => {
+                        if let Some(ch) = accepted_char(&code, key.modifiers) {
+                            screen.input.push(ch);
+                        }
+                    }
+                    }
+                }
                 Some(Ok(_)) => {} // resize/focus/mouse: next draw picks size up
                 Some(Err(_)) | None => {} // event loop hiccup: keep going
             },
@@ -645,5 +690,20 @@ mod tests {
         assert_eq!(tail_by_width("路径abc", 5), "径abc");
         assert_eq!(tail_by_width("ab", 5), "ab");
         assert_eq!(tail_by_width("中文", 1), "");
+    }
+
+    #[test]
+    fn modifier_combos_are_not_text() {
+        use ratatui::crossterm::event::KeyModifiers as M;
+        // plain typing, incl. shifted punctuation
+        assert_eq!(accepted_char(&KeyCode::Char('a'), M::NONE), Some('a'));
+        assert_eq!(accepted_char(&KeyCode::Char(' '), M::NONE), Some(' '));
+        assert_eq!(accepted_char(&KeyCode::Char('!'), M::SHIFT), Some('!'));
+        assert_eq!(accepted_char(&KeyCode::Char('中'), M::NONE), Some('中'));
+        // IME switches / shortcuts must never insert text
+        assert_eq!(accepted_char(&KeyCode::Char(' '), M::CONTROL), None);
+        assert_eq!(accepted_char(&KeyCode::Char(' '), M::SHIFT), None);
+        assert_eq!(accepted_char(&KeyCode::Char('a'), M::CONTROL), None);
+        assert_eq!(accepted_char(&KeyCode::Char('\0'), M::NONE), None);
     }
 }

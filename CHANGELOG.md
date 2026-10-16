@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-10-17
+
+### Fixed
+
+- **TUI input: modifier combinations no longer type text.** Terminals deliver
+  IME switches as plain `Char` events — `Ctrl+Space` (switch input method)
+  arrives as `Char(' ') + CONTROL`, `Shift+Space` as `Char(' ') + SHIFT` — so
+  switching input language during Chinese typing inserted stray spaces.
+  Ctrl/Alt combinations and Shift+Space are now ignored as text.
+
+### Added
+
+- `KAZI_TUI_DEBUG=1` traces every TUI key event (`code/mods/kind`) to
+  `<temp>/kazi-tui-keys.log` — for diagnosing terminal/IME quirks with real
+  data instead of guesswork.
+
 ## [0.10.3] - 2026-10-17
 
 ### Fixed
