@@ -878,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "kazi"
-version = "0.6.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
