@@ -85,6 +85,77 @@ pub fn expand_file_refs(task: &str, cwd: &std::path::Path) -> String {
     }
 }
 
+/// Run the post-edit feedback check (`agent.feedback_command`) and shape its
+/// output for the model: `(ok, one-line preview, full message)`.
+async fn run_feedback(cmd: &str, ctx: &crate::tools::ToolCtx) -> (bool, String, String) {
+    const TAIL_CAP: usize = 4_000;
+    let mut c = crate::tools::shell::build_command(cmd, &ctx.cwd);
+    c.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null());
+    let output = match c.spawn() {
+        Ok(child) => match tokio::time::timeout(ctx.timeout, child.wait_with_output()).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                return (
+                    false,
+                    format!("failed to run: {e}"),
+                    format!("[feedback] `{cmd}` failed to run: {e}"),
+                );
+            }
+            Err(_) => {
+                return (
+                    false,
+                    "timed out".to_string(),
+                    format!(
+                        "[feedback] `{cmd}` timed out after {}s",
+                        ctx.timeout.as_secs()
+                    ),
+                );
+            }
+        },
+        Err(e) => {
+            return (
+                false,
+                format!("cannot start: {e}"),
+                format!("[feedback] `{cmd}` cannot start: {e}"),
+            );
+        }
+    };
+    let code = output.status.code().unwrap_or(-1);
+    let ok = code == 0;
+    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    // keep the TAIL — compilers put the actual errors at the end
+    let total = text.chars().count();
+    let tail: String = if total > TAIL_CAP {
+        text.chars().skip(total - TAIL_CAP).collect()
+    } else {
+        text
+    };
+    let preview: String = tail
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(160)
+        .collect();
+    let body = format!(
+        "[feedback] `{cmd}` exited {code}{}{}\n{tail}",
+        if ok {
+            ""
+        } else {
+            " — fix these before finishing"
+        },
+        if total > TAIL_CAP {
+            " (output tail)"
+        } else {
+            ""
+        }
+    );
+    (ok, preview, body)
+}
+
 /// The default system prompt. Terse on purpose: the tools carry their own
 /// contracts, the loop carries the mechanics; a wall of instructions here
 /// would burn context. Mentioned behaviors: read before write, adapt on
@@ -137,6 +208,12 @@ pub enum AgentEvent {
     },
     /// Auto-compact kicking in between rounds (proactive, at 80% budget).
     AutoCompactStarted,
+    /// Post-edit feedback command finished (`agent.feedback_command`).
+    Feedback {
+        command: String,
+        ok: bool,
+        preview: String,
+    },
     /// Auto-compact finished: `note` describes what happened, `est_tokens`
     /// is the post-compaction context estimate.
     AutoCompactDone { note: String, est_tokens: u64 },
@@ -165,6 +242,9 @@ pub struct Agent {
     /// while streaming (the in-flight provider response is dropped, the
     /// agent and its history survive).
     cancel: Arc<AtomicBool>,
+    /// Optional post-edit check (`agent.feedback_command`): run after a round
+    /// that changed files, its output is fed back to the model.
+    feedback: Option<String>,
 }
 
 impl Agent {
@@ -209,7 +289,14 @@ impl Agent {
             max_parallel_tools: max_parallel_tools.max(1),
             usage: Usage::default(),
             cancel: Arc::new(AtomicBool::new(false)),
+            feedback: None,
         }
+    }
+
+    /// Install the post-edit feedback command (builder-style).
+    pub fn with_feedback(mut self, command: Option<String>) -> Self {
+        self.feedback = command.filter(|c| !c.trim().is_empty());
+        self
     }
 
     /// Handle for interrupting a running task (Esc in the TUI).
@@ -324,7 +411,8 @@ impl Agent {
                 .max_context_tokens
                 .unwrap_or(DEFAULT_MAX_CONTEXT_TOKENS),
             cfg.agent.max_parallel_tools.unwrap_or(DEFAULT_MAX_PARALLEL),
-        ))
+        )
+        .with_feedback(cfg.agent.feedback_command.clone()))
     }
 
     pub fn registry(&self) -> &ToolRegistry {
@@ -524,6 +612,12 @@ impl Agent {
                 verdicts[i] = Some(outcome);
             }
 
+            // did this round change files? (before outcomes are taken)
+            let wrote = calls.iter().enumerate().any(|(i, c)| {
+                matches!(c.name.as_str(), "write_file" | "apply_patch")
+                    && verdicts[i].as_ref().map(|o| !o.is_error).unwrap_or(false)
+            });
+
             for (i, call) in calls.iter().enumerate() {
                 let outcome = std::mem::take(&mut verdicts[i]).expect("every call gets an outcome");
                 self.history.push(Message::tool_result(
@@ -542,6 +636,21 @@ impl Agent {
                 if last_todos.as_ref() != Some(&snap) {
                     last_todos = Some(snap.clone());
                     on_event(AgentEvent::TodosUpdated { items: snap });
+                }
+            }
+            // post-edit feedback: run the configured check after a round that
+            // changed files, and feed its output back to the model
+            if wrote {
+                if let Some(cmd) = self.feedback.clone() {
+                    if self.ctx.permission.get() != crate::tools::PermissionMode::ReadOnly {
+                        let (ok, preview, body) = run_feedback(&cmd, &self.ctx).await;
+                        on_event(AgentEvent::Feedback {
+                            command: cmd,
+                            ok,
+                            preview,
+                        });
+                        self.history.push(Message::user(body));
+                    }
                 }
             }
             self.history.trim_to_tokens(self.max_context_tokens);
@@ -1054,6 +1163,40 @@ mod tests {
                 .any(|e| matches!(e, AgentEvent::AutoCompactStarted)),
             "small task must never trigger auto-compact"
         );
+    }
+
+    #[tokio::test]
+    async fn feedback_command_runs_after_a_write_round() {
+        let script = vec![
+            LlmResponse {
+                tool_calls: vec![ToolCall {
+                    id: "w1".into(),
+                    name: "write_file".into(),
+                    arguments: json!({"path": "gen.txt", "content": "generated"}),
+                }],
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some("done".into()),
+                ..Default::default()
+            },
+        ];
+        let mut a =
+            agent_with_ctx(script, test_ctx()).with_feedback(Some("echo KAZI_FEEDBACK_OK".into()));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(bool, String)>::new()));
+        let sink = seen.clone();
+        a.run_task("write a file", move |ev| {
+            if let AgentEvent::Feedback { ok, preview, .. } = ev {
+                sink.lock().unwrap().push((ok, preview));
+            }
+        })
+        .await
+        .unwrap();
+
+        let hits = seen.lock().unwrap();
+        assert_eq!(hits.len(), 1, "one feedback run after the write round");
+        assert!(hits[0].0, "echo exits 0");
+        assert!(hits[0].1.contains("KAZI_FEEDBACK_OK"), "got: {:?}", hits[0]);
     }
 
     #[tokio::test]

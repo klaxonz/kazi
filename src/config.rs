@@ -88,6 +88,9 @@ pub struct AgentCfg {
     pub max_retries: Option<u32>,
     /// Startup permission mode: "read-only" | "edit" (default) | "yolo".
     pub permission_mode: Option<String>,
+    /// Check to run after a round that changed files (e.g.
+    /// "cargo clippy --all-targets"); its output goes back to the model.
+    pub feedback_command: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]

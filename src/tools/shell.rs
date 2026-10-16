@@ -147,7 +147,7 @@ impl Tool for RunCommand {
     }
 }
 
-fn build_command(cmd: &str, dir: &std::path::Path) -> Command {
+pub(crate) fn build_command(cmd: &str, dir: &std::path::Path) -> Command {
     let mut c = if cfg!(windows) {
         let mut c = Command::new("cmd");
         c.arg("/C").arg(cmd);

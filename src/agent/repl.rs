@@ -156,6 +156,14 @@ pub fn render_event(ev: &AgentEvent) {
                 println!("{DIM}  {marker} {content}{RESET}");
             }
         }
+        AgentEvent::Feedback {
+            command,
+            ok,
+            preview,
+        } => {
+            let (sym, col) = if *ok { ("ok", GREEN) } else { ("x", RED) };
+            println!("\n{col}>> feedback {sym}{RESET} {DIM}`{command}` {preview}{RESET}");
+        }
         AgentEvent::RoundDone { .. } => {} // classic REPL stays quiet
     }
 }

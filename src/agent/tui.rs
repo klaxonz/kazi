@@ -374,6 +374,17 @@ impl Screen {
     fn consume(&mut self, ev: AgentEvent) {
         match ev {
             AgentEvent::TodosUpdated { items } => self.todos = items,
+            AgentEvent::Feedback {
+                command,
+                ok,
+                preview,
+            } => {
+                self.flush_streaming();
+                self.push(
+                    LineKind::Tool { is_error: !ok },
+                    format!("feedback `{command}` — {preview}"),
+                );
+            }
             AgentEvent::TextDelta { text } => self.streaming.push_str(&text),
             AgentEvent::ToolStart { name } => {
                 self.flush_streaming();
