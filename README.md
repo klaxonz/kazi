@@ -132,6 +132,23 @@ initialize logs a warning and is skipped, never blocking the rest.
 Both transports serve tool calls **concurrently** (routed by JSON-RPC id), so
 a single server can answer several calls from one model round at once.
 
+## Reliability & bookkeeping
+
+- Provider calls retry rate limits, server 5xx and network errors with
+  exponential backoff (`agent.max_retries`, default 3); streams never
+  duplicate an already-printed answer.
+- Token usage of the current task shows in `/status` and in the
+  `--output json` report.
+
+Saved conversations are visible and exportable:
+
+```sh
+kazi sessions                 # list: name, message count, saved time
+kazi export chat-abc notes.md # markdown export (roles, tool calls, results)
+```
+
+`--resume <prefix>` accepts any unambiguous name prefix.
+
 ## Safety (read before the first surprise)
 
 - `run_command` never executes without either a config allowlist match, a **y/N

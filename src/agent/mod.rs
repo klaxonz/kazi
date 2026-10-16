@@ -22,7 +22,9 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::llm::{LlmError, LlmRequest, LlmResponse, Message, Provider, StreamEvent, ToolCall};
+use crate::llm::{
+    LlmError, LlmRequest, LlmResponse, Message, Provider, StreamEvent, ToolCall, Usage,
+};
 use crate::tools::{ToolCtx, ToolOutcome, ToolRegistry};
 
 pub const DEFAULT_MAX_ROUNDS: u32 = 30;
@@ -96,6 +98,8 @@ pub struct Agent {
     /// Max tool calls dispatched concurrently within one round; results are
     /// re-ordered back to call order so wire ids stay consistent.
     max_parallel_tools: usize,
+    /// Token usage of the CURRENT task (reset at run_task start).
+    usage: Usage,
 }
 
 impl Agent {
@@ -138,6 +142,7 @@ impl Agent {
             max_rounds: max_rounds.max(1),
             max_context_tokens,
             max_parallel_tools: max_parallel_tools.max(1),
+            usage: Usage::default(),
         }
     }
 
@@ -147,6 +152,11 @@ impl Agent {
 
     pub fn max_rounds(&self) -> u32 {
         self.max_rounds
+    }
+
+    /// Token usage of the current ([`Agent::run_task`]) task.
+    pub fn usage(&self) -> Usage {
+        self.usage.clone()
     }
 
     /// All-inclusive constructor for the CLI (and embedders happy with the
@@ -163,7 +173,11 @@ impl Agent {
         let resolved = cfg.resolve(provider, model_override)?;
         let mut settings = resolved.settings;
         settings.api_key = cfg.api_key_for(&resolved.nick)?;
-        let provider = crate::llm::build_provider(&settings)?;
+        let inner_provider = crate::llm::build_provider(&settings)?;
+        let wrapped: Arc<dyn Provider> = Arc::new(crate::llm::RetryProvider::new(
+            inner_provider,
+            cfg.agent.max_retries.unwrap_or(3),
+        ));
         let mut registry = crate::tools::ToolRegistry::builtin();
         for tool in crate::mcp::load_mcp_tools(
             &cfg.mcp,
@@ -177,7 +191,7 @@ impl Agent {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let ctx = crate::tools::tool_ctx(&cfg.tools, &cwd, approver(yolo));
         Ok(Self::with_parallel(
-            provider,
+            wrapped,
             registry,
             ctx,
             Some(system_prompt(&cwd)),
@@ -210,6 +224,7 @@ impl Agent {
         mut on_event: impl FnMut(AgentEvent),
     ) -> Result<String, AgentError> {
         self.history.push(Message::user(task.to_string()));
+        self.usage = Usage::default();
 
         for _ in 0..self.max_rounds {
             let req = LlmRequest {
@@ -217,6 +232,7 @@ impl Agent {
                 tools: self.registry.specs(),
             };
             let resp = self.stream_round(&req, &mut on_event).await?;
+            self.usage.add(&resp.usage);
 
             if !resp.has_tool_calls() {
                 let text = resp.text_or_empty().to_string();
@@ -503,6 +519,42 @@ mod tests {
         assert!(msgs
             .iter()
             .any(|m| m.role == crate::llm::Role::Tool && m.is_error));
+    }
+
+    #[tokio::test]
+    async fn usage_accumulates_per_round_and_resets() {
+        let script = vec![
+            LlmResponse {
+                usage: Usage {
+                    input_tokens: Some(11),
+                    output_tokens: Some(22),
+                },
+                tool_calls: vec![ToolCall {
+                    id: "a".into(),
+                    name: "list_dir".into(),
+                    arguments: json!({}),
+                }],
+                ..Default::default()
+            },
+            LlmResponse {
+                usage: Usage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                },
+                content: Some("done".into()),
+                ..Default::default()
+            },
+        ];
+        let mut a = agent_with(script.clone());
+        a.run_task("first", |_| {}).await.unwrap();
+        let u = a.usage();
+        assert_eq!(u.input_tokens, Some(21));
+        assert_eq!(u.output_tokens, Some(27));
+        // the next task starts with a fresh counter
+        let last = script.last().cloned().unwrap();
+        let mut a = agent_with(vec![last]);
+        a.run_task("second", |_| {}).await.unwrap();
+        assert_eq!(a.usage().input_tokens, Some(10));
     }
 
     #[tokio::test]

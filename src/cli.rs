@@ -74,6 +74,17 @@ pub enum Command {
     /// List built-in tools
     #[command(name = "tools")]
     Tools,
+    /// List saved sessions
+    #[command(name = "sessions")]
+    Sessions,
+    /// Export a saved session as markdown
+    #[command(name = "export")]
+    Export {
+        /// Session name (exact or unambiguous prefix)
+        session: String,
+        /// Output path (default: `<session>.md` in the working directory)
+        out: Option<PathBuf>,
+    },
 }
 
 /// Machine-readable output shapes for `kazi run`.
@@ -102,6 +113,8 @@ pub async fn execute(cli: Cli) -> anyhow::Result<u8> {
         Some(Command::Config { init }) => config_cmd(init),
         Some(Command::Providers) => providers_cmd(cli.config.as_deref()),
         Some(Command::Tools) => tools_cmd(),
+        Some(Command::Sessions) => sessions_cmd(),
+        Some(Command::Export { session, out }) => export_cmd(&session, out.as_deref()),
     }
 }
 
@@ -125,6 +138,8 @@ struct RunReport {
     answer: String,
     /// `text_delta` / `tool_start` / `tool_end` events, in order.
     events: Vec<AgentEvent>,
+    /// Provider-reported token usage of this task (zeros if unknown).
+    usage: crate::llm::Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -144,20 +159,30 @@ async fn run_once(
     )
     .await?;
     let describe = agent.provider().describe();
-    let mut agent = if let Some(name) = &args.resume {
-        match session::load(name) {
-            Ok(f) => {
-                let sys = f.system.or_else(|| agent.history.system.clone());
-                let mut a = agent;
-                a.history = History::new(sys);
-                a.history.msgs = f.messages;
-                if fmt == OutputFmt::Text {
-                    println!("resumed `{name}` ({n} messages)", n = a.history.msgs_len());
+    let mut agent = if let Some(raw) = &args.resume {
+        match session::resolve(raw) {
+            Some(name) => match session::load(&name) {
+                Ok(f) => {
+                    let sys = f.system.or_else(|| agent.history.system.clone());
+                    let mut a = agent;
+                    a.history = History::new(sys);
+                    a.history.msgs = f.messages;
+                    if fmt == OutputFmt::Text {
+                        println!(
+                            "resumed `{n}` ({count} messages)",
+                            n = name,
+                            count = a.history.msgs_len()
+                        );
+                    }
+                    a
                 }
-                a
-            }
-            Err(e) => {
-                println!("cannot resume `{name}`: {e}");
+                Err(e) => {
+                    println!("cannot resume `{name}`: {e}");
+                    agent
+                }
+            },
+            None => {
+                println!("no stored session matches `{raw}`");
                 agent
             }
         }
@@ -174,6 +199,7 @@ async fn run_once(
     let result = agent.run_task(task, &mut on_event).await;
     // the event collector holds `events`; release it before assembling output
     drop(on_event);
+    let usage = agent.usage();
     match result {
         Ok(answer) => {
             if fmt == OutputFmt::Json {
@@ -183,6 +209,7 @@ async fn run_once(
                     task: task.to_string(),
                     answer,
                     events,
+                    usage,
                     error: None,
                 };
                 println!("{}", serde_json::to_string(&report).unwrap_or_default());
@@ -203,6 +230,7 @@ async fn run_once(
                     task: task.to_string(),
                     answer: String::new(),
                     events,
+                    usage,
                     error: Some(e.to_string()),
                 };
                 println!("{}", serde_json::to_string(&report).unwrap_or_default());
@@ -256,5 +284,43 @@ fn providers_cmd(cfg_path: Option<&Path>) -> anyhow::Result<u8> {
 
 fn tools_cmd() -> anyhow::Result<u8> {
     println!("{}", ToolRegistry::builtin().catalog());
+    Ok(0)
+}
+
+fn sessions_cmd() -> anyhow::Result<u8> {
+    let summaries = crate::agent::session::list_summaries();
+    if summaries.is_empty() {
+        println!("no saved sessions yet — chat sessions save on exit, or /save");
+        return Ok(0);
+    }
+    for s in summaries {
+        println!(
+            "{CYAN}{:<24}{RESET} {} messages, saved {}s ago",
+            s.name,
+            s.messages,
+            crate::agent::session::now_secs().saturating_sub(s.saved_at)
+        );
+    }
+    Ok(0)
+}
+
+fn export_cmd(session: &str, out: Option<&Path>) -> anyhow::Result<u8> {
+    let name = match crate::agent::session::resolve(session) {
+        Some(n) => n,
+        None => {
+            let have = crate::agent::session::list().join(", ");
+            println!(
+                "{RED}no saved session matches `{session}`{RESET}{DIM}(stored: {have}){RESET}"
+            );
+            return Ok(1);
+        }
+    };
+    let f = crate::agent::session::load(&name)?;
+    let md = crate::agent::session::export_markdown(&f);
+    let target = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(format!("{name}.md")));
+    std::fs::write(&target, md)?;
+    println!("wrote {}", target.display());
     Ok(0)
 }

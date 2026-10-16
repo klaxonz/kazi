@@ -5,6 +5,7 @@ pub mod anthropic;
 pub mod mock;
 pub mod ollama;
 pub mod openai;
+pub mod retry;
 pub mod sse;
 pub mod types;
 
@@ -15,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+pub use retry::RetryProvider;
 pub use types::{LlmRequest, LlmResponse, Message, Role, StreamEvent, ToolCall, ToolSpec, Usage};
 
 /// Which wire protocol a configured provider speaks.

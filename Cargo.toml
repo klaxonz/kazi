@@ -1,6 +1,6 @@
 [package]
 name = "kazi"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
@@ -55,3 +55,6 @@ dirs = "6"
 [profile.release]
 lto = true
 strip = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

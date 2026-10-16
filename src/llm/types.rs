@@ -148,6 +148,15 @@ pub struct Usage {
     pub output_tokens: Option<u64>,
 }
 
+impl Usage {
+    /// Accumulate another usage sample (absent counts add zero).
+    pub fn add(&mut self, other: &Usage) {
+        self.input_tokens = Some(self.input_tokens.unwrap_or(0) + other.input_tokens.unwrap_or(0));
+        self.output_tokens =
+            Some(self.output_tokens.unwrap_or(0) + other.output_tokens.unwrap_or(0));
+    }
+}
+
 /// The outcome of one model round.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LlmResponse {

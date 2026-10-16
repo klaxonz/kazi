@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-17
+
+### Added
+
+- **Automatic provider retries** with exponential backoff (800 ms → 30 s,
+  default 3 attempts, `agent.max_retries`): covers rate limits, provider 5xx
+  and network hiccups. Auth/parse errors never retry. Streams only retry
+  while **nothing** was emitted yet — a mid-stream failure is never duplicated.
+- **Token usage tracking**: usage of the current task is visible in
+  `kazi chat` via `/status` and in the `kazi run --output json` report
+  (`usage: {input_tokens, output_tokens}`), reset per task.
+- `kazi sessions` — list saved sessions with message counts/save times.
+- `kazi export <session> [out.md]` — export a saved conversation as
+  readable markdown (roles, tool calls, tool results with the owning tool).
+- `--resume` and `/resume` accept unambiguous name prefixes.
+
 ## [0.3.0] - 2026-10-17
 
 ### Added

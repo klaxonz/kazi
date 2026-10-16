@@ -130,11 +130,14 @@ impl LiveAgent {
         self.agent.provider().describe()
     }
     fn status(&self) -> String {
+        let u = self.agent.usage();
         format!(
-            "provider/model: {}\nround budget:   {}\nest. context:   {} tokens\nsession: {}",
+            "provider/model: {}\nround budget:   {}\nest. context:   {} tokens\nusage(task):    in {} / out {} tokens\nmessages:       {}",
             self.describe(),
             self.agent.max_rounds(),
             self.agent.history.estimate_tokens(),
+            u.input_tokens.unwrap_or(0),
+            u.output_tokens.unwrap_or(0),
             self.agent.history.msgs_len()
         )
     }
@@ -156,15 +159,18 @@ pub async fn chat_loop(
     let mut live = state.rebuild().await?;
 
     if let Some(name) = &resume {
-        match session::load(name) {
-            Ok(f) => {
-                let n = f.messages.len();
-                let sys = f.system.or_else(|| live.history().system.clone());
-                live.agent.history = History::new(sys);
-                live.agent.history.msgs = f.messages;
-                println!("{DIM}resumed `{name}` ({n} messages){RESET}");
-            }
-            Err(e) => println!("{YELLOW}cannot resume `{name}`: {e}{RESET}"),
+        match session::resolve(name) {
+            Some(n) => match session::load(&n) {
+                Ok(f) => {
+                    let count = f.messages.len();
+                    let sys = f.system.or_else(|| live.history().system.clone());
+                    live.agent.history = History::new(sys);
+                    live.agent.history.msgs = f.messages;
+                    println!("{DIM}resumed `{n}` ({count} messages){RESET}");
+                }
+                Err(e) => println!("{YELLOW}cannot resume `{n}`: {e}{RESET}"),
+            },
+            None => println!("{YELLOW}no stored session matches `{name}`{RESET}"),
         }
     }
     println!(
@@ -292,15 +298,18 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
                 state.session_name = name;
             }
         }
-        ("/resume", name) if !name.is_empty() => match session::load(name) {
-            Ok(f) => {
-                let n = f.messages.len();
-                let sys = f.system.or_else(|| live.history().system.clone());
-                live.agent.history = History::new(sys);
-                live.agent.history.msgs = f.messages;
-                println!("loaded {name} ({n} messages)");
-            }
-            Err(e) => println!("{RED}resume failed: {e}{RESET}"),
+        ("/resume", prefix) if !prefix.is_empty() => match session::resolve(prefix) {
+            Some(n) => match session::load(&n) {
+                Ok(f) => {
+                    let count = f.messages.len();
+                    let sys = f.system.or_else(|| live.history().system.clone());
+                    live.agent.history = History::new(sys);
+                    live.agent.history.msgs = f.messages;
+                    println!("loaded {n} ({count} messages)");
+                }
+                Err(e) => println!("{RED}resume failed: {e}{RESET}"),
+            },
+            None => println!("{RED}no stored session matches `{prefix}`{RESET}"),
         },
         ("/provider", nick) if !nick.is_empty() => {
             let mut next = state.clone();

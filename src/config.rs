@@ -84,6 +84,8 @@ pub struct AgentCfg {
     pub max_context_tokens: Option<u64>,
     /// Concurrent tool executions within one round (default 4).
     pub max_parallel_tools: Option<usize>,
+    /// Provider retries for rate limits / 5xx / network errors (default 3).
+    pub max_retries: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
