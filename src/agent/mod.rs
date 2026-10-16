@@ -209,16 +209,44 @@ impl Agent {
         model_override: Option<&str>,
         yolo: bool,
     ) -> anyhow::Result<Self> {
-        Self::default_cli_with_approver(cfg, provider, model_override, approver(yolo)).await
+        let mode = Self::initial_mode(cfg, yolo);
+        Self::default_cli_with_approver(cfg, provider, model_override, approver(yolo), mode).await
+    }
+
+    /// Startup permission mode: `--yolo` wins, then `agent.permission_mode`,
+    /// then the `Edit` default.
+    pub fn initial_mode(cfg: &crate::config::Config, yolo: bool) -> crate::tools::PermissionMode {
+        if yolo {
+            return crate::tools::PermissionMode::Yolo;
+        }
+        cfg.agent
+            .permission_mode
+            .as_deref()
+            .and_then(crate::tools::PermissionMode::parse)
+            .unwrap_or(crate::tools::PermissionMode::Edit)
+    }
+
+    /// Mode-aware constructor for the CLI: `Yolo` implies the permissive
+    /// approver, everything else keeps the interactive gate.
+    pub async fn default_cli_mode(
+        cfg: &crate::config::Config,
+        provider: Option<&str>,
+        model_override: Option<&str>,
+        mode: crate::tools::PermissionMode,
+    ) -> anyhow::Result<Self> {
+        let a = approver(mode == crate::tools::PermissionMode::Yolo);
+        Self::default_cli_with_approver(cfg, provider, model_override, a, mode).await
     }
 
     /// Like [`Agent::default_cli`], but the caller supplies the approver —
-    /// the TUI injects a channel-based one so prompts never touch stdin.
+    /// the TUI injects a channel-based one so prompts never touch stdin —
+    /// and the startup permission mode.
     pub async fn default_cli_with_approver(
         cfg: &crate::config::Config,
         provider: Option<&str>,
         model_override: Option<&str>,
         given_approver: Arc<dyn crate::tools::Approver>,
+        mode: crate::tools::PermissionMode,
     ) -> anyhow::Result<Self> {
         let resolved = cfg.resolve(provider, model_override)?;
         let mut settings = resolved.settings;
@@ -239,7 +267,7 @@ impl Agent {
         }
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let ctx = crate::tools::tool_ctx(&cfg.tools, &cwd, given_approver);
+        let ctx = crate::tools::tool_ctx(&cfg.tools, &cwd, given_approver, mode);
         Ok(Self::with_parallel(
             wrapped,
             registry,
@@ -554,6 +582,7 @@ mod tests {
             approver: Arc::new(AutoApprover),
             checkpointing: None,
             todos: None,
+            permission: crate::tools::Permission::default(),
         }
     }
 
@@ -1086,6 +1115,7 @@ mod tests {
             approver: Arc::new(DenyApprover),
             checkpointing: None,
             todos: None,
+            permission: crate::tools::Permission::default(),
         };
         let script = vec![
             LlmResponse {

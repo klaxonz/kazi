@@ -46,6 +46,9 @@ pub struct EngineArgs {
     /// Auto-approve run_command without asking (dangerous)
     #[arg(long)]
     pub yolo: bool,
+    /// Startup permission mode: read-only | edit (default) | yolo
+    #[arg(long = "permission-mode", value_name = "MODE")]
+    pub permission_mode: Option<String>,
     /// Force the classic line REPL instead of the TUI (pipes/scripts always
     /// get the line REPL automatically)
     #[arg(long = "no-tui")]
@@ -150,12 +153,13 @@ async fn chat(
     // always get the line REPL unless --tui is forced.
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let want_tui = !args.no_tui && (args.tui || interactive);
+    let mode = startup_mode(&cfg, args);
     if want_tui {
         return tui::chat_loop_with(
             cfg,
             args.provider.clone(),
             args.model.clone(),
-            args.yolo,
+            mode,
             topic,
             args.resume.clone(),
         )
@@ -165,11 +169,24 @@ async fn chat(
         cfg,
         args.provider.clone(),
         args.model.clone(),
-        args.yolo,
+        mode,
         topic,
         args.resume.clone(),
     )
     .await
+}
+
+/// Startup permission mode: `--permission-mode` wins, then `--yolo`, then
+/// `agent.permission_mode`, then the `edit` default.
+fn startup_mode(cfg: &config::Config, args: &EngineArgs) -> crate::tools::PermissionMode {
+    if let Some(m) = args
+        .permission_mode
+        .as_deref()
+        .and_then(crate::tools::PermissionMode::parse)
+    {
+        return m;
+    }
+    Agent::initial_mode(cfg, args.yolo)
 }
 
 #[derive(Serialize)]
@@ -193,13 +210,10 @@ async fn run_once(
     cfg_path: Option<&Path>,
 ) -> anyhow::Result<u8> {
     let (cfg, _) = config::load(cfg_path)?;
-    let agent = Agent::default_cli(
-        &cfg,
-        args.provider.as_deref(),
-        args.model.as_deref(),
-        args.yolo,
-    )
-    .await?;
+    let mode = startup_mode(&cfg, args);
+    let agent =
+        Agent::default_cli_mode(&cfg, args.provider.as_deref(), args.model.as_deref(), mode)
+            .await?;
     let describe = agent.provider().describe();
     let mut agent = if let Some(raw) = &args.resume {
         match session::resolve(raw) {

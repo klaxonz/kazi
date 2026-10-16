@@ -146,6 +146,7 @@ mod tests {
             approver: Arc::new(super::super::AutoApprover),
             checkpointing: None,
             todos: Some(list),
+            permission: super::super::Permission::default(),
         }
     }
 

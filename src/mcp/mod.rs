@@ -257,6 +257,7 @@ mod tests {
             approver: Arc::new(AutoApprover),
             checkpointing: None,
             todos: None,
+            permission: crate::tools::Permission::default(),
         }
     }
 

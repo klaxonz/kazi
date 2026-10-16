@@ -222,6 +222,11 @@ impl Tool for WriteFile {
         let content = super::arg_str(args, "content")?;
         let path = ctx.cwd.join(rel);
         ensure_sandbox(ctx.sandbox_root.as_deref(), &path)?;
+        if ctx.permission.get() == crate::tools::PermissionMode::ReadOnly {
+            return Err(ToolError::new(
+                "write_file is blocked in read-only permission mode (Shift+Tab / /permission to change)",
+            ));
+        }
         if content.len() > WRITE_CAP {
             return Err(ToolError::new(format!(
                 "content is {} bytes, over the {WRITE_CAP}-byte write limit",
@@ -281,6 +286,7 @@ mod tests {
             approver: Arc::new(super::super::AutoApprover),
             checkpointing: None,
             todos: None,
+            permission: super::super::Permission::default(),
         }
     }
 
@@ -307,6 +313,20 @@ mod tests {
             "v1",
             "undo must restore the pre-write content"
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn read_only_blocks_writes() {
+        let d = tempdir("ro");
+        let ctx = ctx_for(d.clone(), None);
+        ctx.permission.set(super::super::PermissionMode::ReadOnly);
+        let err = WriteFile
+            .run(&json!({"path": "x.txt", "content": "hi"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.0.contains("read-only"), "got: {}", err.0);
+        assert!(!d.join("x.txt").exists(), "nothing may be written");
         let _ = std::fs::remove_dir_all(&d);
     }
 

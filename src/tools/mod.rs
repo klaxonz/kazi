@@ -88,6 +88,89 @@ pub struct ToolCtx {
     pub checkpointing: Option<Arc<checkpoint::Checkpointing>>,
     /// The model's plan checklist (absent in bare library tests).
     pub todos: Option<Arc<todo::TodoList>>,
+    /// How much the agent may do without asking (default: `Edit`).
+    pub permission: Permission,
+}
+
+/// How much the agent may do without asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionMode {
+    /// Inspection only: write tools and `run_command` refuse outright.
+    ReadOnly,
+    /// Default: writes run, `run_command` is approval-gated.
+    Edit,
+    /// Everything runs unattended (`--yolo`).
+    Yolo,
+}
+
+impl PermissionMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "read" | "readonly" | "read-only" => Some(Self::ReadOnly),
+            "edit" | "default" => Some(Self::Edit),
+            "yolo" | "auto" => Some(Self::Yolo),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::Edit => "edit",
+            Self::Yolo => "yolo",
+        }
+    }
+
+    /// Next mode in the Shift+Tab cycle.
+    pub fn cycle(&self) -> Self {
+        match self {
+            Self::Edit => Self::ReadOnly,
+            Self::ReadOnly => Self::Yolo,
+            Self::Yolo => Self::Edit,
+        }
+    }
+}
+
+/// Shared, atomically switchable permission mode (TUI Shift+Tab, REPL
+/// `/permission`, config at startup all point at the same cell).
+#[derive(Clone)]
+pub struct Permission {
+    mode: Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl Default for Permission {
+    fn default() -> Self {
+        Self::new(PermissionMode::Edit)
+    }
+}
+
+impl Permission {
+    pub fn new(mode: PermissionMode) -> Self {
+        Self {
+            mode: Arc::new(std::sync::atomic::AtomicU8::new(mode_code(mode))),
+        }
+    }
+
+    pub fn get(&self) -> PermissionMode {
+        match self.mode.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => PermissionMode::ReadOnly,
+            2 => PermissionMode::Yolo,
+            _ => PermissionMode::Edit,
+        }
+    }
+
+    pub fn set(&self, mode: PermissionMode) {
+        self.mode
+            .store(mode_code(mode), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn mode_code(m: PermissionMode) -> u8 {
+    match m {
+        PermissionMode::ReadOnly => 0,
+        PermissionMode::Edit => 1,
+        PermissionMode::Yolo => 2,
+    }
 }
 
 /// One approval answer.
@@ -146,12 +229,13 @@ impl Approver for DenyApprover {
 }
 
 /// Standard [`ToolCtx`] derived from the `[tools]` config section, the launch
-/// directory, and an approver supplied by the caller (CLI injects the
-/// terminal prompt or `AutoApprover` with `--yolo`).
+/// directory, an approver supplied by the caller (CLI injects the terminal
+/// prompt or `AutoApprover` with `--yolo`), and the startup permission mode.
 pub fn tool_ctx(
     cfg: &crate::config::ToolsCfg,
     cwd: &std::path::Path,
     approver: std::sync::Arc<dyn Approver>,
+    mode: PermissionMode,
 ) -> ToolCtx {
     ToolCtx {
         cwd: cwd.to_path_buf(),
@@ -174,6 +258,7 @@ pub fn tool_ctx(
             ))
         }),
         todos: Some(Arc::new(todo::TodoList::default())),
+        permission: Permission::new(mode),
     }
 }
 
@@ -329,6 +414,25 @@ mod tests {
     }
 
     #[test]
+    fn permission_mode_parse_and_cycle() {
+        use PermissionMode::*;
+        assert_eq!(PermissionMode::parse("read-only"), Some(ReadOnly));
+        assert_eq!(PermissionMode::parse(" READ "), Some(ReadOnly));
+        assert_eq!(PermissionMode::parse("yolo"), Some(Yolo));
+        assert_eq!(PermissionMode::parse("edit"), Some(Edit));
+        assert_eq!(PermissionMode::parse("nope"), None);
+        assert_eq!(Edit.cycle(), ReadOnly);
+        assert_eq!(ReadOnly.cycle(), Yolo);
+        assert_eq!(Yolo.cycle(), Edit);
+
+        let p = Permission::default();
+        assert_eq!(p.get(), Edit);
+        let cloned = p.clone();
+        p.set(Yolo);
+        assert_eq!(cloned.get(), Yolo, "clones share the same cell");
+    }
+
+    #[test]
     fn approval_key_takes_first_command_token() {
         assert_eq!(approval_key("$ git status --short\n  cwd: /tmp"), "git");
         assert_eq!(approval_key(" $ cargo test"), "cargo");
@@ -367,6 +471,7 @@ mod tests {
             approver: Arc::new(AutoApprover),
             checkpointing: None,
             todos: None,
+            permission: Permission::default(),
         }
     }
 }

@@ -65,8 +65,14 @@ impl Tool for RunCommand {
 
     /// Gate for the engine's serial pre-flight: allowlisted (and
     /// metacharacter-free) commands run without asking, everything else
-    /// produces a one-screen summary the user confirms.
+    /// produces a one-screen summary the user confirms. `yolo` skips the
+    /// gate entirely; read-only mode refuses commands before this point.
     fn approval_summary(&self, args: &Value, ctx: &ToolCtx) -> Option<String> {
+        if ctx.permission.get() == crate::tools::PermissionMode::Yolo
+            || ctx.permission.get() == crate::tools::PermissionMode::ReadOnly
+        {
+            return None;
+        }
         let Some(cmd) = args.get("command").and_then(Value::as_str) else {
             return None; // malformed call; run() will reject with a precise error
         };
@@ -83,6 +89,11 @@ impl Tool for RunCommand {
     }
 
     async fn run(&self, args: &Value, ctx: &ToolCtx) -> Result<String, ToolError> {
+        if ctx.permission.get() == crate::tools::PermissionMode::ReadOnly {
+            return Err(ToolError::new(
+                "run_command is blocked in read-only permission mode (Shift+Tab / /permission to change)",
+            ));
+        }
         let cmd = arg_str(args, "command")?.trim().to_string();
         if cmd.is_empty() {
             return Err(ToolError::new("argument `command` must not be empty"));
@@ -200,6 +211,17 @@ mod tests {
             .expect("echo must work on both platforms");
         assert!(out.contains("exit code: 0"));
         assert!(out.contains("kazi-ok"));
+    }
+
+    #[tokio::test]
+    async fn read_only_blocks_commands() {
+        let ctx = super::super::tests::test_ctx();
+        ctx.permission.set(crate::tools::PermissionMode::ReadOnly);
+        let err = RunCommand
+            .run(&json!({"command": "echo hi"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.0.contains("read-only"), "got: {}", err.0);
     }
 
     #[tokio::test]

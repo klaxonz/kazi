@@ -262,6 +262,7 @@ mod tests {
             approver: Arc::new(super::super::AutoApprover),
             checkpointing: None,
             todos: None,
+            permission: super::super::Permission::default(),
         }
     }
 

@@ -47,6 +47,11 @@ impl Tool for ApplyPatch {
 
         let path = ctx.cwd.join(rel);
         crate::tools::file::ensure_sandbox(ctx.sandbox_root.as_deref(), &path)?;
+        if ctx.permission.get() == crate::tools::PermissionMode::ReadOnly {
+            return Err(ToolError::new(
+                "apply_patch is blocked in read-only permission mode (Shift+Tab / /permission to change)",
+            ));
+        }
 
         if find.is_empty() {
             return Err(ToolError::new(
@@ -147,6 +152,7 @@ mod tests {
             approver: Arc::new(super::super::AutoApprover),
             checkpointing: None,
             todos: None,
+            permission: super::super::Permission::default(),
         }
     }
 

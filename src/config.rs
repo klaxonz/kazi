@@ -86,6 +86,8 @@ pub struct AgentCfg {
     pub max_parallel_tools: Option<usize>,
     /// Provider retries for rate limits / 5xx / network errors (default 3).
     pub max_retries: Option<u32>,
+    /// Startup permission mode: "read-only" | "edit" (default) | "yolo".
+    pub permission_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]

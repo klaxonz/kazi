@@ -319,6 +319,8 @@ struct Screen {
     pending_approval: Option<ApprovalAsk>,
     /// The model's plan checklist: (content, status) pairs.
     todos: Vec<(String, String)>,
+    /// Current permission mode (mirrors the shared cell; Shift+Tab cycles).
+    mode: crate::tools::PermissionMode,
     /// Set when the user asked to quit.
     quit: bool,
 }
@@ -340,6 +342,7 @@ impl Screen {
             busy: false,
             pending_approval: None,
             todos: Vec::new(),
+            mode: crate::tools::PermissionMode::Edit,
             quit: false,
         }
     }
@@ -488,6 +491,14 @@ impl Screen {
             Span::styled(&self.session_name, Style::default().fg(CYAN)),
             Span::raw("  "),
             Span::styled(budget_note, Style::default().fg(DIM)),
+            Span::styled(
+                format!("  [{}]", self.mode.as_str()),
+                Style::default().fg(match self.mode {
+                    crate::tools::PermissionMode::ReadOnly => YELLOW,
+                    crate::tools::PermissionMode::Edit => DIM,
+                    crate::tools::PermissionMode::Yolo => RED,
+                }),
+            ),
         ];
         if self.scroll.get() > 0 {
             status_spans.push(Span::styled(
@@ -690,7 +701,7 @@ pub async fn chat_loop_with(
     cfg: crate::config::Config,
     provider: Option<String>,
     model: Option<String>,
-    yolo: bool,
+    mode: crate::tools::PermissionMode,
     topic: Option<String>,
     resume: Option<String>,
 ) -> anyhow::Result<u8> {
@@ -716,7 +727,7 @@ pub async fn chat_loop_with(
     };
     // Channel-based approval: the agent asks, the UI loop answers by key.
     let (ask_tx, ask_rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalAsk>();
-    let approver: std::sync::Arc<dyn Approver> = if yolo {
+    let approver: std::sync::Arc<dyn Approver> = if mode == crate::tools::PermissionMode::Yolo {
         std::sync::Arc::new(crate::tools::AutoApprover)
     } else {
         std::sync::Arc::new(TuiApprover::new(ask_tx))
@@ -726,6 +737,7 @@ pub async fn chat_loop_with(
         provider.as_deref(),
         model.as_deref(),
         approver,
+        mode,
     )
     .await
     {
@@ -764,7 +776,7 @@ pub async fn chat_loop_with(
         }
         Err(_) => {
             // terminal can't do alternate screens: classic REPL fallback
-            crate::agent::repl::chat_loop(cfg, provider, model, yolo, topic, resume).await
+            crate::agent::repl::chat_loop(cfg, provider, model, mode, topic, resume).await
         }
     }
 }
@@ -780,6 +792,7 @@ pub async fn chat_loop_tui(
 ) -> anyhow::Result<u8> {
     let provider_desc = agent.provider().describe();
     let max_rounds = agent.max_rounds();
+    let permission = agent.ctx.permission.clone();
 
     enable_raw_mode()?;
     let mut stdout: Stdout = std::io::stdout();
@@ -788,6 +801,7 @@ pub async fn chat_loop_tui(
     let mut terminal = Terminal::new(backend)?;
 
     let mut screen = Screen::new(&provider_desc, &session_name, max_rounds);
+    screen.mode = permission.get();
     screen.push(
         LineKind::Dim,
         "type a task and press Enter (empty line = same task again) — Esc quits".to_string(),
@@ -799,6 +813,7 @@ pub async fn chat_loop_tui(
         agent,
         &on_session_save,
         &mut approvals,
+        &permission,
     )
     .await;
 
@@ -823,6 +838,7 @@ async fn tui_inner(
     agent: Agent,
     on_session_save: &(impl Fn(&Agent) + ?Sized),
     approvals: &mut tokio::sync::mpsc::UnboundedReceiver<ApprovalAsk>,
+    permission: &crate::tools::Permission,
 ) -> anyhow::Result<Option<Agent>> {
     // Agent handoff: the runner task owns the agent while a task runs (the
     // engine needs `&mut`), then parks it back here for the next task and
@@ -913,6 +929,16 @@ async fn tui_inner(
                         } else {
                             screen.quit = true;
                         }
+                    }
+                    KeyCode::BackTab => {
+                        // Shift+Tab: cycle read-only → yolo → edit
+                        let next = permission.get().cycle();
+                        permission.set(next);
+                        screen.mode = next;
+                        screen.push(
+                            LineKind::Dim,
+                            format!("permission mode -> {}", next.as_str()),
+                        );
                     }
                     KeyCode::Enter if !screen.busy => {
                         if let Some(task) = screen.take_input() {

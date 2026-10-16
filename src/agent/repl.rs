@@ -235,6 +235,12 @@ const COMMANDS: &[CmdSpec] = &[
         arg: ArgKind::Toggle,
     },
     CmdSpec {
+        name: "/permission",
+        args: "[read-only|edit|yolo]",
+        help: "show or set the permission mode",
+        arg: ArgKind::No,
+    },
+    CmdSpec {
         name: "/tools",
         args: "",
         help: "list built-in tools (+ MCP servers)",
@@ -465,7 +471,7 @@ pub struct ChatState {
     /// Provider nick; `None` = follow config precedence.
     provider: Option<String>,
     model: Option<String>,
-    yolo: bool,
+    mode: crate::tools::PermissionMode,
     session_name: String,
 }
 
@@ -475,7 +481,7 @@ impl Clone for ChatState {
             cfg: self.cfg.clone(),
             provider: self.provider.clone(),
             model: self.model.clone(),
-            yolo: self.yolo,
+            mode: self.mode,
             session_name: self.session_name.clone(),
         }
     }
@@ -486,14 +492,14 @@ impl ChatState {
         cfg: Config,
         provider: Option<String>,
         model: Option<String>,
-        yolo: bool,
+        mode: crate::tools::PermissionMode,
         session_name: String,
     ) -> Self {
         Self {
             cfg,
             provider,
             model,
-            yolo,
+            mode,
             session_name,
         }
     }
@@ -504,11 +510,11 @@ impl ChatState {
     }
 
     async fn rebuild(&self) -> anyhow::Result<LiveAgent> {
-        Agent::default_cli(
+        Agent::default_cli_mode(
             &self.cfg,
             self.provider.as_deref(),
             self.model.as_deref(),
-            self.yolo,
+            self.mode,
         )
         .await
         .map(|agent| LiveAgent { agent })
@@ -610,7 +616,7 @@ pub async fn chat_loop(
     cfg: Config,
     provider: Option<String>,
     model: Option<String>,
-    yolo: bool,
+    mode: crate::tools::PermissionMode,
     topic: Option<String>,
     resume: Option<String>,
 ) -> anyhow::Result<u8> {
@@ -619,7 +625,7 @@ pub async fn chat_loop(
         Some(name) => session::resolve(name).unwrap_or_else(|| name.to_string()),
         None => pick_session_name(topic.as_deref()),
     };
-    let mut state = ChatState::new(cfg, provider, model, yolo, session_name.clone());
+    let mut state = ChatState::new(cfg, provider, model, mode, session_name.clone());
     let mut live = state.rebuild().await?;
 
     if let Some(name) = &resume {
@@ -646,7 +652,7 @@ pub async fn chat_loop(
     rl.set_helper(Some(SlashHelper {
         nicks: state.cfg.nicks(),
         model: state.model.clone(),
-        yolo: state.yolo,
+        yolo: state.mode == crate::tools::PermissionMode::Yolo,
     }));
 
     loop {
@@ -701,7 +707,7 @@ pub async fn chat_loop(
             }
             // keep completion hints honest with whatever the command changed
             if let Some(h) = rl.helper_mut() {
-                h.yolo = state.yolo;
+                h.yolo = state.mode == crate::tools::PermissionMode::Yolo;
                 h.model = state.model.clone();
             }
             continue;
@@ -889,33 +895,77 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
             }
         }
         ("/yolo", on) => {
+            use crate::tools::PermissionMode;
             let next = match on {
-                "" => !state.yolo,
-                "on" | "1" | "true" => true,
-                "off" | "0" | "false" => false,
+                "" => {
+                    if state.mode == PermissionMode::Yolo {
+                        PermissionMode::Edit
+                    } else {
+                        PermissionMode::Yolo
+                    }
+                }
+                "on" | "1" | "true" => PermissionMode::Yolo,
+                "off" | "0" | "false" => PermissionMode::Edit,
                 _ => {
                     println!("{YELLOW}{}{RESET}", usage_line(spec_of("/yolo").unwrap()));
                     return Flow::Continue;
                 }
             };
-            state.yolo = next;
+            let prev = state.mode;
+            state.mode = next;
             match state.rebuild().await {
                 Ok(new) => {
                     *live = new;
                     println!(
-                        "command auto-approval: {}",
-                        if state.yolo {
-                            format!(
-                                "{GREEN}ON{RESET} (--yolo) — run_command executes without prompts"
-                            )
+                        "permission mode: {GREEN}{}{RESET} ({})",
+                        state.mode.as_str(),
+                        if state.mode == PermissionMode::Yolo {
+                            "run_command executes without prompts"
                         } else {
-                            format!("{YELLOW}OFF{RESET} — run_command asks for approval")
+                            "run_command asks for approval"
                         }
                     );
                 }
                 Err(e) => {
-                    state.yolo = !next; // roll back on failed rebuild
+                    state.mode = prev; // roll back on failed rebuild
                     println!("{RED}toggle failed: {e}{RESET}");
+                }
+            }
+        }
+        ("/permission", arg) => {
+            use crate::tools::PermissionMode;
+            let next = if arg.is_empty() {
+                None
+            } else {
+                match PermissionMode::parse(arg) {
+                    Some(m) => Some(m),
+                    None => {
+                        println!(
+                            "{YELLOW}{}{RESET}",
+                            usage_line(spec_of("/permission").unwrap())
+                        );
+                        return Flow::Continue;
+                    }
+                }
+            };
+            match next {
+                None => println!(
+                    "permission mode: {}(read-only = inspect only, edit = writes allowed, yolo = no prompts)",
+                    state.mode.as_str()
+                ),
+                Some(m) => {
+                    let prev = state.mode;
+                    state.mode = m;
+                    match state.rebuild().await {
+                        Ok(new) => {
+                            *live = new;
+                            println!("permission mode -> {}", state.mode.as_str());
+                        }
+                        Err(e) => {
+                            state.mode = prev;
+                            println!("{RED}switch failed: {e}{RESET}");
+                        }
+                    }
                 }
             }
         }
