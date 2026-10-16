@@ -66,9 +66,9 @@ input stays responsive while a task streams). Pipes and redirections get the
 classic line REPL automatically, so scripts keep working:
 
 ```sh
-kazi chat                     # TUI
+kazi                          # TUI (same as `kazi chat`)
 kazi chat --no-tui            # force the line REPL (streaming text, /commands)
-echo "/status" | kazi chat    # non-tty → line REPL, scriptable
+echo "/status" | kazi         # non-tty → line REPL, scriptable
 ```
 
 Both share the same engine, sessions, and slash commands (`/compact`,

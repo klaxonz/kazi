@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Docs: the primary quickstart is now bare `kazi` (equivalent to
+  `kazi chat`, which has always been the no-subcommand default).
+
 ## [0.10.0] - 2026-10-17
 
 ### Changed
