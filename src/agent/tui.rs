@@ -317,6 +317,8 @@ struct Screen {
     /// A pending approval question: rendered instead of the input line and
     /// answered by the next keystroke (y/a/n).
     pending_approval: Option<ApprovalAsk>,
+    /// The model's plan checklist: (content, status) pairs.
+    todos: Vec<(String, String)>,
     /// Set when the user asked to quit.
     quit: bool,
 }
@@ -337,6 +339,7 @@ impl Screen {
             scroll: std::cell::Cell::new(0),
             busy: false,
             pending_approval: None,
+            todos: Vec::new(),
             quit: false,
         }
     }
@@ -365,6 +368,7 @@ impl Screen {
     /// Render one agent event into the screen state.
     fn consume(&mut self, ev: AgentEvent) {
         match ev {
+            AgentEvent::TodosUpdated { items } => self.todos = items,
             AgentEvent::TextDelta { text } => self.streaming.push_str(&text),
             AgentEvent::ToolStart { name } => {
                 self.flush_streaming();
@@ -438,14 +442,34 @@ impl Screen {
         Some(t)
     }
 
-    /// Paint one frame. Height budget: status 1, input 3, transcript = rest.
+    /// Paint one frame. Height budget: status 1, plan checklist (when the
+    /// model keeps one), transcript, input 3.
     fn draw(&self, f: &mut Frame) {
-        let [status, body, input] = Layout::vertical([
+        let todo_rows = self.todos.len().min(6) as u16;
+        let [status, todos_area, body, input] = Layout::vertical([
             Constraint::Length(1),
+            Constraint::Length(todo_rows),
             Constraint::Min(3),
             Constraint::Length(3),
         ])
         .areas(f.area());
+
+        if todo_rows > 0 {
+            let lines: Vec<Line> = self
+                .todos
+                .iter()
+                .take(6)
+                .map(|(content, status)| {
+                    let (marker, style) = match status.as_str() {
+                        "completed" => ("[x]", Style::default().fg(DIM)),
+                        "in_progress" => ("[>]", Style::default().fg(CYAN)),
+                        _ => ("[ ]", Style::default()),
+                    };
+                    Line::styled(format!("  {marker} {content}"), style)
+                })
+                .collect();
+            f.render_widget(Paragraph::new(Text::from(lines)), todos_area);
+        }
 
         // -- status bar -----------------------------------------------------
         let budget_note = if self.busy {

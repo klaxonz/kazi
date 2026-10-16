@@ -85,6 +85,9 @@ pub enum AgentEvent {
     TextDelta { text: String },
     /// A tool call is starting.
     ToolStart { name: String },
+    /// The model's plan checklist changed: `(content, status)` pairs, in
+    /// order. Emitted after a tool round when `todo_write` ran.
+    TodosUpdated { items: Vec<(String, String)> },
     /// Tool call finished: error flag + one-line preview of its output.
     ToolEnd {
         name: String,
@@ -357,6 +360,8 @@ impl Agent {
         if let Some(cp) = &self.ctx.checkpointing {
             cp.begin_epoch();
         }
+        // plan snapshot across rounds: emit `TodosUpdated` only on change
+        let mut last_todos: Option<Vec<(String, String)>> = None;
 
         for round in 0..self.max_rounds {
             if self.cancelled() {
@@ -453,6 +458,18 @@ impl Agent {
                     outcome.is_error,
                 ));
             }
+            // surface plan changes to the UI
+            if let Some(list) = &self.ctx.todos {
+                let snap: Vec<(String, String)> = list
+                    .snapshot()
+                    .into_iter()
+                    .map(|t| (t.content, t.status))
+                    .collect();
+                if last_todos.as_ref() != Some(&snap) {
+                    last_todos = Some(snap.clone());
+                    on_event(AgentEvent::TodosUpdated { items: snap });
+                }
+            }
             self.history.trim_to_tokens(self.max_context_tokens);
 
             // Proactive compaction AFTER the tool round (before the next
@@ -536,6 +553,7 @@ mod tests {
             allow_commands: vec![],
             approver: Arc::new(AutoApprover),
             checkpointing: None,
+            todos: None,
         }
     }
 
@@ -947,6 +965,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn todo_write_emits_plan_events() {
+        let script = vec![
+            LlmResponse {
+                tool_calls: vec![ToolCall {
+                    id: "t1".into(),
+                    name: "todo_write".into(),
+                    arguments: json!({"todos": [
+                        {"content": "step A", "status": "completed"},
+                        {"content": "step B", "status": "in_progress"}
+                    ]}),
+                }],
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some("planned".into()),
+                ..Default::default()
+            },
+        ];
+        let mut ctx = test_ctx();
+        ctx.todos = Some(std::sync::Arc::new(crate::tools::todo::TodoList::default()));
+        let mut a = agent_with_ctx(script, ctx);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<(String, String)>>::new()));
+        let sink = seen.clone();
+        a.run_task("plan it", move |ev| {
+            if let AgentEvent::TodosUpdated { items } = ev {
+                sink.lock().unwrap().push(items);
+            }
+        })
+        .await
+        .unwrap();
+
+        let snapshots = seen.lock().unwrap();
+        assert_eq!(snapshots.len(), 1, "exactly one plan event");
+        assert_eq!(snapshots[0][0], ("step A".into(), "completed".into()));
+        assert_eq!(snapshots[0][1], ("step B".into(), "in_progress".into()));
+    }
+
+    #[tokio::test]
     async fn usage_accumulates_per_round_and_resets() {
         let script = vec![
             LlmResponse {
@@ -1029,6 +1085,7 @@ mod tests {
             allow_commands: vec![],
             approver: Arc::new(DenyApprover),
             checkpointing: None,
+            todos: None,
         };
         let script = vec![
             LlmResponse {

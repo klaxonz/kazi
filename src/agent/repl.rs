@@ -121,6 +121,17 @@ pub fn render_event(ev: &AgentEvent) {
         AgentEvent::AutoCompactDone { note, est_tokens } => {
             println!(" {DIM}{note} (est. {est_tokens} tokens){RESET}");
         }
+        AgentEvent::TodosUpdated { items } => {
+            println!();
+            for (content, status) in items.iter() {
+                let marker = match status.as_str() {
+                    "completed" => "[x]",
+                    "in_progress" => "[>]",
+                    _ => "[ ]",
+                };
+                println!("{DIM}  {marker} {content}{RESET}");
+            }
+        }
         AgentEvent::RoundDone { .. } => {} // classic REPL stays quiet
     }
 }

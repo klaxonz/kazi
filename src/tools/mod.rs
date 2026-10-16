@@ -12,6 +12,7 @@ pub mod file;
 pub mod patch;
 pub mod search;
 pub mod shell;
+pub mod todo;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -85,6 +86,8 @@ pub struct ToolCtx {
     pub approver: Arc<dyn Approver>,
     /// Write-ahead checkpoints for `/undo` (absent in bare library tests).
     pub checkpointing: Option<Arc<checkpoint::Checkpointing>>,
+    /// The model's plan checklist (absent in bare library tests).
+    pub todos: Option<Arc<todo::TodoList>>,
 }
 
 /// One approval answer.
@@ -170,6 +173,7 @@ pub fn tool_ctx(
                 d.join("kazi").join("checkpoints"),
             ))
         }),
+        todos: Some(Arc::new(todo::TodoList::default())),
     }
 }
 
@@ -229,6 +233,7 @@ impl ToolRegistry {
     /// Standard toolset shipped with kazi.
     pub fn builtin() -> Self {
         Self::new()
+            .register(Arc::new(todo::TodoWrite))
             .register(Arc::new(file::ListDir))
             .register(Arc::new(file::ReadFile))
             .register(Arc::new(search::SearchFiles))
@@ -303,6 +308,7 @@ mod tests {
         assert_eq!(
             names.iter().map(String::as_str).collect::<Vec<_>>(),
             vec![
+                "todo_write",
                 "list_dir",
                 "read_file",
                 "search_files",
@@ -360,6 +366,7 @@ mod tests {
             allow_commands: vec!["echo".into()],
             approver: Arc::new(AutoApprover),
             checkpointing: None,
+            todos: None,
         }
     }
 }

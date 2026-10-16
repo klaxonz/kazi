@@ -256,6 +256,7 @@ mod tests {
             allow_commands: vec![],
             approver: Arc::new(AutoApprover),
             checkpointing: None,
+            todos: None,
         }
     }
 
