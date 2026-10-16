@@ -118,8 +118,10 @@ pub trait Tool: Send + Sync {
 - **错误是数据不是异常**: 不知情就中断的 agent 永远学不会自纠
 - schema 手写不代码生成——一个工具的自契约只在一个地方
 
-内置工具 (`tools/builtin()`):`list_dir` / `read_file` (行号分页+二进制拒绝) /
-`write_file` / `run_command` (§8) / `fetch_url` (§8)。
+全部注册在 `tools/builtin()`,与模型可见的 catalog 同源:
+`list_dir` / `read_file` (行号分页+二进制拒绝) / `apply_patch` (唯一性
+find-replace) / `write_file` / `run_command` (§5) / `fetch_url` (§8),
+外加由 MCP 服务器注入的工具 (§9)。
 
 ## 5. run_command 的安全模型
 
@@ -160,7 +162,39 @@ tool_use 父消息」的历史,单条裁剪会制造幽灵。最新一轮永不�
 - 1 MiB 字节上限 + 30 秒墙钟上限,双保险读流
 - HTML 粗蜕壳成文本 (剥 script/style + 标签),模型消费的是文字不是浏览器
 
-## 9. 添加一个新工具 (30 行以内)
+## 9. v0.2:并行工具与 MCP
+
+**并行工具调用**。`Agent::run_task` 的工具轮执行顺序:
+
+```text
+① 预检(串行):对每个 call 问 Tool::approval_summary —— 需要审批的逐个问
+   (run_command 非白名单),拒绝 → 直接产生 is_error 结果,不再分发
+② 分发(并发):其余 call 一起进 JoinSet,Semaphore(max_parallel_tools,默认 4)
+③ 完成:JoinSet 完成一个发一个 ToolEnd(UI 即时可见)
+④ 回填:最终按【调用顺序】写回历史——OpenAI/Claude 的 tool_call id
+   必须与 tool_result 顺序对应,乱序会被 Anthropic 拒绝
+```
+
+关键取舍:**审批询问必须串行**(终端问答不能互相穿插),而执行可以并发——
+所以把审批逻辑从 `Tool::run` 内部提出来(`approval_summary`),执行时假定已批准。
+
+**MCP 客户端(stdio)**。MCP = JSON-RPC 2.0 over 换行分隔的 stdio。kazi 在
+`src/mcp/` 手写了一个约 300 行的客户端:
+
+- `initialize` 握手 → `notifications/initialized` → `tools/list` → `tools/call`
+- 服务器主动 `ping` 由后台 reader 回答;notifications 直接忽略
+- 按请求超时(pending 表 + oneshot),超时的调用从 pending 摘除
+- 工具桥接:`mcp_<server>_<raw>` 命名清洗到 `[A-Za-z0-9_-] ≤64`
+  (两级协议都限制函数名形态);`isError:true` → 错误 tool-result 回传模型
+- 生命周期:server 子进程 `kill_on_drop`,Arc 计数归零即收割;启动失败的
+  服务器降级为警告跳过,不阻塞 agent
+- 侷限(文档明示):**仅 stdio**;每个 server 的请求串行(一次一个 in-flight)
+  ——可预测性优先,后续版本再开并发请求
+
+测试用 **in-process duplex** 伪服务器走全链路(握手/列表/调用/isError/超时),
+不需要可执行文件,协议逻辑与传输解耦(`McpClient::over(read, write, timeout)`)。
+
+## 10. 添加一个新工具 (30 行以内)
 
 ```rust
 // src/tools/weather.rs
@@ -187,7 +221,7 @@ impl Tool for GetWeather {
 
 schema 会自动进入下一轮请求;模型调用它时循环零改动。
 
-## 10. 为什么不用框架
+## 11. 为什么不用框架
 
 现有的 agent 框架 (LangChain/rig/Swarm…) 提供的是**包装**,购买的是接入速度,
 付出的代价是:层数深了以后,你不知道一次 422 是哪里产生的、流式碎片在哪里被拼坏、

@@ -137,12 +137,22 @@ pub fn tool_ctx(
 
 #[async_trait]
 pub trait Tool: Send + Sync {
-    fn name(&self) -> &'static str;
+    /// Exposed tool name (unique per registry). Static for built-ins,
+    /// dynamic for MCP-served ones (`mcp_<server>_<name>`).
+    fn name(&self) -> &str;
     fn description(&self) -> &str;
     /// JSON-Schema `{"type":"object","properties":{...},"required":[...]}`.
     /// Kept hand-written (not codegen) so each tool documents its own contract
     /// in one visible place.
     fn parameters(&self) -> Value;
+    /// Pre-flight gate: return `Some(summary)` when executing this call needs
+    /// explicit approval. The engine asks the [`Approver`] ONCE per call,
+    /// serially, before dispatching — so parallel rounds never interleave
+    /// prompts, and `run()` can assume it was approved.
+    /// `None` = no gate (default).
+    fn approval_summary(&self, _args: &Value, _ctx: &ToolCtx) -> Option<String> {
+        None
+    }
     async fn run(&self, args: &Value, ctx: &ToolCtx) -> Result<String, ToolError>;
 }
 
@@ -189,8 +199,8 @@ impl ToolRegistry {
             .register(Arc::new(fetch::FetchUrl))
     }
 
-    pub fn names(&self) -> Vec<&'static str> {
-        self.tools.iter().map(|t| t.name()).collect()
+    pub fn names(&self) -> Vec<String> {
+        self.tools.iter().map(|t| t.name().to_string()).collect()
     }
 
     /// Tool catalog as JSON spec list for the current model round.
@@ -212,6 +222,13 @@ impl ToolRegistry {
             .map(|t| format!("{}: {}", t.name(), t.description()))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Engine-side pre-flight: `Some(summary)` when this call needs explicit
+    /// user approval (see [`Tool::approval_summary`]).
+    pub fn approval_summary(&self, call: &ToolCall, ctx: &ToolCtx) -> Option<String> {
+        let tool = self.tools.iter().find(|t| t.name() == call.name)?;
+        tool.approval_summary(&call.arguments, ctx)
     }
 
     /// Execute a model-requested tool call. Infallible at this level — errors
@@ -245,7 +262,7 @@ mod tests {
         let reg = ToolRegistry::builtin();
         let names = reg.names();
         assert_eq!(
-            names,
+            names.iter().map(String::as_str).collect::<Vec<_>>(),
             vec![
                 "list_dir",
                 "read_file",

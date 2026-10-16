@@ -103,6 +103,27 @@ Override anything per call: `--provider <nick>` `--model <name>`
 Agents fail lucidly on purpose: every error text is fed back to the model (`is_error`),
 which usually corrects its next call — that's how the loop learns.
 
+When several tools are requested in one round, they run **in parallel** (default
+cap 4, `agent.max_parallel_tools`); approval prompts are asked serially first,
+so a denied command never blocks the others from completing.
+
+## MCP servers
+
+Local MCP (Model Context Protocol) servers plug into the same catalog as
+built-in tools — add them to `config.toml`:
+
+```toml
+[mcp.servers.files]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "D:/Code"]
+```
+
+Every tool the server exposes becomes available as `mcp_<server>_<name>`
+(schema passed through verbatim; `isError` from the server surfaces to the
+model as an error result). Servers spawn at startup over stdio; a server that
+fails to initialize logs a warning and is skipped, never blocking the rest.
+Remote (SSE/HTTP) MCP servers are not supported yet.
+
 ## Safety (read before the first surprise)
 
 - `run_command` never executes without either a config allowlist match, a **y/N
@@ -123,7 +144,7 @@ Everything the CLI does is library API (crate docs: `cargo doc --open`):
 use kazi::agent::{Agent, repl};
 
 let cfg = kazi::config::load(None)?.0;
-let agent = Agent::default_cli(&cfg, Some("deepseek"), None, false)?;
+let mut agent = Agent::default_cli(&cfg, Some("deepseek"), None, false).await?;
 let answer = agent
     .run_task("How many .rs files are in src?", |e| repl::render_event(&e))
     .await?;

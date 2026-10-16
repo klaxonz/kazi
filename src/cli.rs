@@ -141,7 +141,8 @@ async fn run_once(
         args.provider.as_deref(),
         args.model.as_deref(),
         args.yolo,
-    )?;
+    )
+    .await?;
     let describe = agent.provider().describe();
     let mut agent = if let Some(name) = &args.resume {
         match session::load(name) {

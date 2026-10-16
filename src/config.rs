@@ -50,8 +50,26 @@ pub struct Config {
     pub provider: Option<String>,
     pub agent: AgentCfg,
     pub tools: ToolsCfg,
+    /// MCP stdio servers to bridge as tools (`[mcp.servers.<nick>]`).
+    pub mcp: McpCfg,
     /// nickname → entry; BTreeMap keeps stable ordering for errors and `first`.
     pub providers: BTreeMap<String, ProviderEntry>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default)]
+pub struct McpCfg {
+    /// nickname → server entry; each spawns a stdio MCP server process.
+    pub servers: BTreeMap<String, McpServerEntry>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct McpServerEntry {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -59,6 +77,8 @@ pub struct Config {
 pub struct AgentCfg {
     pub max_rounds: Option<u32>,
     pub max_context_tokens: Option<u64>,
+    /// Concurrent tool executions within one round (default 4).
+    pub max_parallel_tools: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]

@@ -108,13 +108,14 @@ impl ChatState {
         }
     }
 
-    fn rebuild(&self) -> anyhow::Result<LiveAgent> {
+    async fn rebuild(&self) -> anyhow::Result<LiveAgent> {
         Agent::default_cli(
             &self.cfg,
             self.provider.as_deref(),
             self.model.as_deref(),
             self.yolo,
         )
+        .await
         .map(|agent| LiveAgent { agent })
     }
 }
@@ -152,7 +153,7 @@ pub async fn chat_loop(
 ) -> anyhow::Result<u8> {
     let session_name = resume.clone().unwrap_or_else(session::default_name);
     let mut state = ChatState::new(cfg, provider, model, yolo, session_name);
-    let mut live = state.rebuild()?;
+    let mut live = state.rebuild().await?;
 
     if let Some(name) = &resume {
         match session::load(name) {
@@ -190,7 +191,7 @@ pub async fn chat_loop(
         let _ = rl.add_history_entry(&line);
 
         if let Some(cmd) = line.strip_prefix('/') {
-            if handle_command(cmd, &mut state, &mut live).is_exit() {
+            if handle_command(cmd, &mut state, &mut live).await.is_exit() {
                 break;
             }
             continue;
@@ -246,7 +247,7 @@ impl Flow {
     }
 }
 
-fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) -> Flow {
+async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) -> Flow {
     let (verb, arg) = cmd
         .split_once(' ')
         .map(|(a, b)| (a, b.trim()))
@@ -304,7 +305,7 @@ fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) -> Flo
         ("/provider", nick) if !nick.is_empty() => {
             let mut next = state.clone();
             next.provider = Some(nick.to_string());
-            match next.rebuild() {
+            match next.rebuild().await {
                 Ok(new) => {
                     println!("switched -> {}", new.describe());
                     *live = new;
@@ -315,7 +316,7 @@ fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) -> Flo
         ("/model", m) if !m.is_empty() => {
             let mut next = state.clone();
             next.model = Some(m.to_string());
-            match next.rebuild() {
+            match next.rebuild().await {
                 Ok(new) => {
                     println!("switched -> {}", new.describe());
                     *live = new;

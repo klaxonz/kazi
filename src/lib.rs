@@ -18,6 +18,7 @@
 //! // config.toml: [providers.deepseek] type = "openai" ...
 //! let cfg = kazi::config::load(None).expect("config").0;
 //! let mut agent = Agent::default_cli(&cfg, Some("deepseek"), None, false)
+//!     .await
 //!     .expect("provider wired");
 //!
 //! let answer = agent
@@ -46,6 +47,7 @@ pub mod agent;
 pub mod cli;
 pub mod config;
 pub mod llm;
+pub mod mcp;
 pub mod tools;
 
 /// Crate version (matches `CARGO_PKG_VERSION`), handy for embedders.

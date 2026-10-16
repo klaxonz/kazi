@@ -20,6 +20,11 @@ use super::{arg_str, optional_str, Tool, ToolCtx, ToolError};
 
 pub struct RunCommand;
 
+/// Text handed back to the model when the user denies a command. It lives in
+/// the engine's pre-flight now — the model gets it as an error tool-result.
+pub const COMMAND_DENIED: &str =
+    "the user declined to run this command. Do not retry it; acknowledge and propose a different approach.";
+
 /// True when an allowlist entry covers this command *and* the command cannot
 /// smuggle a second statement through shell metacharacters.
 pub fn is_auto_approved(cmd: &str, allow: &[String]) -> bool {
@@ -58,6 +63,25 @@ impl Tool for RunCommand {
         })
     }
 
+    /// Gate for the engine's serial pre-flight: allowlisted (and
+    /// metacharacter-free) commands run without asking, everything else
+    /// produces a one-screen summary the user confirms.
+    fn approval_summary(&self, args: &Value, ctx: &ToolCtx) -> Option<String> {
+        let Some(cmd) = args.get("command").and_then(Value::as_str) else {
+            return None; // malformed call; run() will reject with a precise error
+        };
+        let cmd = cmd.trim();
+        if is_auto_approved(cmd, &ctx.allow_commands) {
+            return None;
+        }
+        let cwd = args
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(|d| ctx.cwd.join(d))
+            .unwrap_or_else(|| ctx.cwd.clone());
+        Some(format!("$ {cmd}\n  cwd: {}", cwd.display()))
+    }
+
     async fn run(&self, args: &Value, ctx: &ToolCtx) -> Result<String, ToolError> {
         let cmd = arg_str(args, "command")?.trim().to_string();
         if cmd.is_empty() {
@@ -73,16 +97,7 @@ impl Tool for RunCommand {
             }
             None => ctx.cwd.clone(),
         };
-
-        if !is_auto_approved(&cmd, &ctx.allow_commands) {
-            let summary = format!("$ {cmd}\n  cwd: {}", dir.display());
-            if !ctx.approver.decide("run_command", &summary).await {
-                return Err(ToolError::new(
-                    "the user declined to run this command. Do not retry it; acknowledge and propose a different approach.",
-                ));
-            }
-        }
-
+        // NOTE: approval already happened (engine pre-flight / allowlist).
         let mut c = build_command(&cmd, &dir);
         c.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

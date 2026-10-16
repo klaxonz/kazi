@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-17
+
+### Added
+
+- **MCP client (stdio)**: configure local MCP servers in `[mcp.servers.*]` —
+  their tools join the agent's catalog automatically (`mcp_<server>_<name>`),
+  hand-rolled JSON-RPC 2.0 transport with ping handling, per-call timeout, and
+  graceful degradation (a dead server never stops the agent). `isError` from
+  the server surfaces as an error tool-result the model can react to.
+- **Parallel tool calls**: when one model round requests several tools they
+  now execute concurrently (default cap 4, `agent.max_parallel_tools`), while
+  approval prompts are asked serially *before* dispatch so they never
+  interleave; denied calls become error results for the remaining ones to
+  still run. Results are re-ordered back to call order to keep the wire
+  protocol consistent.
+
+### Changed
+
+- `Tool::approval_summary` pre-flight: the run_command gate moved from inside
+  `run()` into a separate hook, enabling the parallel dispatch above without
+  blocking prompts. Behavior for users is unchanged.
+
 ## [0.1.1] - 2026-10-16
 
 ### Added

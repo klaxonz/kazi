@@ -8,6 +8,14 @@ provider = "deepseek"
 # [agent]
 # max_rounds = 30                  # hard cap on model<->tool rounds per task
 # max_context_tokens = 60000       # rough budget; oldest non-system turns are dropped
+# max_parallel_tools = 4           # concurrent tool executions within a round
+
+# [mcp]
+# Local MCP (Model Context Protocol) servers; their tools join the catalog as
+# mcp_<server>_<name>, spawned at agent start via stdio:
+# [mcp.servers.files]
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "D:/Code"]
 
 # [tools]
 # sandbox_root = ""                # if set, file tools cannot touch paths outside this root
