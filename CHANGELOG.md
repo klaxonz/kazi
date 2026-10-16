@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Slash-command redesign** (REPL):
+  - Table-driven commands: one `COMMANDS` table now feeds `/help`, TAB
+    completion, ghost-text argument hints, usage errors, and the startup
+    banner — adding a command is one table row plus one match arm.
+  - `/save` removed. Writing always goes through autosave; renaming a session
+    is `/new <name>`. This eliminates the old trap where `/save name` silently
+    turned into save-as and orphaned the previously autosaved session.
+  - `/clear` repoints autosave at a fresh timestamped session file, so it can
+    never rewrite the session the history came from (the old help text promised
+    "keep the session file" while exit would overwrite it).
+  - Argument-taking commands (`/resume`, `/provider`, `/model`) now print usage
+    + the available options when called without an argument, instead of
+    falling through to "unknown command".
+  - `/yolo [on|off]` added: toggle command auto-approval without restarting
+    (previously `--yolo` was CLI-only even though the state field existed).
+  - Unknown commands get a "did you mean …?" hint (edit distance) instead of a
+    bare "see /help".
+
+### Added
+
+- TAB completion and ghost hints in the REPL: slash verbs complete from the
+  table; `/resume` completes stored-session names, `/provider` completes
+  configured nicks, `/yolo` completes on/off. `/model <TAB>`-style lines show
+  inline argument hints with current values.
+
 - Repository URL corrected to github.com/klaxonz (metadata only).
 
 ## [0.6.0] - 2026-10-17

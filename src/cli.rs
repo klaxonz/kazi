@@ -300,7 +300,7 @@ fn tools_cmd() -> anyhow::Result<u8> {
 fn sessions_cmd() -> anyhow::Result<u8> {
     let summaries = crate::agent::session::list_summaries();
     if summaries.is_empty() {
-        println!("no saved sessions yet — chat sessions save on exit, or /save");
+        println!("no saved sessions yet — chat sessions save automatically after each task");
         return Ok(0);
     }
     for s in summaries {
