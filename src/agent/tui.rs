@@ -393,7 +393,7 @@ pub async fn chat_loop_with(
 /// restored on every return path. Returns unchanged session data reduction —
 /// persistence continues to live in repl.rs.
 pub async fn chat_loop_tui(
-    mut agent: Agent,
+    agent: Agent,
     session_name: String,
     on_session_save: impl Fn(&Agent),
 ) -> anyhow::Result<u8> {
@@ -412,16 +412,15 @@ pub async fn chat_loop_tui(
         "type a task and press Enter (empty line = same task again) — Esc quits".to_string(),
     );
 
-    let res = tui_inner(&mut terminal, &mut screen, &mut agent, &on_session_save).await;
+    let res = tui_inner(&mut terminal, &mut screen, agent, &on_session_save).await;
 
     disable_raw_mode()?;
     execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
     std::io::stdout().flush().ok();
 
     let quit_clean = screen.quit;
-    if screen.lines.len() > 1 {
-        on_session_save(&agent);
-    }
+    // the save already happened inside tui_inner with the real agent
+    // (`None` = aborted mid-task: nothing new to persist)
     res.map(|_| if quit_clean { 0 } else { 1 })
 }
 
@@ -439,21 +438,16 @@ fn visible_width(s: &str) -> usize {
 async fn tui_inner(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     screen: &mut Screen,
-    agent: &mut Agent,
+    agent: Agent,
     on_session_save: &(impl Fn(&Agent) + ?Sized),
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<Agent>> {
     // Agent handoff: the runner task owns the agent while a task runs (the
     // engine needs `&mut`), then parks it back here for the next task and
-    // for the final save. `Option` because it's empty only DURING a run.
+    // for the final save. The slot is `None` only DURING a run; if the user
+    // aborts mid-task (Esc) the runner is dropped together with the agent and
+    // the slot stays empty — the caller then skips the final save.
     let shared_agent: std::sync::Arc<tokio::sync::Mutex<Option<Agent>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(None));
-
-    // First fill: park the freshly built agent. Then the loop drains it on
-    // demand instead of `*agent` borrows.
-    {
-        let mut slot = shared_agent.lock().await;
-        *slot = Some(std::mem::replace(agent, parked_placeholder()));
-    }
+        std::sync::Arc::new(tokio::sync::Mutex::new(Some(agent)));
 
     enum Pump {
         Ev(AgentEvent),
@@ -527,21 +521,14 @@ async fn tui_inner(
         }
     }
 
-    // retrieve the agent for the caller's save hook
+    // hand the agent back to the caller (None when Esc aborted a busy task)
     let returned = shared_agent.lock().await.take();
-    if let Some(a) = returned {
-        *agent = a;
+    if let Some(agent) = &returned {
+        if screen.lines.len() > 1 {
+            on_session_save(agent);
+        }
     }
-    if screen.lines.len() > 1 {
-        on_session_save(agent);
-    }
-    Ok(())
-}
-
-/// Placeholder only to satisfy `std::mem::replace` types; immediately
-/// overwritten by take() semantics. Not a real agent.
-fn parked_placeholder() -> Agent {
-    unreachable!("see repl.rs — placeholder should never be constructed")
+    Ok(returned)
 }
 
 #[cfg(test)]

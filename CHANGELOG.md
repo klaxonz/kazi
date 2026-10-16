@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-17
+
+### Fixed
+
+- **TUI crashed on startup** (`unreachable!()` at tui.rs:544): the agent
+  handoff into the runner task used `mem::replace` with a placeholder that
+  was defined as `unreachable!()` — so the very first thing the TUI did was
+  panic. The handoff now moves the agent by value into an `Option` slot; an
+  Esc-abort mid-task correctly skips the final save instead of touching a
+  fake agent. Verified with a live TUI smoke run (process stays up).
+
 ### Changed
 
 - Docs: the primary quickstart is now bare `kazi` (equivalent to
