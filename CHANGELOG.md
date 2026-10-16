@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-17
+
+### Fixed
+
+- `kazi chat` slash commands (`/status`, `/help`, `/tools`, ...) always
+  answered `unknown command` — the input loop stripped the leading `/` before
+  dispatching, while every command matcher expected the slash form. The
+  dispatcher now receives the full line; verified with a scripted REPL run.
+  (No user-facing regression for tasks; only slash commands were dead.)
+
 ## [0.4.0] - 2026-10-17
 
 ### Added

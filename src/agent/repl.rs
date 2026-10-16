@@ -196,8 +196,9 @@ pub async fn chat_loop(
         }
         let _ = rl.add_history_entry(&line);
 
-        if let Some(cmd) = line.strip_prefix('/') {
-            if handle_command(cmd, &mut state, &mut live).await.is_exit() {
+        if line.starts_with('/') {
+            // pass the full line (with '/') — arms match on the slash form
+            if handle_command(&line, &mut state, &mut live).await.is_exit() {
                 break;
             }
             continue;
