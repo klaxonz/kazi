@@ -14,9 +14,10 @@ use tokio::process::Child;
 use crate::llm::ToolSpec;
 use crate::tools::{Tool, ToolCtx, ToolError};
 
-use super::client::{McpClient, ToolCallOut};
+use super::client::ToolCallOut;
+use super::McpSession;
 
-/// One tool served by one MCP server.
+/// One tool served by one MCP server (stdio or HTTP transport).
 pub struct McpTool {
     /// sanitized exposed name (registry key).
     pub name: String,
@@ -24,10 +25,10 @@ pub struct McpTool {
     pub raw_name: String,
     pub description: String,
     pub schema: Value,
-    pub client: Arc<McpClient>,
+    pub client: Arc<dyn McpSession>,
     /// The server process, kept alive for as long as any of its tools live
-    /// (`kill_on_drop` reaps it when the registry is replaced). `None` only
-    /// in tests that use an in-process transport.
+    /// (`kill_on_drop` reaps it when the registry is replaced). `None` in
+    /// tests and for remote (HTTP) servers — there is nothing to reap.
     pub child: Option<Arc<Child>>,
 }
 

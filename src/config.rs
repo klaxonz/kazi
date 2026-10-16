@@ -65,11 +65,16 @@ pub struct McpCfg {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct McpServerEntry {
-    pub command: String,
+    /// stdio transport: executable to spawn (with `args`/`env`)
+    pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// streamable-HTTP transport: MCP endpoint URL
+    pub url: Option<String>,
+    /// env var holding the bearer token for HTTP servers (`Authorization`)
+    pub api_key_env: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]

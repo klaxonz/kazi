@@ -116,13 +116,21 @@ built-in tools — add them to `config.toml`:
 [mcp.servers.files]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "D:/Code"]
+
+# remote servers use `url` instead of `command` (Streamable HTTP transport):
+[mcp.servers.remote]
+url = "https://mcp.example.com/mcp"
+api_key_env = "EXAMPLE_TOKEN"     # sent as `Authorization: Bearer <token>`
 ```
 
-Every tool the server exposes becomes available as `mcp_<server>_<name>`
-(schema passed through verbatim; `isError` from the server surfaces to the
-model as an error result). Servers spawn at startup over stdio; a server that
-fails to initialize logs a warning and is skipped, never blocking the rest.
-Remote (SSE/HTTP) MCP servers are not supported yet.
+Tool names from a server become `mcp_<server>_<name>` so they never collide
+with built-ins (schemas pass through verbatim; server-side `isError` surfaces
+to the model as an error result). stdio servers spawn at startup and die with
+the agent; HTTP servers are only touched per request. A server that fails to
+initialize logs a warning and is skipped, never blocking the rest.
+
+Both transports serve tool calls **concurrently** (routed by JSON-RPC id), so
+a single server can answer several calls from one model round at once.
 
 ## Safety (read before the first surprise)
 

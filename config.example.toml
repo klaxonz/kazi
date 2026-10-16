@@ -16,6 +16,10 @@ provider = "deepseek"
 # [mcp.servers.files]
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "D:/Code"]
+# Remote ones speak Streamable HTTP instead (no local process needed):
+# [mcp.servers.remote]
+# url = "https://mcp.example.com/mcp"
+# api_key_env = "EXAMPLE_TOKEN"
 
 # [tools]
 # sandbox_root = ""                # if set, file tools cannot touch paths outside this root

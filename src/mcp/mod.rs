@@ -1,25 +1,57 @@
-//! MCP (Model Context Protocol) stdio client.
+//! MCP (Model Context Protocol) client: two transports, one session trait.
 //!
-//! Hand-rolled JSON-RPC 2.0 over newline-delimited stdio — the subset every
-//! MCP stdio server speaks. Configured servers spawn at agent build time;
-//! a server that fails to start or initialize degrades to a terminal warning
-//! and its tools are skipped (a dead MCP server never kills the agent).
+//! - **stdio** (`client.rs`): subprocess pipes, hand-rolled JSON-RPC 2.0 over
+//!   newline-delimited messages — the subset every MCP stdio server speaks.
+//! - **streamable HTTP** (`http.rs`): remote servers; POST per message,
+//!   plain-JSON or SSE responses, `Mcp-Session-Id` + Bearer auth.
+//!
+//! Configured servers load at agent build time; a server that fails to start
+//! or initialize degrades to a terminal warning and its tools are skipped
+//! (a dead MCP server never kills the agent).
 
 pub mod bridge;
 pub mod client;
+pub mod http;
 
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::AsyncRead;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
+
+use async_trait::async_trait;
+use serde_json::Value;
 
 pub use bridge::McpTool;
 pub use client::{McpClient, McpError, ToolCallOut};
+pub use http::HttpMcpSession;
 
 /// Per-call ceiling for `tools/call` (server-side work can be slow).
 pub const MCP_CALL_TIMEOUT_SECS: u64 = 60;
+
+/// One established MCP session, regardless of transport. stdio (subprocess
+/// pipes) and Streamable HTTP (remote servers) both implement this — the
+/// tool bridge and the loader only see these three calls.
+#[async_trait]
+pub trait McpSession: Send + Sync {
+    async fn initialize(&self) -> Result<(), McpError>;
+    async fn list_tools(&self) -> Result<Vec<(String, String, Value)>, McpError>;
+    async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolCallOut, McpError>;
+}
+
+#[async_trait]
+impl McpSession for McpClient {
+    async fn initialize(&self) -> Result<(), McpError> {
+        McpClient::initialize(self).await
+    }
+    async fn list_tools(&self) -> Result<Vec<(String, String, Value)>, McpError> {
+        McpClient::list_tools(self).await
+    }
+    async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolCallOut, McpError> {
+        McpClient::call_tool(self, name, arguments).await
+    }
+}
 
 /// Spawn every configured server and collect their bridged tools.
 pub async fn load_mcp_tools(
@@ -41,7 +73,50 @@ async fn load_one(
     entry: &crate::config::McpServerEntry,
     call_timeout: Duration,
 ) -> Result<Vec<Arc<dyn crate::tools::Tool>>, McpError> {
-    let mut cmd = Command::new(&entry.command);
+    // Transport selection: `url` → streamable HTTP; otherwise a local
+    // subprocess is spawned over stdio. Both produce the same `McpSession`.
+    let (session, child): (Arc<dyn McpSession>, Option<Arc<Child>>) = if let Some(url) = &entry.url
+    {
+        let key = match &entry.api_key_env {
+            Some(env) => Some(
+                std::env::var(env)
+                    .map_err(|_| McpError::Spawn(format!("auth env var {env} is not set")))?,
+            ),
+            None => None,
+        };
+        (Arc::new(HttpMcpSession::new(url, key, call_timeout)), None)
+    } else {
+        let (c, ch) = spawn_stdio(entry, call_timeout).await?;
+        (c, Some(ch))
+    };
+
+    session.initialize().await?;
+    let mut out: Vec<Arc<dyn crate::tools::Tool>> = Vec::new();
+    for (raw, description, schema) in session.list_tools().await? {
+        out.push(Arc::new(McpTool {
+            name: McpTool::exposed_name(nick, &raw),
+            raw_name: raw,
+            description,
+            schema,
+            client: session.clone(),
+            child: child.clone(),
+        }));
+    }
+    Ok(out)
+}
+
+/// Spawn a local MCP server process and connect it over stdio.
+/// The returned child stays alive exactly as long as the caller keeps it.
+async fn spawn_stdio(
+    entry: &crate::config::McpServerEntry,
+    call_timeout: Duration,
+) -> Result<(Arc<McpClient>, Arc<Child>), McpError> {
+    let command = entry
+        .command
+        .as_deref()
+        .filter(|c| !c.trim().is_empty())
+        .ok_or_else(|| McpError::Spawn("no `command` and no `url` configured".into()))?;
+    let mut cmd = Command::new(command);
     cmd.args(&entry.args)
         .kill_on_drop(true)
         .stdin(Stdio::piped())
@@ -54,7 +129,7 @@ async fn load_one(
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| McpError::Spawn(format!("`{}`: {e}", entry.command)))?;
+        .map_err(|e| McpError::Spawn(format!("`{command}`: {e}")))?;
     let stdout = child
         .stdout
         .take()
@@ -67,23 +142,8 @@ async fn load_one(
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(drain(stderr));
     }
-    // the process stays alive exactly as long as the tools do
     let child = Arc::new(child);
-
-    let client = McpClient::over(stdout, stdin, call_timeout);
-    client.initialize().await?;
-    let mut out: Vec<Arc<dyn crate::tools::Tool>> = Vec::new();
-    for (raw, description, schema) in client.list_tools().await? {
-        out.push(Arc::new(McpTool {
-            name: McpTool::exposed_name(nick, &raw),
-            raw_name: raw,
-            description,
-            schema,
-            client: client.clone(),
-            child: Some(child.clone()),
-        }));
-    }
-    Ok(out)
+    Ok((McpClient::over(stdout, stdin, call_timeout), child.clone()))
 }
 
 async fn drain<R: AsyncRead + Unpin + Send>(mut r: R) {
@@ -110,13 +170,18 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     /// Minimal MCP echo server over a duplex stream (in-process, no exec).
+    /// Plus a `slow`/`fast` pair that proves concurrent requests are routed
+    /// by id, not by reply order: `slow` defers, `fast` replies immediately,
+    /// and only then does the deferred one go out.
     async fn echo_server(stream: tokio::io::DuplexStream) {
         let (read, mut write) = tokio::io::split(stream);
         let mut lines = BufReader::new(read).lines();
+        let mut deferred: Option<serde_json::Value> = None;
         while let Ok(Some(line)) = lines.next_line().await {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
+            let mut replies: Vec<serde_json::Value> = Vec::new();
             let reply = match v["method"].as_str() {
                 Some("initialize") => json!({
                     "jsonrpc": "2.0", "id": v["id"].clone(),
@@ -143,14 +208,34 @@ mod tests {
                         "jsonrpc": "2.0", "id": v["id"].clone(),
                         "result": {"content": [{"type": "text", "text": "boom"}], "isError": true}
                     }),
+                    // deferred: answered after the NEXT call arrives
+                    Some("slow") => {
+                        deferred = Some(json!({
+                            "jsonrpc": "2.0", "id": v["id"].clone(),
+                            "result": {"content": [{"type": "text", "text": "echo:deferred"}]}
+                        }));
+                        continue;
+                    }
+                    Some("fast") => {
+                        if let Some(d) = deferred.take() {
+                            replies.push(d);
+                        }
+                        json!({
+                            "jsonrpc": "2.0", "id": v["id"].clone(),
+                            "result": {"content": [{"type": "text", "text": "echo:immediate"}]}
+                        })
+                    }
                     _ => continue, // "hang": no reply ever
                 },
                 Some("ping") => json!({"jsonrpc": "2.0", "id": v["id"].clone(), "result": {}}),
                 _ => continue,
             };
-            write.write_all(reply.to_string().as_bytes()).await.unwrap();
-            write.write_all(b"\n").await.unwrap();
-            write.flush().await.unwrap();
+            replies.push(reply);
+            for r in replies {
+                write.write_all(r.to_string().as_bytes()).await.unwrap();
+                write.write_all(b"\n").await.unwrap();
+                write.flush().await.unwrap();
+            }
         }
     }
 
@@ -187,6 +272,23 @@ mod tests {
             .expect("call");
         assert_eq!(out.text, "echo:hi");
         assert!(!out.is_error);
+    }
+
+    #[tokio::test]
+    async fn concurrent_calls_match_by_id() {
+        let client = connect();
+        client.initialize().await.expect("handshake");
+        // two requests in flight; the server answers `fast` BEFORE `slow`
+        let (slow, fast) = tokio::join!(
+            client.call_tool("slow", json!({})),
+            client.call_tool("fast", json!({})),
+        );
+        let slow = slow.expect("deferred call resolves by id");
+        let fast = fast.expect("immediate call resolves by id");
+        assert_eq!(slow.text, "echo:deferred");
+        assert_eq!(fast.text, "echo:immediate");
+        // neither response leaked across
+        assert!(!slow.is_error && !fast.is_error);
     }
 
     #[tokio::test]

@@ -162,7 +162,7 @@ tool_use 父消息」的历史,单条裁剪会制造幽灵。最新一轮永不�
 - 1 MiB 字节上限 + 30 秒墙钟上限,双保险读流
 - HTML 粗蜕壳成文本 (剥 script/style + 标签),模型消费的是文字不是浏览器
 
-## 9. v0.2:并行工具与 MCP
+## 9. 并行工具与 MCP(stdio + Streamable HTTP)
 
 **并行工具调用**。`Agent::run_task` 的工具轮执行顺序:
 
@@ -178,21 +178,23 @@ tool_use 父消息」的历史,单条裁剪会制造幽灵。最新一轮永不�
 关键取舍:**审批询问必须串行**(终端问答不能互相穿插),而执行可以并发——
 所以把审批逻辑从 `Tool::run` 内部提出来(`approval_summary`),执行时假定已批准。
 
-**MCP 客户端(stdio)**。MCP = JSON-RPC 2.0 over 换行分隔的 stdio。kazi 在
-`src/mcp/` 手写了一个约 300 行的客户端:
+**MCP 客户端**。MCP = JSON-RPC 2.0;kazi 手写两个约 300 行的传输,共用一个
+`McpSession` 抽象(initialize / tools/list / tools/call 三个调用,桥接层零感知):
 
-- `initialize` 握手 → `notifications/initialized` → `tools/list` → `tools/call`
-- 服务器主动 `ping` 由后台 reader 回答;notifications 直接忽略
-- 按请求超时(pending 表 + oneshot),超时的调用从 pending 摘除
-- 工具桥接:`mcp_<server>_<raw>` 命名清洗到 `[A-Za-z0-9_-] ≤64`
-  (两级协议都限制函数名形态);`isError:true` → 错误 tool-result 回传模型
-- 生命周期:server 子进程 `kill_on_drop`,Arc 计数归零即收割;启动失败的
-  服务器降级为警告跳过,不阻塞 agent
-- 侷限(文档明示):**仅 stdio**;每个 server 的请求串行(一次一个 in-flight)
-  ——可预测性优先,后续版本再开并发请求
+- **stdio** (`client.rs`):本地子进程,换行分隔 JSON-RPC;后台 reader 按响应 id
+  路由到 pending 表 → **同一服务器天然支持并发在途**(引擎的
+  max_parallel_tools 决定实际上限);服务器主动 ping 由 reader 应答;
+  子进程 kill_on_drop,Arc 归零即收割
+- **streamable HTTP** (`http.rs`):远程服务器;每条 JSON-RPC 消息一次 POST,
+  响应可以是纯 JSON 或 SSE 流(复用 llm 的 SseDecoder 按 id 扫描);
+  `Mcp-Session-Id` 捕获后回带;`Authorization: Bearer`(key 只在环境变量);
+  notifications → 202 丢弃;**不实现 GET 推送流**(规范可选——代价仅是不收
+  主动通知,请求/响应流完整);每次请求独立超时——握手阶段没到响应头或
+  工具调用挂起,统一报 Timeout
 
-测试用 **in-process duplex** 伪服务器走全链路(握手/列表/调用/isError/超时),
-不需要可执行文件,协议逻辑与传输解耦(`McpClient::over(read, write, timeout)`)。
+测试全部 in-process:dulex 伪 stdio 服务器、手写 HTTP/1.1 mock 服务器,
+覆盖握手/列表/调用/isError/超时/会话与鉴权断言/乱序并发回复(服务器
+先答第二个请求)。
 
 ## 10. 添加一个新工具 (30 行以内)
 

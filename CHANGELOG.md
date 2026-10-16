@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-17
+
+### Added
+
+- **Streamable-HTTP MCP transport**: remote servers configured with `url`
+  instead of `command` now work — POST-per-message, plain-JSON and SSE
+  streamed responses both supported, `Mcp-Session-Id` captured and echoed,
+  Bearer auth via `api_key_env` (key stays in the environment). Requests
+  without a session header (stateless servers) are fine. GET push streams
+  are intentionally out (optional per spec); unsolicited notifications are
+  not received until then.
+- **Concurrent in-flight MCP requests**: one MCP server now serves several
+  tool calls at once (routed by JSON-RPC `id`, proven by an interleaved-reply
+  test where the server answers the second call before the first). The
+  engine's `max_parallel_tools` cap (default 4) still bounds total load.
+
+### Changed
+
+- Tool bridge is transport-agnostic: `McpTool` holds `Arc<dyn McpSession>`,
+  implemented by both the stdio client and the HTTP client. Config entries
+  pick with `command` (stdio) or `url` (HTTP).
+
 ## [0.2.0] - 2026-10-17
 
 ### Added

@@ -14,8 +14,8 @@
 //! Transport is injected (`AsyncRead` + `AsyncWrite` halves): the real path
 //! spawns a server process and hands in its stdio; tests use an in-process
 //! duplex — that keeps the protocol logic testable without any executable.
-//! One request is in flight per client (per-server serialization), which is
-//! deliberate: kazi keeps per-server concurrency at one to stay predictable.
+//! Requests may be in flight concurrently (routed by JSON-RPC id); the
+//! agent loop's `max_parallel_tools` cap bounds how many actually happen.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,6 +39,8 @@ pub enum McpError {
     Timeout(u64),
     #[error("mcp io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("mcp http transport: {0}")]
+    Http(#[from] reqwest::Error),
 }
 
 /// Result of a `tools/call` as the server framed it: text plus the error flag.
