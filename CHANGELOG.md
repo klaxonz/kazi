@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-10-17
+
+### Fixed
+
+- **TUI input/rendering with CJK text**: wrapping and cursor math used char
+  counts and byte offsets, so Chinese input drifted (cursor offset, wrong
+  line breaks) and long unspaced words could even hit a byte-slice panic.
+  Wrapping, input trimming, and cursor placement now use display width
+  (unicode-width); CJK counts as two columns everywhere.
+- Input key handling: `Char('\0')` events (IME/unknown-key artifacts) are
+  ignored, and key-repeat events are kept while key-release events are
+  filtered (previously the filter was press-only).
+
 ## [0.10.2] - 2026-10-17
 
 ### Fixed

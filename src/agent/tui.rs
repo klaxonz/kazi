@@ -12,6 +12,7 @@
 
 use futures::StreamExt;
 use std::io::{Stdout, Write};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
@@ -234,21 +235,15 @@ impl Screen {
 
         // -- input box -------------------------------------------------------
         let prompt = if self.busy { " [busy] " } else { " kazi> " };
-        let shown: String = if visible_width(&self.input) + visible_width(prompt)
-            > (input.width as usize).saturating_sub(2)
-        {
-            let keep = (input.width as usize).saturating_sub(2 + visible_width(prompt));
-            self.input
-                .chars()
-                .rev()
-                .take(keep)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect()
+        let budget = (input.width as usize)
+            .saturating_sub(2)
+            .saturating_sub(UnicodeWidthStr::width(prompt));
+        let shown: String = if UnicodeWidthStr::width(&*self.input) > budget {
+            tail_by_width(&self.input, budget)
         } else {
             self.input.clone()
         };
+        let shown_w = UnicodeWidthStr::width(&*shown);
         let input_text = Line::from(vec![
             Span::styled(prompt, Style::default().fg(CYAN).bold()),
             Span::raw(&shown),
@@ -260,15 +255,18 @@ impl Screen {
 
         // cursor
         f.set_cursor_position(ratatui::layout::Position {
-            x: (input.x + 1 + prompt.len() as u16 + shown.len() as u16)
+            x: (input.x + 1 + UnicodeWidthStr::width(prompt) as u16 + shown_w as u16)
                 .min(input.right().saturating_sub(1)),
             y: input.y + 1,
         });
     }
 }
 
-/// Word-ish wrap: break preferentially at spaces, hard at `max` otherwise.
+/// Word-ish wrap by DISPLAY width (CJK glyphs are double-width): break
+/// preferentially at spaces, hard-break long words glyph by glyph — never by
+/// bytes, which would panic on multi-byte chars.
 fn wrap_text(s: &str, max: usize) -> Vec<String> {
+    let max = max.max(1);
     let mut out = Vec::new();
     for para in s.split('\n') {
         if para.is_empty() {
@@ -276,31 +274,51 @@ fn wrap_text(s: &str, max: usize) -> Vec<String> {
             continue;
         }
         let mut cur = String::new();
+        let mut cur_w = 0usize;
+        let mut has_content = false;
+        let push_line = |out: &mut Vec<String>, cur: &mut String, cur_w: &mut usize| {
+            out.push(std::mem::take(cur));
+            *cur_w = 0;
+        };
         for word in para.split(' ') {
-            // hard-break overly long words
-            if word.len() > max {
-                if !cur.is_empty() {
-                    out.push(std::mem::take(&mut cur));
-                }
-                let mut start = 0usize;
-                while start < word.len() {
-                    let end = (start + max).min(word.len());
-                    out.push(word[start..end].to_string());
-                    start = end;
-                }
-                continue;
+            let word_w = UnicodeWidthStr::width(word);
+            if has_content && cur_w + 1 + word_w > max {
+                push_line(&mut out, &mut cur, &mut cur_w);
+                has_content = false;
             }
-            if !cur.is_empty() && cur.len() + 1 + word.len() > max {
-                out.push(std::mem::take(&mut cur));
-            }
-            if !cur.is_empty() {
+            if has_content {
                 cur.push(' ');
+                cur_w += 1;
             }
-            cur.push_str(word);
+            for ch in word.chars() {
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if cur_w + cw > max && cur_w > 0 {
+                    push_line(&mut out, &mut cur, &mut cur_w);
+                }
+                cur.push(ch);
+                cur_w += cw;
+            }
+            has_content = true;
         }
         out.push(cur);
     }
     out
+}
+
+/// Tail of `s` that fits into `max` display columns (for the input box).
+fn tail_by_width(s: &str, max: usize) -> String {
+    let mut picked: Vec<char> = Vec::new();
+    let mut w = 0usize;
+    for ch in s.chars().rev() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > max {
+            break;
+        }
+        w += cw;
+        picked.push(ch);
+    }
+    picked.reverse();
+    picked.into_iter().collect()
 }
 
 /// Park-and-run helper: kept for library users who want the simple blocking
@@ -424,12 +442,6 @@ pub async fn chat_loop_tui(
     res.map(|_| if quit_clean { 0 } else { 1 })
 }
 
-/// Width of a string as terminal columns — chars here is close enough for
-/// ASCII-heavy content and avoids pulling unicode-width directly.
-fn visible_width(s: &str) -> usize {
-    s.chars().count()
-}
-
 /// Inner loop: agent tasks run in a spawned tokio task and stream their
 /// events through an mpsc channel; the UI loop `select!`s between terminal
 /// input and incoming events, so the screen keeps redrawing (streaming
@@ -485,7 +497,7 @@ async fn tui_inner(
 
             // ---- input pump (async EventStream) ----------------------------
             maybe_ev = events.next() => match maybe_ev {
-                Some(Ok(CtEvent::Key(key))) if key.kind == KeyEventKind::Press => match key.code {
+                Some(Ok(CtEvent::Key(key))) if key.kind != KeyEventKind::Release => match key.code {
                     KeyCode::Esc => {
                         screen.quit = true;
                         if let Some(r) = runner.take() { r.abort(); }
@@ -517,6 +529,7 @@ async fn tui_inner(
                     {
                         screen.lines.clear();
                     }
+                    KeyCode::Char('\0') => {} // NUL: IME/unknown-key artifact
                     KeyCode::Char(c) => screen.input.push(c),
                     _ => {}
                 },
@@ -609,5 +622,28 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rx.recv().await, Some(7));
+    }
+
+    /// CJK text has no spaces: wrapping must go by display width and cut at
+    /// glyph boundaries (the old byte slicing panicked on multi-byte chars).
+    #[test]
+    fn wrap_handles_cjk_by_display_width() {
+        let text = "你好世界这是一段没有空格的中文长文本用于测试换行";
+        let lines = wrap_text(text, 10);
+        assert!(
+            lines
+                .iter()
+                .all(|l| UnicodeWidthStr::width(l.as_str()) <= 10),
+            "width overflow: {lines:?}"
+        );
+        assert_eq!(lines.join(""), text, "wrapping must not lose characters");
+    }
+
+    #[test]
+    fn tail_by_width_counts_cjk_as_two() {
+        // "路径abc" = 2+2+1+1+1 columns; keep the last 5: "径abc"
+        assert_eq!(tail_by_width("路径abc", 5), "径abc");
+        assert_eq!(tail_by_width("ab", 5), "ab");
+        assert_eq!(tail_by_width("中文", 1), "");
     }
 }
