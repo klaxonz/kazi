@@ -8,6 +8,7 @@
 
 pub mod fetch;
 pub mod file;
+pub mod patch;
 pub mod shell;
 
 use std::sync::Arc;
@@ -182,6 +183,7 @@ impl ToolRegistry {
         Self::new()
             .register(Arc::new(file::ListDir))
             .register(Arc::new(file::ReadFile))
+            .register(Arc::new(patch::ApplyPatch))
             .register(Arc::new(file::WriteFile))
             .register(Arc::new(shell::RunCommand))
             .register(Arc::new(fetch::FetchUrl))
@@ -247,6 +249,7 @@ mod tests {
             vec![
                 "list_dir",
                 "read_file",
+                "apply_patch",
                 "write_file",
                 "run_command",
                 "fetch_url"

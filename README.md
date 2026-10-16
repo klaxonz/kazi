@@ -71,7 +71,12 @@ Headless (exit code 0 + final answer → scriptable):
 ```sh
 kazi run "list the 10 largest .rs files in src and summarize each"
 kazi run --provider ollama --model qwen3:14b "explain what 115Manager/data is"
+kazi run --output json "check cargo test status" | jq -r .answer   # structured mode
 ```
+
+`--output json` emits one object `{ok, provider, task, answer, events[], error}`
+where `events` carries `text_delta` / `tool_start` / `tool_end` — pipe it into
+`jq` or store it as an audit trail.
 
 Discovery:
 
@@ -90,6 +95,7 @@ Override anything per call: `--provider <nick>` `--model <name>`
 |--------------|---------------------------------------------------------|
 | `list_dir`   | directory listing (names, sizes, dirs marked)           |
 | `read_file`  | numbered lines, paging by offset/limit, refuses binaries |
+| `apply_patch`| exact, unique find-and-replace; ambiguity is an error   |
 | `write_file` | create/overwrite, makes parent directories              |
 | `run_command`| shell command — **approval-gated** (below)              |
 | `fetch_url`  | https GET → plain text (blocks local networks)          |

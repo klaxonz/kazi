@@ -69,10 +69,11 @@ pub enum AgentError {
 }
 
 /// What the UI wants to know while a task runs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentEvent {
     /// Assistant text fragment, in order.
-    TextDelta(String),
+    TextDelta { text: String },
     /// A tool call is starting.
     ToolStart { name: String },
     /// A tool call finished: error flag + one-line preview of its output.
@@ -226,7 +227,7 @@ impl Agent {
             let mut closed = false;
             tokio::select! {
                 ev = rx.recv(), if !closed => match ev {
-                    Some(StreamEvent::TextDelta(t)) => on_event(AgentEvent::TextDelta(t)),
+                    Some(StreamEvent::TextDelta(t)) => on_event(AgentEvent::TextDelta { text: t }),
                     _ => closed = true,
                 },
                 r = &mut fut => break r?,
@@ -244,7 +245,7 @@ impl Agent {
         };
         // Drain late events so nothing arrives after the final response.
         while let Some(StreamEvent::TextDelta(t)) = rx.recv().await {
-            on_event(AgentEvent::TextDelta(t));
+            on_event(AgentEvent::TextDelta { text: t });
         }
         Ok(resp)
     }
@@ -352,7 +353,7 @@ mod tests {
         );
         assert!(evs
             .iter()
-            .any(|e| matches!(e, AgentEvent::TextDelta(t) if t.contains("note says"))));
+            .any(|e| matches!(e, AgentEvent::TextDelta { text } if text.contains("note says"))));
     }
 
     #[tokio::test]

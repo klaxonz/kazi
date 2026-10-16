@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-16
+
+### Added
+
+- `apply_patch` tool: exact, unique find-and-replace inside text files — the
+  model gets pointed errors (match count, first-line hints, CR hints) instead of
+  garbage in, so it widens context and retries correctly. Reading before
+  editing behaves as expected with the existing sandbox rules.
+- `kazi run --output json`: one JSON object on stdout
+  (`{ok, provider, task, answer, events[], error}`) with `events` carrying
+  `text_delta` / `tool_start` / `tool_end` entries — structured consumption for
+  scripts and CI pipes. Exit codes unchanged (0 ok / 1 error / 2 budget).
+
 ## [0.1.0] - 2026-10-16
 
 ### Added

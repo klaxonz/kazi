@@ -38,8 +38,8 @@ impl Approver for StdinApprover {
 /// Render one agent event to stdout; shared by `chat` and `run`.
 pub fn render_event(ev: &AgentEvent) {
     match ev {
-        AgentEvent::TextDelta(t) => {
-            print!("{t}");
+        AgentEvent::TextDelta { text } => {
+            print!("{text}");
             let _ = std::io::stdout().flush();
         }
         AgentEvent::ToolStart { name } => {

@@ -15,7 +15,7 @@ use super::{Tool, ToolCtx, ToolError};
 ///
 /// `write` targets may not exist yet, so we canonicalize the nearest existing
 /// ancestor and re-check the whole path against the canonicalized root.
-fn ensure_sandbox(root: Option<&Path>, target: &Path) -> Result<(), ToolError> {
+pub(crate) fn ensure_sandbox(root: Option<&Path>, target: &Path) -> Result<(), ToolError> {
     let Some(root) = root else { return Ok(()) };
 
     let probe = if target.exists() {

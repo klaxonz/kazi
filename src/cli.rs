@@ -2,9 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 
-use crate::agent::{context::History, repl, session, Agent, AgentError};
+use crate::agent::{context::History, repl, session, Agent, AgentError, AgentEvent};
 use crate::config;
 use crate::tools::ToolRegistry;
 
@@ -57,6 +58,9 @@ pub enum Command {
         task: String,
         #[command(flatten)]
         args: EngineArgs,
+        /// Structured stdout for scripts/CI (`json`); default: human text
+        #[arg(long, value_enum)]
+        output: Option<OutputFmt>,
     },
     /// Show the config path; `--init` writes the example config
     #[command(name = "config")]
@@ -72,12 +76,29 @@ pub enum Command {
     Tools,
 }
 
+/// Machine-readable output shapes for `kazi run`.
+#[derive(ValueEnum, Clone, Debug, Copy, PartialEq)]
+pub enum OutputFmt {
+    /// Stream progress, print the final answer (default).
+    Text,
+    /// One JSON object on stdout; events embedded; nothing else printed.
+    Json,
+}
+
 /// Dispatch; returns the process exit code.
 pub async fn execute(cli: Cli) -> anyhow::Result<u8> {
     match cli.command {
         None => chat(&EngineArgs::default(), cli.config.as_deref()).await,
         Some(Command::Chat(args)) => chat(&args, cli.config.as_deref()).await,
-        Some(Command::Run { task, args }) => run_once(&task, &args, cli.config.as_deref()).await,
+        Some(Command::Run { task, args, output }) => {
+            run_once(
+                &task,
+                &args,
+                output.unwrap_or(OutputFmt::Text),
+                cli.config.as_deref(),
+            )
+            .await
+        }
         Some(Command::Config { init }) => config_cmd(init),
         Some(Command::Providers) => providers_cmd(cli.config.as_deref()),
         Some(Command::Tools) => tools_cmd(),
@@ -96,7 +117,24 @@ async fn chat(args: &EngineArgs, cfg_path: Option<&Path>) -> anyhow::Result<u8> 
     .await
 }
 
-async fn run_once(task: &str, args: &EngineArgs, cfg_path: Option<&Path>) -> anyhow::Result<u8> {
+#[derive(Serialize)]
+struct RunReport {
+    ok: bool,
+    provider: String,
+    task: String,
+    answer: String,
+    /// `text_delta` / `tool_start` / `tool_end` events, in order.
+    events: Vec<AgentEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+async fn run_once(
+    task: &str,
+    args: &EngineArgs,
+    fmt: OutputFmt,
+    cfg_path: Option<&Path>,
+) -> anyhow::Result<u8> {
     let (cfg, _) = config::load(cfg_path)?;
     let agent = Agent::default_cli(
         &cfg,
@@ -104,6 +142,7 @@ async fn run_once(task: &str, args: &EngineArgs, cfg_path: Option<&Path>) -> any
         args.model.as_deref(),
         args.yolo,
     )?;
+    let describe = agent.provider().describe();
     let mut agent = if let Some(name) = &args.resume {
         match session::load(name) {
             Ok(f) => {
@@ -111,14 +150,13 @@ async fn run_once(task: &str, args: &EngineArgs, cfg_path: Option<&Path>) -> any
                 let mut a = agent;
                 a.history = History::new(sys);
                 a.history.msgs = f.messages;
-                println!(
-                    "{DIM}resumed `{name}` ({n} messages){RESET}",
-                    n = a.history.msgs_len()
-                );
+                if fmt == OutputFmt::Text {
+                    println!("resumed `{name}` ({n} messages)", n = a.history.msgs_len());
+                }
                 a
             }
             Err(e) => {
-                println!("{YELLOW}cannot resume `{name}`: {e}{RESET}");
+                println!("cannot resume `{name}`: {e}");
                 agent
             }
         }
@@ -126,19 +164,51 @@ async fn run_once(task: &str, args: &EngineArgs, cfg_path: Option<&Path>) -> any
         agent
     };
 
-    println!("{DIM}provider: {}{RESET}", agent.provider().describe());
-    match agent.run_task(task, |e| repl::render_event(&e)).await {
-        Ok(_answer) => {
-            println!();
+    let mut events: Vec<AgentEvent> = Vec::new();
+    let mut on_event: Box<dyn FnMut(AgentEvent)> = match fmt {
+        OutputFmt::Text => Box::new(|e| repl::render_event(&e)),
+        OutputFmt::Json => Box::new(|e| events.push(e)),
+    };
+
+    let result = agent.run_task(task, &mut on_event).await;
+    // the event collector holds `events`; release it before assembling output
+    drop(on_event);
+    match result {
+        Ok(answer) => {
+            if fmt == OutputFmt::Json {
+                let report = RunReport {
+                    ok: true,
+                    provider: describe.clone(),
+                    task: task.to_string(),
+                    answer,
+                    events,
+                    error: None,
+                };
+                println!("{}", serde_json::to_string(&report).unwrap_or_default());
+            } else {
+                println!();
+            }
             Ok(0)
         }
-        Err(AgentError::RoundsExceeded(r)) => {
-            eprintln!("\n{YELLOW}stopped after {r} rounds without a final answer{RESET}");
-            Ok(2)
-        }
         Err(e) => {
-            eprintln!("\n{RED}{e}{RESET}");
-            Ok(1)
+            let (code, held) = match &e {
+                AgentError::RoundsExceeded(_) => (2u8, "task budget exhausted"),
+                _ => (1u8, "agent failed"),
+            };
+            if fmt == OutputFmt::Json {
+                let report = RunReport {
+                    ok: false,
+                    provider: describe.clone(),
+                    task: task.to_string(),
+                    answer: String::new(),
+                    events,
+                    error: Some(e.to_string()),
+                };
+                println!("{}", serde_json::to_string(&report).unwrap_or_default());
+            } else {
+                eprintln!("\n{YELLOW}{held}{RESET}\n{RED}{e}{RESET}");
+            }
+            Ok(code)
         }
     }
 }
