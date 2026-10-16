@@ -156,6 +156,69 @@ async fn run_feedback(cmd: &str, ctx: &crate::tools::ToolCtx) -> (bool, String, 
     (ok, preview, body)
 }
 
+/// Sub-agent factory backing the `delegate` tool: same provider, a fresh
+/// (short) history, and an isolated tool context.
+pub struct SubAgentRunnerImpl {
+    provider: Arc<dyn Provider>,
+    base_ctx: crate::tools::ToolCtx,
+    system: String,
+    max_rounds: u32,
+    max_context_tokens: u64,
+}
+
+impl SubAgentRunnerImpl {
+    pub fn new(
+        provider: Arc<dyn Provider>,
+        base_ctx: crate::tools::ToolCtx,
+        system: String,
+        max_rounds: u32,
+        max_context_tokens: u64,
+    ) -> Self {
+        Self {
+            provider,
+            base_ctx,
+            system,
+            max_rounds,
+            max_context_tokens,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::tools::subagent::SubAgentRunner for SubAgentRunnerImpl {
+    async fn run_sub(&self, prompt: &str, read_only: bool) -> Result<String, String> {
+        const REPORT_CAP: usize = 4_000;
+        let mut ctx = self.base_ctx.clone();
+        ctx.subagent = None; // delegation cannot nest
+        ctx.checkpointing = None; // sub-agent edits are not a /undo epoch
+        ctx.todos = None; // its plan is its own
+        if read_only {
+            ctx.permission.set(crate::tools::PermissionMode::ReadOnly);
+        }
+        let mut sub = Agent::with_parallel(
+            self.provider.clone(),
+            crate::tools::ToolRegistry::builtin(),
+            ctx,
+            Some(self.system.clone()),
+            self.max_rounds.clamp(1, 12),
+            self.max_context_tokens,
+            4,
+        );
+        match sub.run_task(prompt, |_| {}).await {
+            Ok(text) => {
+                let total = text.chars().count();
+                Ok(if total > REPORT_CAP {
+                    text.chars().take(REPORT_CAP).collect::<String>()
+                        + "\n[…sub-agent report truncated]"
+                } else {
+                    text
+                })
+            }
+            Err(e) => Err(format!("sub-agent failed: {e}")),
+        }
+    }
+}
+
 /// The default system prompt. Terse on purpose: the tools carry their own
 /// contracts, the loop carries the mechanics; a wall of instructions here
 /// would burn context. Mentioned behaviors: read before write, adapt on
@@ -400,16 +463,30 @@ impl Agent {
         }
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let ctx = crate::tools::tool_ctx(&cfg.tools, &cwd, given_approver, mode);
+        let mut ctx = crate::tools::tool_ctx(&cfg.tools, &cwd, given_approver, mode);
+        let max_rounds = cfg.agent.max_rounds.unwrap_or(DEFAULT_MAX_ROUNDS);
+        let max_context_tokens = cfg
+            .agent
+            .max_context_tokens
+            .unwrap_or(DEFAULT_MAX_CONTEXT_TOKENS);
+        let system = system_prompt(&cwd);
+        // the `delegate` tool needs a factory; it clones the context handed
+        // down, so a sub-agent can never delegate again
+        let runner = Arc::new(SubAgentRunnerImpl::new(
+            wrapped.clone(),
+            ctx.clone(),
+            system.clone(),
+            max_rounds,
+            max_context_tokens,
+        ));
+        ctx.subagent = Some(runner);
         Ok(Self::with_parallel(
             wrapped,
             registry,
             ctx,
-            Some(system_prompt(&cwd)),
-            cfg.agent.max_rounds.unwrap_or(DEFAULT_MAX_ROUNDS),
-            cfg.agent
-                .max_context_tokens
-                .unwrap_or(DEFAULT_MAX_CONTEXT_TOKENS),
+            Some(system),
+            max_rounds,
+            max_context_tokens,
             cfg.agent.max_parallel_tools.unwrap_or(DEFAULT_MAX_PARALLEL),
         )
         .with_feedback(cfg.agent.feedback_command.clone()))
@@ -738,6 +815,7 @@ mod tests {
             checkpointing: None,
             todos: None,
             permission: crate::tools::Permission::default(),
+            subagent: None,
         }
     }
 
@@ -1166,6 +1244,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delegate_returns_subagent_summary() {
+        // the sub-agent runs on its own provider script
+        let sub_provider: Arc<dyn Provider> =
+            Arc::new(crate::llm::mock::MockProvider::new(vec![LlmResponse {
+                content: Some("SUB_AGENT_FOUND: 42".into()),
+                ..Default::default()
+            }]));
+        let mut ctx = test_ctx();
+        let base = ctx.clone();
+        ctx.subagent = Some(Arc::new(SubAgentRunnerImpl::new(
+            sub_provider,
+            base,
+            "sub system".into(),
+            3,
+            1_000,
+        )));
+
+        let script = vec![
+            LlmResponse {
+                tool_calls: vec![ToolCall {
+                    id: "d1".into(),
+                    name: "delegate".into(),
+                    arguments: json!({"prompt": "count the things"}),
+                }],
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some("summary received".into()),
+                ..Default::default()
+            },
+        ];
+        let mut a = agent_with_ctx(script, ctx);
+        a.run_task("delegate the counting", |_| {}).await.unwrap();
+
+        let joined = a
+            .history
+            .msgs
+            .iter()
+            .map(|m| m.text().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("SUB_AGENT_FOUND: 42"),
+            "the sub-agent's report must reach the main history: {joined}"
+        );
+    }
+
+    #[tokio::test]
     async fn feedback_command_runs_after_a_write_round() {
         let script = vec![
             LlmResponse {
@@ -1322,6 +1448,7 @@ mod tests {
             checkpointing: None,
             todos: None,
             permission: crate::tools::Permission::default(),
+            subagent: None,
         };
         let script = vec![
             LlmResponse {

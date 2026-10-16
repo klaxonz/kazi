@@ -287,6 +287,7 @@ mod tests {
             checkpointing: None,
             todos: None,
             permission: super::super::Permission::default(),
+            subagent: None,
         }
     }
 

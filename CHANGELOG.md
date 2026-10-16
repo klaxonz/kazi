@@ -8,6 +8,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-17
+
+### Added
+
+- **`todo_write` plan checklist**: the model keeps a visible, ordered plan;
+  the TUI renders it as a pane above the transcript, the REPL prints updates,
+  and the engine only emits changes (no event spam).
+- **Three permission modes** — `read-only` / `edit` (default) / `yolo`:
+  read-only refuses `write_file`, `apply_patch`, and `run_command` outright
+  with a teaching error. Switch at launch with `--permission-mode`, from
+  config (`agent.permission_mode`), by cycling with **Shift+Tab** in the TUI
+  (shown in the status bar), or with `/permission` / `/yolo` in the REPL.
+- **`@file` attachments**: `summarize @src/main.rs` attaches the file's
+  contents (64 KiB cap, binaries skipped, missing files reported inline).
+- **`/context`**: token estimate split into system / history / tools against
+  the budget (REPL and TUI).
+- **Post-edit feedback loop**: set `agent.feedback_command` (e.g.
+  `cargo clippy --all-targets -- -D warnings`) and its output is fed back to
+  the model automatically after any round that changed files (skipped in
+  read-only mode; 4 KiB tail, compiler errors included).
+- **`delegate` sub-agents**: hand a self-contained sub-task to a fresh agent
+  context and get a summary back — long explorations no longer eat the main
+  conversation's context. `read_only` defaults to true; delegation cannot
+  nest; a sub-agent's edits stay outside the main `/undo` epoch.
+
+### Fixed
+
+- `/context` counted the system prompt twice (history estimate folded it in).
+
 ## [0.11.0] - 2026-10-17
 
 ### Added

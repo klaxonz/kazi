@@ -12,6 +12,7 @@ pub mod file;
 pub mod patch;
 pub mod search;
 pub mod shell;
+pub mod subagent;
 pub mod todo;
 
 use std::sync::Arc;
@@ -90,6 +91,8 @@ pub struct ToolCtx {
     pub todos: Option<Arc<todo::TodoList>>,
     /// How much the agent may do without asking (default: `Edit`).
     pub permission: Permission,
+    /// Factory for the `delegate` tool's sub-agents (`None` = tool refuses).
+    pub subagent: Option<Arc<dyn subagent::SubAgentRunner>>,
 }
 
 /// How much the agent may do without asking.
@@ -259,6 +262,7 @@ pub fn tool_ctx(
         }),
         todos: Some(Arc::new(todo::TodoList::default())),
         permission: Permission::new(mode),
+        subagent: None, // the agent wires its own runner in
     }
 }
 
@@ -319,6 +323,7 @@ impl ToolRegistry {
     pub fn builtin() -> Self {
         Self::new()
             .register(Arc::new(todo::TodoWrite))
+            .register(Arc::new(subagent::Delegate))
             .register(Arc::new(file::ListDir))
             .register(Arc::new(file::ReadFile))
             .register(Arc::new(search::SearchFiles))
@@ -394,6 +399,7 @@ mod tests {
             names.iter().map(String::as_str).collect::<Vec<_>>(),
             vec![
                 "todo_write",
+                "delegate",
                 "list_dir",
                 "read_file",
                 "search_files",
@@ -472,6 +478,7 @@ mod tests {
             checkpointing: None,
             todos: None,
             permission: Permission::default(),
+            subagent: None,
         }
     }
 }

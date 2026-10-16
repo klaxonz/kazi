@@ -84,6 +84,18 @@ restores the files the last task changed, `/help` lists all of it.
 Every task run checkpoints the files it is about to modify (newest 20 kept),
 so `/undo` is a one-keystroke safety net after an aggressive edit.
 
+Permission modes: `edit` (default) gates commands behind approval, `read-only`
+refuses anything that writes, and `yolo` runs unattended. `Shift+Tab` cycles
+them in the TUI, `/permission` sets them in the REPL, `--permission-mode`
+picks the startup one. `@file` in a task attaches a file's contents, and
+`/context` shows where the token budget goes.
+
+Set `agent.feedback_command` (say `cargo clippy --all-targets -- -D warnings`)
+and kazi runs it after every round that changed files, feeding the output back
+to the model so it fixes its own mistakes before answering. The `delegate`
+tool pushes a self-contained sub-task into a fresh agent context and returns
+only a summary — useful for wide explorations.
+
 Headless (exit code 0 + final answer → scriptable):
 
 ```sh

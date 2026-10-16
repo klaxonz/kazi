@@ -258,6 +258,7 @@ mod tests {
             checkpointing: None,
             todos: None,
             permission: crate::tools::Permission::default(),
+            subagent: None,
         }
     }
 

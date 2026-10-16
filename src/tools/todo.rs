@@ -147,6 +147,7 @@ mod tests {
             checkpointing: None,
             todos: Some(list),
             permission: super::super::Permission::default(),
+            subagent: None,
         }
     }
 
