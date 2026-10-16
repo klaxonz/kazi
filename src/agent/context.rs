@@ -47,8 +47,15 @@ impl History {
     }
 
     /// 4 chars ≈ 1 token, plus a flat margin of 32 per message overhead.
+    /// Includes the system prompt.
     pub fn estimate_tokens(&self) -> u64 {
-        let mut n: u64 = self.system.as_deref().map(estimate_str).unwrap_or(0);
+        self.system.as_deref().map(estimate_str).unwrap_or(0) + self.estimate_msgs_tokens()
+    }
+
+    /// Messages only, no system prompt — the `/context` breakdown needs the
+    /// two numbers separately.
+    pub fn estimate_msgs_tokens(&self) -> u64 {
+        let mut n: u64 = 0;
         for m in &self.msgs {
             n += estimate_str(m.text());
             for tc in &m.tool_calls {

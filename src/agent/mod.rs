@@ -44,6 +44,47 @@ fn approver(yolo: bool) -> Arc<dyn crate::tools::Approver> {
     }
 }
 
+/// Expand `@path` references in a task into attached file contents (capped at
+/// 64 KiB per file, binaries skipped, missing files reported inline). The
+/// model sees the augmented text; the transcript still shows what the user
+/// typed.
+pub fn expand_file_refs(task: &str, cwd: &std::path::Path) -> String {
+    const CAP: usize = 64 * 1024;
+    let mut attachments: Vec<String> = Vec::new();
+    for raw in task.split_whitespace() {
+        let Some(path) = raw.strip_prefix('@') else {
+            continue;
+        };
+        let path = path.trim_end_matches(|c: char| {
+            matches!(c, ',' | '.' | ';' | ':' | ')' | ']' | '"' | '\'')
+        });
+        if path.is_empty() {
+            continue;
+        }
+        let full = cwd.join(path);
+        match std::fs::read(&full) {
+            Ok(bytes) if bytes.iter().take(8192).any(|b| *b == 0) => {
+                attachments.push(format!("[attached @{path}: binary, skipped]"));
+            }
+            Ok(bytes) => {
+                let truncated = bytes.len() > CAP;
+                let text = String::from_utf8_lossy(&bytes[..bytes.len().min(CAP)]);
+                attachments.push(format!(
+                    "[attached @{path}: {} bytes{}]\n{text}",
+                    bytes.len(),
+                    if truncated { ", truncated" } else { "" }
+                ));
+            }
+            Err(_) => attachments.push(format!("[cannot attach @{path}: not readable]")),
+        }
+    }
+    if attachments.is_empty() {
+        task.to_string()
+    } else {
+        format!("{task}\n\n{}", attachments.join("\n\n"))
+    }
+}
+
 /// The default system prompt. Terse on purpose: the tools carry their own
 /// contracts, the loop carries the mechanics; a wall of instructions here
 /// would burn context. Mentioned behaviors: read before write, adapt on
@@ -191,6 +232,11 @@ impl Agent {
 
     pub fn max_rounds(&self) -> u32 {
         self.max_rounds
+    }
+
+    /// Context budget in estimated tokens (`/context` display).
+    pub fn max_context_tokens(&self) -> u64 {
+        self.max_context_tokens
     }
 
     /// Token usage of the current ([`Agent::run_task`]) task.
@@ -627,6 +673,23 @@ mod tests {
             60_000,
             4,
         )
+    }
+
+    #[test]
+    fn expands_file_refs_and_reports_failures() {
+        let d = std::env::temp_dir().join(format!("kazi-refs-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("a.txt"), "hello file").unwrap();
+
+        let out = expand_file_refs("summarize @a.txt please", &d);
+        assert!(out.contains("[attached @a.txt"), "got: {out}");
+        assert!(out.contains("hello file"));
+
+        let miss = expand_file_refs("read @missing.rs", &d);
+        assert!(miss.contains("cannot attach @missing.rs"));
+
+        assert_eq!(expand_file_refs("no refs here", &d), "no refs here");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[tokio::test]

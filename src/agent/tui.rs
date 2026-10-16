@@ -44,7 +44,9 @@ const TUI_HELP: &[&str] = &[
     "keys: Enter submit · Esc interrupt (idle: quit) · Ctrl+C quit",
     "↑/↓ input history · Ctrl+A/E/U/K/W edit · Ctrl+L clear transcript",
     "PgUp/PgDn or mouse wheel scroll · Ctrl+Home top · Ctrl+End bottom",
-    "commands here: /undo (restore last task's files) · /help",
+    "Shift+Tab cycles permission mode (read-only → yolo → edit)",
+    "@file in a task attaches the file's contents",
+    "commands here: /undo · /context · /help",
     "full set (/new, /model, /provider, /compact, /resume …): kazi --no-tui",
 ];
 
@@ -969,6 +971,19 @@ async fn tui_inner(
                                             screen.push(LineKind::Dim, *line);
                                         }
                                     }
+                                    "context" => {
+                                        let report = shared_agent
+                                            .lock()
+                                            .await
+                                            .as_ref()
+                                            .map(super::repl::context_report);
+                                        for line in report
+                                            .unwrap_or_else(|| "context unavailable".to_string())
+                                            .lines()
+                                        {
+                                            screen.push(LineKind::Dim, line.to_string());
+                                        }
+                                    }
                                     other => screen.push(
                                         LineKind::Warn,
                                         format!("unknown command /{other} — /help for keys (full command set in `kazi --no-tui`)"),
@@ -983,11 +998,12 @@ async fn tui_inner(
                             let taken = shared_agent.lock().await.take();
                             if let Some(owned) = taken {
                                 current_cancel = Some(owned.cancel_token());
+                                let expanded = super::expand_file_refs(&task, &owned.ctx.cwd);
                                 let slot = shared_agent.clone();
                                 let tx = tx.clone();
                                 runner = Some(tokio::spawn(async move {
                                     let mut owned = owned;
-                                    let out = owned.run_task(&task, |ev| {
+                                    let out = owned.run_task(&expanded, |ev| {
                                         let _ = tx.send(Pump::Ev(ev));
                                     }).await;
                                     // park the agent back first, THEN report

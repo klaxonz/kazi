@@ -46,6 +46,30 @@ pub fn undo_last_task(agent: &Agent) -> std::io::Result<Option<usize>> {
     }
 }
 
+/// `/context`: where the estimated tokens go right now.
+pub fn context_report(agent: &Agent) -> String {
+    let h = &agent.history;
+    let sys = h
+        .system
+        .as_deref()
+        .map(|s| s.chars().count() as u64 / 4)
+        .unwrap_or(0);
+    // messages only: `estimate_tokens()` would fold the system prompt in again
+    let hist = h.estimate_msgs_tokens();
+    let specs = agent.registry().specs();
+    let tools: u64 = specs
+        .iter()
+        .map(|t| (t.name.len() + t.description.len() + t.parameters.to_string().len()) as u64 / 4)
+        .sum();
+    format!(
+        "context estimate:\n  system   ~{sys} tokens\n  history  ~{hist} tokens ({} messages)\n  tools    ~{tools} tokens ({} in catalog)\n  total    ~{} / {} token budget",
+        h.msgs_len(),
+        specs.len(),
+        sys + hist + tools,
+        agent.max_context_tokens()
+    )
+}
+
 /// Terminal prompt approver: `y` once, `a` always (this session, per
 /// command prefix), anything else denies. A blocking stdin read is
 /// deliberate here — nothing else runs while we wait.
@@ -238,6 +262,12 @@ const COMMANDS: &[CmdSpec] = &[
         name: "/permission",
         args: "[read-only|edit|yolo]",
         help: "show or set the permission mode",
+        arg: ArgKind::No,
+    },
+    CmdSpec {
+        name: "/context",
+        args: "",
+        help: "show the estimated token distribution",
         arg: ArgKind::No,
     },
     CmdSpec {
@@ -713,9 +743,10 @@ pub async fn chat_loop(
             continue;
         }
 
-        // A real task: stream it, then auto-save.
+        // A real task: expand @file references, stream it, then auto-save.
         println!();
-        match live.agent.run_task(&line, |e| render_event(&e)).await {
+        let task = crate::agent::expand_file_refs(&line, &live.agent.ctx.cwd);
+        match live.agent.run_task(&task, |e| render_event(&e)).await {
             Ok(_) => {
                 println!();
                 let _ = session::save(
@@ -788,6 +819,7 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
             Ok(None) => println!("nothing to undo (no checkpointed task yet)"),
             Err(e) => println!("{RED}undo failed: {e}{RESET}"),
         },
+        ("/context", _) => println!("{}", context_report(&live.agent)),
         ("/exit", _) | ("/quit", _) => return Flow::Exit,
         ("/clear", _) => {
             // clear + repoint autosave: the old file can never be rewritten
