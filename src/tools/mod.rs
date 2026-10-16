@@ -84,11 +84,39 @@ pub struct ToolCtx {
     pub approver: Arc<dyn Approver>,
 }
 
+/// One approval answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// Run it this once.
+    Allow,
+    /// Run it and remember the approval for the rest of the session
+    /// (implementations key that on [`approval_key`]).
+    AllowSession,
+    /// Refuse; the model gets an error tool-result.
+    Deny,
+}
+
+/// Stable per-command key used for session-scoped approval memory:
+/// the first token of the summary (e.g. `$ git` → `git`).
+pub fn approval_key(summary: &str) -> String {
+    summary
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('$')
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Interactive gate for potentially-impactful actions (`run_command`).
-/// Implementations: terminal prompt (CLI), always-allow (`--yolo`), tests.
+/// Implementations: terminal prompt (CLI/REPL), TUI prompt over a channel,
+/// always-allow (`--yolo`), always-deny (library default), tests.
 #[async_trait]
 pub trait Approver: Send + Sync {
-    async fn decide(&self, tool: &str, summary: &str) -> bool;
+    async fn decide(&self, tool: &str, summary: &str) -> Decision;
 }
 
 /// Always allows. Only used with the explicit `--yolo` flag.
@@ -96,8 +124,8 @@ pub struct AutoApprover;
 
 #[async_trait]
 impl Approver for AutoApprover {
-    async fn decide(&self, _tool: &str, _summary: &str) -> bool {
-        true
+    async fn decide(&self, _tool: &str, _summary: &str) -> Decision {
+        Decision::Allow
     }
 }
 
@@ -106,8 +134,8 @@ pub struct DenyApprover;
 
 #[async_trait]
 impl Approver for DenyApprover {
-    async fn decide(&self, _tool: &str, _summary: &str) -> bool {
-        false
+    async fn decide(&self, _tool: &str, _summary: &str) -> Decision {
+        Decision::Deny
     }
 }
 
@@ -283,6 +311,13 @@ mod tests {
             );
             assert!(spec.parameters["properties"].is_object());
         }
+    }
+
+    #[test]
+    fn approval_key_takes_first_command_token() {
+        assert_eq!(approval_key("$ git status --short\n  cwd: /tmp"), "git");
+        assert_eq!(approval_key(" $ cargo test"), "cargo");
+        assert_eq!(approval_key(""), "");
     }
 
     #[test]

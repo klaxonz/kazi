@@ -28,7 +28,7 @@ use rustyline::{CompletionType, Config as RlConfig, Context, Editor, Helper, Res
 
 use crate::agent::{context::History, session, Agent, AgentError, AgentEvent};
 use crate::config::Config;
-use crate::tools::Approver;
+use crate::tools::{Approver, Decision};
 
 const CYAN: &str = "\x1b[36m";
 const DIM: &str = "\x1b[2m";
@@ -37,18 +37,52 @@ const RED: &str = "\x1b[31m";
 const YELLOW: &str = "\x1b[33m";
 const RESET: &str = "\x1b[0m";
 
-/// Terminal prompt approver: shows the action, waits for y/N. A blocking
-/// stdin read is deliberate here — nothing else runs while we wait.
-pub struct StdinApprover;
+/// Terminal prompt approver: `y` once, `a` always (this session, per
+/// command prefix), anything else denies. A blocking stdin read is
+/// deliberate here — nothing else runs while we wait.
+#[derive(Default)]
+pub struct StdinApprover {
+    /// Command prefixes approved for the rest of this session.
+    session_allows: std::sync::Mutex<Vec<String>>,
+}
+
+/// Pure answer mapping so the prompt logic is testable.
+fn decision_from_input(input: &str) -> Decision {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Decision::Allow,
+        "a" | "always" => Decision::AllowSession,
+        _ => Decision::Deny,
+    }
+}
 
 #[async_trait]
 impl Approver for StdinApprover {
-    async fn decide(&self, tool: &str, summary: &str) -> bool {
-        print!("\n{YELLOW}[{tool}] requests approval{RESET}\n{summary}\napprove? [y/N] ");
+    async fn decide(&self, tool: &str, summary: &str) -> Decision {
+        let key = crate::tools::approval_key(summary);
+        if !key.is_empty()
+            && self
+                .session_allows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|p| p == &key)
+        {
+            return Decision::Allow;
+        }
+        print!(
+            "\n{YELLOW}[{tool}] requests approval{RESET}\n{summary}\napprove? [y] once  [a] always (session)  [N] no "
+        );
         let _ = std::io::stdout().flush();
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);
-        matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+        let decision = decision_from_input(&line);
+        if decision == Decision::AllowSession && !key.is_empty() {
+            self.session_allows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(key);
+        }
+        decision
     }
 }
 
@@ -982,6 +1016,18 @@ mod tests {
 
 #[cfg(test)]
 mod slug_tests {
+    use super::*;
+
+    #[test]
+    fn approval_answers_map_to_decisions() {
+        assert_eq!(decision_from_input("y\n"), Decision::Allow);
+        assert_eq!(decision_from_input("Yes"), Decision::Allow);
+        assert_eq!(decision_from_input(" a "), Decision::AllowSession);
+        assert_eq!(decision_from_input("always\n"), Decision::AllowSession);
+        assert_eq!(decision_from_input("n\n"), Decision::Deny);
+        assert_eq!(decision_from_input(""), Decision::Deny);
+        assert_eq!(decision_from_input("what?\n"), Decision::Deny);
+    }
     use super::slugify;
 
     #[test]

@@ -40,7 +40,7 @@ fn approver(yolo: bool) -> Arc<dyn crate::tools::Approver> {
     if yolo {
         Arc::new(crate::tools::AutoApprover)
     } else {
-        Arc::new(repl::StdinApprover)
+        Arc::new(repl::StdinApprover::default())
     }
 }
 
@@ -206,6 +206,17 @@ impl Agent {
         model_override: Option<&str>,
         yolo: bool,
     ) -> anyhow::Result<Self> {
+        Self::default_cli_with_approver(cfg, provider, model_override, approver(yolo)).await
+    }
+
+    /// Like [`Agent::default_cli`], but the caller supplies the approver —
+    /// the TUI injects a channel-based one so prompts never touch stdin.
+    pub async fn default_cli_with_approver(
+        cfg: &crate::config::Config,
+        provider: Option<&str>,
+        model_override: Option<&str>,
+        given_approver: Arc<dyn crate::tools::Approver>,
+    ) -> anyhow::Result<Self> {
         let resolved = cfg.resolve(provider, model_override)?;
         let mut settings = resolved.settings;
         settings.api_key = cfg.api_key_for(&resolved.nick)?;
@@ -225,7 +236,7 @@ impl Agent {
         }
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let ctx = crate::tools::tool_ctx(&cfg.tools, &cwd, approver(yolo));
+        let ctx = crate::tools::tool_ctx(&cfg.tools, &cwd, given_approver);
         Ok(Self::with_parallel(
             wrapped,
             registry,
@@ -384,16 +395,19 @@ impl Agent {
                     on_event(AgentEvent::ToolStart {
                         name: call.name.clone(),
                     });
-                    if self.ctx.approver.decide(&call.name, &summary).await {
-                        pending.push((i, call.clone()));
-                    } else {
-                        let denied = ToolOutcome::err(crate::tools::shell::COMMAND_DENIED);
-                        on_event(AgentEvent::ToolEnd {
-                            name: call.name.clone(),
-                            is_error: true,
-                            preview: denied.first_line_preview(160),
-                        });
-                        verdicts[i] = Some(denied);
+                    match self.ctx.approver.decide(&call.name, &summary).await {
+                        crate::tools::Decision::Deny => {
+                            let denied = ToolOutcome::err(crate::tools::shell::COMMAND_DENIED);
+                            on_event(AgentEvent::ToolEnd {
+                                name: call.name.clone(),
+                                is_error: true,
+                                preview: denied.first_line_preview(160),
+                            });
+                            verdicts[i] = Some(denied);
+                        }
+                        // Allow / AllowSession (the approver already recorded
+                        // session memory) both run the call now.
+                        _ => pending.push((i, call.clone())),
                     }
                 } else {
                     on_event(AgentEvent::ToolStart {

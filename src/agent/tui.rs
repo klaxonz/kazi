@@ -16,7 +16,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    DisableMouseCapture, Event as CtEvent, EventStream, KeyCode, KeyEventKind,
+    DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream, KeyCode, KeyEventKind,
+    MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -29,12 +30,77 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use super::{Agent, AgentEvent};
+use crate::tools::{approval_key, Approver, Decision};
 
 const CYAN: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
 const GREEN: Color = Color::Green;
 const RED: Color = Color::Red;
 const YELLOW: Color = Color::Yellow;
+
+/// Approval request travelling from the agent thread to the UI loop.
+pub struct ApprovalAsk {
+    pub summary: String,
+    pub reply: tokio::sync::oneshot::Sender<Decision>,
+}
+
+/// Channel-based approver for the TUI: the agent asks over a channel, the
+/// main loop renders the question and answers with a keystroke. Never touches
+/// stdin (raw mode owns it) and remembers "always" per command prefix.
+pub struct TuiApprover {
+    tx: tokio::sync::mpsc::UnboundedSender<ApprovalAsk>,
+    session_allows: std::sync::Mutex<Vec<String>>,
+}
+
+impl TuiApprover {
+    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<ApprovalAsk>) -> Self {
+        Self {
+            tx,
+            session_allows: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Approver for TuiApprover {
+    async fn decide(&self, _tool: &str, summary: &str) -> Decision {
+        let key = approval_key(summary);
+        if !key.is_empty()
+            && self
+                .session_allows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|p| p == &key)
+        {
+            return Decision::Allow;
+        }
+        let (rtx, rrx) = tokio::sync::oneshot::channel();
+        if self
+            .tx
+            .send(ApprovalAsk {
+                summary: summary.to_string(),
+                reply: rtx,
+            })
+            .is_err()
+        {
+            return Decision::Deny; // UI gone: fail closed
+        }
+        match rrx.await {
+            Ok(Decision::AllowSession) => {
+                if !key.is_empty() {
+                    self.session_allows
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(key);
+                }
+                Decision::Allow
+            }
+            Ok(d) => d,
+            Err(_) => Decision::Deny,
+        }
+    }
+}
 
 /// What the TUI turns events into before the transcript scroll absorbs them.
 #[derive(Debug, Clone)]
@@ -233,8 +299,14 @@ struct Screen {
     est_tokens: u64,
     /// Streamed assistant text of the CURRENT task (paragraph, wraps itself).
     streaming: String,
+    /// Transcript scroll: lines above the bottom (0 = follow the tail).
+    /// Cell because the clamp depends on the last draw's viewport height.
+    scroll: std::cell::Cell<usize>,
     /// While true, input is disabled (a task is in flight).
     busy: bool,
+    /// A pending approval question: rendered instead of the input line and
+    /// answered by the next keystroke (y/a/n).
+    pending_approval: Option<ApprovalAsk>,
     /// Set when the user asked to quit.
     quit: bool,
 }
@@ -252,13 +324,32 @@ impl Screen {
             tokens_out: 0,
             est_tokens: 0,
             streaming: String::new(),
+            scroll: std::cell::Cell::new(0),
             busy: false,
+            pending_approval: None,
             quit: false,
         }
     }
 
     fn push(&mut self, kind: LineKind, text: impl Into<String>) {
         self.lines.push((kind, text.into()));
+    }
+
+    /// Scroll the transcript (clamped during draw against the viewport).
+    fn scroll_up(&self, n: usize) {
+        self.scroll.set(self.scroll.get().saturating_add(n));
+    }
+
+    fn scroll_down(&self, n: usize) {
+        self.scroll.set(self.scroll.get().saturating_sub(n));
+    }
+
+    fn scroll_to_bottom(&self) {
+        self.scroll.set(0);
+    }
+
+    fn scroll_to_top(&self) {
+        self.scroll.set(usize::MAX); // clamped in draw()
     }
 
     /// Render one agent event into the screen state.
@@ -355,7 +446,7 @@ impl Screen {
         } else {
             format!("ctx ~{}", self.est_tokens)
         };
-        let status_line = Line::from(vec![
+        let mut status_spans = vec![
             Span::styled(" kazi ", Style::default().fg(Color::Black).bg(CYAN).bold()),
             Span::raw(" "),
             Span::styled(&self.provider_desc, Style::default().fg(DIM)),
@@ -363,11 +454,17 @@ impl Screen {
             Span::styled(&self.session_name, Style::default().fg(CYAN)),
             Span::raw("  "),
             Span::styled(budget_note, Style::default().fg(DIM)),
-        ]);
-        f.render_widget(status_line.style(Style::new()), status);
+        ];
+        if self.scroll.get() > 0 {
+            status_spans.push(Span::styled(
+                "  [scrolled — End: bottom]",
+                Style::default().fg(YELLOW),
+            ));
+        }
+        f.render_widget(Line::from(status_spans).style(Style::new()), status);
 
         // -- transcript ------------------------------------------------------
-        let mut text = Text::default();
+        let mut all: Vec<Line> = Vec::new();
         for (kind, content) in &self.lines {
             let style = match kind {
                 LineKind::User => Style::default().fg(CYAN),
@@ -386,7 +483,7 @@ impl Screen {
             // wrap, but pre-wrapping keeps the scroll arithmetic honest.
             let width = body.width.saturating_sub(2) as usize;
             for chunk in wrap_text(content, width.max(20)) {
-                text.lines.push(Line::styled(chunk, style));
+                all.push(Line::styled(chunk, style));
             }
         }
         // streaming assistant text lives at the bottom of the transcript
@@ -395,12 +492,36 @@ impl Screen {
                 &self.streaming,
                 body.width.saturating_sub(2).max(20) as usize,
             ) {
-                text.lines.push(Line::raw(chunk));
+                all.push(Line::raw(chunk));
             }
         }
-        f.render_widget(Paragraph::new(text), body);
+        let height = body.height as usize;
+        let (start, end, off) = scroll_range(all.len(), height, self.scroll.get());
+        self.scroll.set(off); // keep the stored offset within bounds
+        f.render_widget(Paragraph::new(Text::from(all[start..end].to_vec())), body);
 
-        // -- input box -------------------------------------------------------
+        // -- input box (or the pending approval question) ---------------------
+        if let Some(pending) = &self.pending_approval {
+            let first = pending.summary.lines().next().unwrap_or("");
+            let question = Line::from(vec![
+                Span::styled(
+                    " approve ",
+                    Style::default().fg(Color::Black).bg(YELLOW).bold(),
+                ),
+                Span::raw(" "),
+                Span::raw(first.to_string()),
+            ]);
+            let hint = Line::from(vec![Span::styled(
+                " [y] once   [a] always (session)   [n] deny",
+                Style::default().fg(YELLOW),
+            )]);
+            f.render_widget(
+                Paragraph::new(Text::from(vec![question, hint]))
+                    .block(Block::default().borders(Borders::TOP)),
+                input,
+            );
+            return;
+        }
         let prompt = if self.busy { " [busy] " } else { " kazi> " };
         let budget = (input.width as usize)
             .saturating_sub(1)
@@ -421,6 +542,15 @@ impl Screen {
             .min(input.right().saturating_sub(1));
         f.set_cursor_position(ratatui::layout::Position { x, y: input.y + 1 });
     }
+}
+
+/// (start, end, clamped_offset) of the transcript window: `off` counts lines
+/// hidden below the viewport (0 = follow the tail).
+fn scroll_range(total: usize, height: usize, off: usize) -> (usize, usize, usize) {
+    let off = off.min(total.saturating_sub(height));
+    let end = total.saturating_sub(off);
+    let start = end.saturating_sub(height);
+    (start, end, off)
 }
 
 /// Opt-in key-event tracing to diagnose terminal quirks: set
@@ -550,11 +680,24 @@ pub async fn chat_loop_with(
             name
         }
     };
-    let mut agent =
-        match Agent::default_cli(&cfg, provider.as_deref(), model.as_deref(), yolo).await {
-            Ok(a) => a,
-            Err(e) => anyhow::bail!("{e}"),
-        };
+    // Channel-based approval: the agent asks, the UI loop answers by key.
+    let (ask_tx, ask_rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalAsk>();
+    let approver: std::sync::Arc<dyn Approver> = if yolo {
+        std::sync::Arc::new(crate::tools::AutoApprover)
+    } else {
+        std::sync::Arc::new(TuiApprover::new(ask_tx))
+    };
+    let mut agent = match Agent::default_cli_with_approver(
+        &cfg,
+        provider.as_deref(),
+        model.as_deref(),
+        approver,
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => anyhow::bail!("{e}"),
+    };
 
     // resume the same way repl.rs does
     if let Some(name) = &resume {
@@ -580,7 +723,7 @@ pub async fn chat_loop_with(
         );
     };
 
-    match chat_loop_tui(agent, session_name.clone(), save).await {
+    match chat_loop_tui(agent, session_name.clone(), save, ask_rx).await {
         Ok(code) => {
             println!("\x1b[2msession saved -> {session_name}\x1b[0m");
             Ok(code)
@@ -599,13 +742,14 @@ pub async fn chat_loop_tui(
     agent: Agent,
     session_name: String,
     on_session_save: impl Fn(&Agent),
+    mut approvals: tokio::sync::mpsc::UnboundedReceiver<ApprovalAsk>,
 ) -> anyhow::Result<u8> {
     let provider_desc = agent.provider().describe();
     let max_rounds = agent.max_rounds();
 
     enable_raw_mode()?;
     let mut stdout: Stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -615,7 +759,14 @@ pub async fn chat_loop_tui(
         "type a task and press Enter (empty line = same task again) — Esc quits".to_string(),
     );
 
-    let res = tui_inner(&mut terminal, &mut screen, agent, &on_session_save).await;
+    let res = tui_inner(
+        &mut terminal,
+        &mut screen,
+        agent,
+        &on_session_save,
+        &mut approvals,
+    )
+    .await;
 
     disable_raw_mode()?;
     execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
@@ -637,6 +788,7 @@ async fn tui_inner(
     screen: &mut Screen,
     agent: Agent,
     on_session_save: &(impl Fn(&Agent) + ?Sized),
+    approvals: &mut tokio::sync::mpsc::UnboundedReceiver<ApprovalAsk>,
 ) -> anyhow::Result<Option<Agent>> {
     // Agent handoff: the runner task owns the agent while a task runs (the
     // engine needs `&mut`), then parks it back here for the next task and
@@ -667,6 +819,13 @@ async fn tui_inner(
         let _ = terminal.draw(|f| screen.draw(f));
 
         tokio::select! {
+            // ---- approval requests from the agent --------------------------
+            ask = approvals.recv() => {
+                if let Some(ask) = ask {
+                    screen.pending_approval = Some(ask);
+                }
+            }
+
             // ---- agent pump ------------------------------------------------
             maybe = rx.recv(), if runner.is_some() => match maybe {
                 Some(Pump::Ev(ev)) => screen.consume(ev),
@@ -691,6 +850,24 @@ async fn tui_inner(
             maybe_ev = events.next() => match maybe_ev {
                 Some(Ok(CtEvent::Key(key))) if key.kind != KeyEventKind::Release => {
                     log_key_event(&key);
+                    // a pending approval swallows the next keystroke
+                    if let Some(pending) = screen.pending_approval.take() {
+                        let decision = match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                                Decision::Allow
+                            }
+                            KeyCode::Char('a') | KeyCode::Char('A') => Decision::AllowSession,
+                            _ => Decision::Deny, // n / Esc / anything else
+                        };
+                        let _ = pending.reply.send(decision);
+                        let verdict = match decision {
+                            Decision::Allow => "allowed",
+                            Decision::AllowSession => "allowed (session)",
+                            Decision::Deny => "denied",
+                        };
+                        screen.push(LineKind::Dim, format!("approval: {verdict}"));
+                        continue;
+                    }
                     match key.code {
                     KeyCode::Esc => {
                         if screen.busy {
@@ -706,6 +883,7 @@ async fn tui_inner(
                     KeyCode::Enter if !screen.busy => {
                         if let Some(task) = screen.take_input() {
                             screen.busy = true;
+                            screen.scroll_to_bottom(); // new work pulls the view down
                             // take agent out of the slot for the runner
                             let taken = shared_agent.lock().await.take();
                             if let Some(owned) = taken {
@@ -728,10 +906,26 @@ async fn tui_inner(
                     KeyCode::Delete => screen.input.delete(),
                     KeyCode::Left => screen.input.left(),
                     KeyCode::Right => screen.input.right(),
+                    KeyCode::Home
+                        if key
+                            .modifiers
+                            .contains(ratatui::crossterm::event::KeyModifiers::CONTROL) =>
+                    {
+                        screen.scroll_to_top()
+                    }
+                    KeyCode::End
+                        if key
+                            .modifiers
+                            .contains(ratatui::crossterm::event::KeyModifiers::CONTROL) =>
+                    {
+                        screen.scroll_to_bottom()
+                    }
                     KeyCode::Home => screen.input.home(),
                     KeyCode::End => screen.input.end(),
                     KeyCode::Up => screen.input.history_prev(),
                     KeyCode::Down => screen.input.history_next(),
+                    KeyCode::PageUp => screen.scroll_up(10),
+                    KeyCode::PageDown => screen.scroll_down(10),
                     KeyCode::Char(c)
                         if key
                             .modifiers
@@ -755,6 +949,11 @@ async fn tui_inner(
                     }
                     }
                 }
+                Some(Ok(CtEvent::Mouse(me))) => match me.kind {
+                    MouseEventKind::ScrollUp => screen.scroll_up(3),
+                    MouseEventKind::ScrollDown => screen.scroll_down(3),
+                    _ => {}
+                },
                 Some(Ok(_)) => {} // resize/focus/mouse: next draw picks size up
                 Some(Err(_)) | None => {} // event loop hiccup: keep going
             },
@@ -973,6 +1172,18 @@ mod tests {
     }
 
     #[test]
+    fn scroll_window_follows_and_clamps() {
+        // following the tail
+        assert_eq!(scroll_range(100, 10, 0), (90, 100, 0));
+        // five lines up
+        assert_eq!(scroll_range(100, 10, 5), (85, 95, 5));
+        // overshoot clamps to the top
+        assert_eq!(scroll_range(100, 10, 999), (0, 10, 90));
+        // fewer lines than the viewport
+        assert_eq!(scroll_range(3, 10, 0), (0, 3, 0));
+    }
+
+    #[test]
     fn modifier_combos_are_not_text() {
         use ratatui::crossterm::event::KeyModifiers as M;
         // plain typing, incl. shifted punctuation
@@ -985,5 +1196,33 @@ mod tests {
         assert_eq!(accepted_char(&KeyCode::Char(' '), M::SHIFT), None);
         assert_eq!(accepted_char(&KeyCode::Char('a'), M::CONTROL), None);
         assert_eq!(accepted_char(&KeyCode::Char('\0'), M::NONE), None);
+    }
+
+    #[tokio::test]
+    async fn tui_approver_round_trips_and_remembers() {
+        use std::sync::Arc;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalAsk>();
+        let approver = Arc::new(TuiApprover::new(tx));
+
+        // first ask: agent side waits, UI side answers "always"
+        let a1 = approver.clone();
+        let task1 = tokio::spawn(async move { a1.decide("run_command", "$ git status").await });
+        let ask = rx.recv().await.expect("ask delivered");
+        assert!(ask.summary.contains("git status"));
+        ask.reply.send(Decision::AllowSession).expect("ui replies");
+        assert_eq!(task1.await.unwrap(), Decision::Allow);
+
+        // same command prefix afterwards: no question, straight allow
+        assert_eq!(
+            approver.decide("run_command", "$ git log --oneline").await,
+            Decision::Allow
+        );
+
+        // a different command still asks, and deny is honoured
+        let a2 = approver.clone();
+        let task2 = tokio::spawn(async move { a2.decide("run_command", "$ cargo test").await });
+        let ask2 = rx.recv().await.expect("second ask");
+        ask2.reply.send(Decision::Deny).expect("ui replies");
+        assert_eq!(task2.await.unwrap(), Decision::Deny);
     }
 }
