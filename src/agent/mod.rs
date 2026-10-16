@@ -353,6 +353,10 @@ impl Agent {
         self.history.push(Message::user(task.to_string()));
         self.usage = Usage::default();
         self.clear_cancel();
+        // every task run gets a fresh checkpoint epoch: `/undo` restores it
+        if let Some(cp) = &self.ctx.checkpointing {
+            cp.begin_epoch();
+        }
 
         for round in 0..self.max_rounds {
             if self.cancelled() {
@@ -531,6 +535,7 @@ mod tests {
             output_limit: 4096,
             allow_commands: vec![],
             approver: Arc::new(AutoApprover),
+            checkpointing: None,
         }
     }
 
@@ -1023,6 +1028,7 @@ mod tests {
             output_limit: 4096,
             allow_commands: vec![],
             approver: Arc::new(DenyApprover),
+            checkpointing: None,
         };
         let script = vec![
             LlmResponse {

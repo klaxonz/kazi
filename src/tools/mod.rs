@@ -6,6 +6,7 @@
 //! flows back to the model as text (`is_error` marks failures), so the model
 //! can adapt instead of the loop aborting.
 
+pub mod checkpoint;
 pub mod fetch;
 pub mod file;
 pub mod patch;
@@ -82,6 +83,8 @@ pub struct ToolCtx {
     /// `run_command` prefixes auto-approved without prompting.
     pub allow_commands: Vec<String>,
     pub approver: Arc<dyn Approver>,
+    /// Write-ahead checkpoints for `/undo` (absent in bare library tests).
+    pub checkpointing: Option<Arc<checkpoint::Checkpointing>>,
 }
 
 /// One approval answer.
@@ -161,6 +164,12 @@ pub fn tool_ctx(
         output_limit: cfg.output_limit.unwrap_or(64_000),
         allow_commands: cfg.allow_commands.clone().unwrap_or_default(),
         approver,
+        // write-ahead checkpoints live under the platform data dir
+        checkpointing: dirs::data_dir().map(|d| {
+            Arc::new(checkpoint::Checkpointing::new(
+                d.join("kazi").join("checkpoints"),
+            ))
+        }),
     }
 }
 
@@ -350,6 +359,7 @@ mod tests {
             output_limit: 4096,
             allow_commands: vec!["echo".into()],
             approver: Arc::new(AutoApprover),
+            checkpointing: None,
         }
     }
 }

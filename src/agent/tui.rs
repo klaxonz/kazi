@@ -38,6 +38,16 @@ const GREEN: Color = Color::Green;
 const RED: Color = Color::Red;
 const YELLOW: Color = Color::Yellow;
 
+/// Keys and commands the TUI itself answers (the full command set lives in
+/// the line REPL, `kazi --no-tui`).
+const TUI_HELP: &[&str] = &[
+    "keys: Enter submit · Esc interrupt (idle: quit) · Ctrl+C quit",
+    "↑/↓ input history · Ctrl+A/E/U/K/W edit · Ctrl+L clear transcript",
+    "PgUp/PgDn or mouse wheel scroll · Ctrl+Home top · Ctrl+End bottom",
+    "commands here: /undo (restore last task's files) · /help",
+    "full set (/new, /model, /provider, /compact, /resume …): kazi --no-tui",
+];
+
 /// Approval request travelling from the agent thread to the UI loop.
 pub struct ApprovalAsk {
     pub summary: String,
@@ -882,6 +892,41 @@ async fn tui_inner(
                     }
                     KeyCode::Enter if !screen.busy => {
                         if let Some(task) = screen.take_input() {
+                            // minimal in-TUI command set; anything else starting
+                            // with '/' is reported instead of being sent as a task
+                            if let Some(cmdline) = task.strip_prefix('/') {
+                                match cmdline.trim().to_lowercase().as_str() {
+                                    "undo" => {
+                                        let cp = shared_agent
+                                            .lock()
+                                            .await
+                                            .as_ref()
+                                            .and_then(|a| a.ctx.checkpointing.clone());
+                                        let msg = match cp {
+                                            Some(cp) => match cp.undo_latest() {
+                                                Ok(Some(n)) => {
+                                                    format!("undo: restored {n} file(s)")
+                                                }
+                                                Ok(None) => "undo: nothing to restore".to_string(),
+                                                Err(e) => format!("undo failed: {e}"),
+                                            },
+                                            None => "undo unavailable in this build".to_string(),
+                                        };
+                                        screen.push(LineKind::Dim, msg);
+                                    }
+                                    "help" => {
+                                        for line in TUI_HELP {
+                                            screen.push(LineKind::Dim, *line);
+                                        }
+                                    }
+                                    other => screen.push(
+                                        LineKind::Warn,
+                                        format!("unknown command /{other} — /help for keys (full command set in `kazi --no-tui`)"),
+                                    ),
+                                }
+                                screen.scroll_to_bottom();
+                                continue;
+                            }
                             screen.busy = true;
                             screen.scroll_to_bottom(); // new work pulls the view down
                             // take agent out of the slot for the runner

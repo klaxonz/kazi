@@ -255,6 +255,7 @@ mod tests {
             output_limit: 4096,
             allow_commands: vec![],
             approver: Arc::new(AutoApprover),
+            checkpointing: None,
         }
     }
 

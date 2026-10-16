@@ -37,6 +37,15 @@ const RED: &str = "\x1b[31m";
 const YELLOW: &str = "\x1b[33m";
 const RESET: &str = "\x1b[0m";
 
+/// Undo the last task's file changes via the agent's checkpoint store.
+/// Shared by the REPL and the TUI.
+pub fn undo_last_task(agent: &Agent) -> std::io::Result<Option<usize>> {
+    match &agent.ctx.checkpointing {
+        Some(cp) => cp.undo_latest(),
+        None => Ok(None),
+    }
+}
+
 /// Terminal prompt approver: `y` once, `a` always (this session, per
 /// command prefix), anything else denies. A blocking stdin read is
 /// deliberate here — nothing else runs while we wait.
@@ -152,6 +161,12 @@ const COMMANDS: &[CmdSpec] = &[
         name: "/help",
         args: "",
         help: "show this help",
+        arg: ArgKind::No,
+    },
+    CmdSpec {
+        name: "/undo",
+        args: "",
+        help: "restore files changed by the last task",
         arg: ArgKind::No,
     },
     CmdSpec {
@@ -751,6 +766,11 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
 
     match (verb, arg) {
         ("/help", _) => println!("{}", help_text()),
+        ("/undo", _) => match undo_last_task(&live.agent) {
+            Ok(Some(n)) => println!("restored {n} file(s) from the last task's checkpoint"),
+            Ok(None) => println!("nothing to undo (no checkpointed task yet)"),
+            Err(e) => println!("{RED}undo failed: {e}{RESET}"),
+        },
         ("/exit", _) | ("/quit", _) => return Flow::Exit,
         ("/clear", _) => {
             // clear + repoint autosave: the old file can never be rewritten

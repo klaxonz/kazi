@@ -104,6 +104,10 @@ impl Tool for ApplyPatch {
         patched.push_str(&text[first + find.len()..]);
 
         let start_line = text[..first].matches('\n').count() + 1;
+        // write-ahead checkpoint: keep the pre-patch content for /undo
+        if let Some(cp) = &ctx.checkpointing {
+            cp.snapshot(&path);
+        }
         tokio::fs::write(&path, patched.as_bytes())
             .await
             .map_err(|e| ToolError::new(format!("cannot write {path:?}: {e}")))?;
@@ -141,6 +145,7 @@ mod tests {
             output_limit: 4096,
             allow_commands: vec![],
             approver: Arc::new(super::super::AutoApprover),
+            checkpointing: None,
         }
     }
 

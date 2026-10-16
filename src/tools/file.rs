@@ -233,6 +233,10 @@ impl Tool for WriteFile {
                 .await
                 .map_err(|e| ToolError::new(format!("cannot create parent dirs: {e}")))?;
         }
+        // write-ahead checkpoint: keep the pre-write content for /undo
+        if let Some(cp) = &ctx.checkpointing {
+            cp.snapshot(&path);
+        }
         tokio::fs::write(&path, content)
             .await
             .map_err(|e| ToolError::new(format!("cannot write {path:?}: {e}")))?;
@@ -275,7 +279,34 @@ mod tests {
             output_limit: 4096,
             allow_commands: vec![],
             approver: Arc::new(super::super::AutoApprover),
+            checkpointing: None,
         }
+    }
+
+    #[tokio::test]
+    async fn write_file_snapshots_for_undo() {
+        let d = tempdir("ckpt");
+        let store = std::sync::Arc::new(crate::tools::checkpoint::Checkpointing::new(
+            d.join("store"),
+        ));
+        let mut ctx = ctx_for(d.clone(), None);
+        ctx.checkpointing = Some(store.clone());
+
+        std::fs::write(d.join("a.txt"), "v1").unwrap();
+        store.begin_epoch();
+        WriteFile
+            .run(&json!({"path": "a.txt", "content": "v2"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "v2");
+
+        assert_eq!(store.undo_latest().unwrap(), Some(1));
+        assert_eq!(
+            std::fs::read_to_string(d.join("a.txt")).unwrap(),
+            "v1",
+            "undo must restore the pre-write content"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[tokio::test]

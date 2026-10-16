@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-17
+
+### Added
+
+- **TUI input line**: full editing (←/→, Home/End, Delete, Ctrl+A/E/U/K/W),
+  ↑/↓ history recall (the half-typed draft survives browsing), and a
+  caret-aware horizontal window that accounts for double-width CJK glyphs.
+- **Transcript scrolling**: PgUp/PgDn, mouse wheel, Ctrl+Home top /
+  Ctrl+End bottom, a "scrolled" indicator, and Enter snapping back to the
+  tail; the viewport math is a tested pure function.
+- **Task interruption**: Esc cancels a running task (the session and its
+  history survive — only the in-flight response is dropped); Esc when idle
+  quits; Ctrl+C quits. Cancellation is checked between rounds and while
+  streaming.
+- **Approval decisions**: `y` once / `a` always (per command prefix, per
+  session) / `n` deny — in both the REPL prompt and a new in-TUI approval
+  row (channel-based, so raw mode never fights stdin for the answer).
+- **Write-ahead checkpoints + `/undo`**: before any write tool touches a
+  file, the original is copied into a per-task checkpoint epoch. `/undo`
+  (REPL and TUI) restores the last task's files — including *deleting* files
+  the task created; the newest 20 epochs are kept, older ones pruned.
+- TUI command stub: `/undo` and `/help` (with a keys cheatsheet) work
+  in-TUI; the full command set remains in the line REPL (`kazi --no-tui`).
+
 ## [0.10.5] - 2026-10-17
 
 ### Fixed
