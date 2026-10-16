@@ -275,9 +275,7 @@ impl Agent {
         if (self.history.estimate_tokens() as f64) < budget as f64 * Self::COMPACT_THRESHOLD {
             return None;
         }
-        let Some(dropped) = self.history.take_beyond_text(budget) else {
-            return None;
-        };
+        let dropped = self.history.take_beyond_text(budget)?;
         on_event(AgentEvent::AutoCompactStarted);
         let note: String = match self.summarize_dropped(&dropped).await {
             Ok(summary) if !summary.is_empty() => {
@@ -818,10 +816,9 @@ mod tests {
                 .any(|e| matches!(e, AgentEvent::AutoCompactStarted)),
             "run_task must trigger auto-compact between rounds, events: {evs:?}"
         );
-        assert!(
-            evs.iter()
-                .any(|e| matches!(e, AgentEvent::AutoCompactDone { .. }))
-        );
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AutoCompactDone { .. })));
     }
 
     #[tokio::test]
@@ -855,7 +852,10 @@ mod tests {
         // Provider error, not a context blowup — trim kept the request legal.
         assert!(result.is_err(), "script runs dry: {result:?}");
         let est = agent.history.estimate_tokens();
-        assert!(est <= 400, "fallback trim must bring context under the budget: {est}");
+        assert!(
+            est <= 400,
+            "fallback trim must bring context under the budget: {est}"
+        );
     }
 
     #[tokio::test]

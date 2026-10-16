@@ -114,18 +114,78 @@ struct CmdSpec {
 }
 
 const COMMANDS: &[CmdSpec] = &[
-    CmdSpec { name: "/help",    args: "",          help: "show this help", arg: ArgKind::No },
-    CmdSpec { name: "/exit",    args: "",          help: "save session and leave (Ctrl-D also quits)", arg: ArgKind::No },
-    CmdSpec { name: "/quit",    args: "",          help: "alias for /exit", arg: ArgKind::No },
-    CmdSpec { name: "/new",     args: "[name]",    help: "fresh session (optional name); the old one keeps on exit", arg: ArgKind::Topic },
-    CmdSpec { name: "/clear",   args: "",          help: "forget history; autosave moves to a fresh session file", arg: ArgKind::No },
-    CmdSpec { name: "/compact", args: "",          help: "drop oldest turns under the context budget", arg: ArgKind::No },
-    CmdSpec { name: "/resume",  args: "<prefix>",  help: "load a stored session (TAB lists them)", arg: ArgKind::Session },
-    CmdSpec { name: "/provider", args: "<nick>",   help: "switch provider (TAB lists them)", arg: ArgKind::Provider },
-    CmdSpec { name: "/model",   args: "<name>",    help: "override the current provider's model", arg: ArgKind::Model },
-    CmdSpec { name: "/yolo",    args: "[on|off]",  help: "toggle command auto-approval", arg: ArgKind::Toggle },
-    CmdSpec { name: "/tools",   args: "",          help: "list built-in tools (+ MCP servers)", arg: ArgKind::No },
-    CmdSpec { name: "/status",  args: "",          help: "provider, model, rounds, usage, session", arg: ArgKind::No },
+    CmdSpec {
+        name: "/help",
+        args: "",
+        help: "show this help",
+        arg: ArgKind::No,
+    },
+    CmdSpec {
+        name: "/exit",
+        args: "",
+        help: "save session and leave (Ctrl-D also quits)",
+        arg: ArgKind::No,
+    },
+    CmdSpec {
+        name: "/quit",
+        args: "",
+        help: "alias for /exit",
+        arg: ArgKind::No,
+    },
+    CmdSpec {
+        name: "/new",
+        args: "[name]",
+        help: "fresh session (optional name); the old one keeps on exit",
+        arg: ArgKind::Topic,
+    },
+    CmdSpec {
+        name: "/clear",
+        args: "",
+        help: "forget history; autosave moves to a fresh session file",
+        arg: ArgKind::No,
+    },
+    CmdSpec {
+        name: "/compact",
+        args: "",
+        help: "drop oldest turns under the context budget",
+        arg: ArgKind::No,
+    },
+    CmdSpec {
+        name: "/resume",
+        args: "<prefix>",
+        help: "load a stored session (TAB lists them)",
+        arg: ArgKind::Session,
+    },
+    CmdSpec {
+        name: "/provider",
+        args: "<nick>",
+        help: "switch provider (TAB lists them)",
+        arg: ArgKind::Provider,
+    },
+    CmdSpec {
+        name: "/model",
+        args: "<name>",
+        help: "override the current provider's model",
+        arg: ArgKind::Model,
+    },
+    CmdSpec {
+        name: "/yolo",
+        args: "[on|off]",
+        help: "toggle command auto-approval",
+        arg: ArgKind::Toggle,
+    },
+    CmdSpec {
+        name: "/tools",
+        args: "",
+        help: "list built-in tools (+ MCP servers)",
+        arg: ArgKind::No,
+    },
+    CmdSpec {
+        name: "/status",
+        args: "",
+        help: "provider, model, rounds, usage, session",
+        arg: ArgKind::No,
+    },
 ];
 
 fn spec_of(verb: &str) -> Option<&'static CmdSpec> {
@@ -317,11 +377,7 @@ impl Highlighter for SlashHelper {
             return Cow::Borrowed(line);
         }
         let end = line.find(' ').unwrap_or(line.len());
-        Cow::Owned(format!(
-            "{CYAN}{}{RESET}{}",
-            &line[..end],
-            &line[end..]
-        ))
+        Cow::Owned(format!("{CYAN}{}{RESET}{}", &line[..end], &line[end..]))
     }
 
     fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
@@ -659,7 +715,10 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
             let name = pick_session_name(None);
             *state.session_name_mut() = name;
             live.agent.reset();
-            println!("{GREEN}history cleared{RESET} — autosave now -> {}", state.session_name);
+            println!(
+                "{GREEN}history cleared{RESET} — autosave now -> {}",
+                state.session_name
+            );
         }
         ("/new", topic) => {
             let name = pick_session_name(if topic.is_empty() { None } else { Some(topic) });
@@ -682,9 +741,15 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
             if prefix.is_empty() {
                 let have = session::list();
                 if have.is_empty() {
-                    println!("no stored sessions yet — sessions save automatically after each task");
+                    println!(
+                        "no stored sessions yet — sessions save automatically after each task"
+                    );
                 } else {
-                    println!("stored sessions: {}\n{}", have.join(", "), usage_line(spec_of("/resume").unwrap()));
+                    println!(
+                        "stored sessions: {}\n{}",
+                        have.join(", "),
+                        usage_line(spec_of("/resume").unwrap())
+                    );
                 }
             } else {
                 match session::resolve(prefix) {
@@ -767,7 +832,9 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
                     println!(
                         "command auto-approval: {}",
                         if state.yolo {
-                            format!("{GREEN}ON{RESET} (--yolo) — run_command executes without prompts")
+                            format!(
+                                "{GREEN}ON{RESET} (--yolo) — run_command executes without prompts"
+                            )
                         } else {
                             format!("{YELLOW}OFF{RESET} — run_command asks for approval")
                         }
@@ -798,8 +865,15 @@ mod tests {
 
     #[test]
     fn continuation_backslash_detected() {
-        assert_eq!(strip_continuation("refactor this \\"), Some("refactor this"));
-        assert_eq!(strip_continuation("a\\\\b"), None, "escaped backslash, not EOL");
+        assert_eq!(
+            strip_continuation("refactor this \\"),
+            Some("refactor this")
+        );
+        assert_eq!(
+            strip_continuation("a\\\\b"),
+            None,
+            "escaped backslash, not EOL"
+        );
         // terminal backslash with spaces before it still joins
         assert_eq!(strip_continuation("x  \\  "), Some("x"));
         assert_eq!(strip_continuation("plain"), None);
@@ -846,9 +920,7 @@ mod tests {
         assert_eq!(start, 0);
         assert_eq!(cands[0].replacement, "/resume");
         // arg completion: provider nicks after "/provider "
-        let (start, cands) = helper
-            .completions("/provider de", 12)
-            .expect("in scope");
+        let (start, cands) = helper.completions("/provider de", 12).expect("in scope");
         assert_eq!(start, 10);
         assert_eq!(cands[0].replacement, "deepseek");
         // TAB on a known arg kind lists everything even with empty token
@@ -875,7 +947,9 @@ mod tests {
         let ctx = rustyline::Context::new(&history);
         let hint = helper.hint("/model", 6, &ctx).expect("hint");
         assert!(hint.contains("<name>") && hint.contains("m1"));
-        let hint = helper.hint("/provider ", 10, &ctx).expect("hint after space");
+        let hint = helper
+            .hint("/provider ", 10, &ctx)
+            .expect("hint after space");
         assert!(hint.contains("one of: a"));
         // mid-line cursor or past the verb → silent
         assert!(helper.hint("/model gpt", 10, &ctx).is_none());
@@ -889,8 +963,12 @@ mod tests {
         let name = pick_session_name(Some(&base));
         assert_ne!(name, base, "existing session must not be reused");
         assert!(name.starts_with(&format!("{base}-")));
-        std::fs::remove_file(session::sessions_dir().unwrap().join(format!("{base}.json")))
-            .unwrap();
+        std::fs::remove_file(
+            session::sessions_dir()
+                .unwrap()
+                .join(format!("{base}.json")),
+        )
+        .unwrap();
     }
 }
 

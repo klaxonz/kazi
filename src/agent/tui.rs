@@ -94,10 +94,7 @@ impl Screen {
             AgentEvent::TextDelta { text } => self.streaming.push_str(&text),
             AgentEvent::ToolStart { name } => {
                 self.flush_streaming();
-                self.push(
-                    LineKind::Tool { is_error: false },
-                    format!(">> {name} ..."),
-                );
+                self.push(LineKind::Tool { is_error: false }, format!(">> {name} ..."));
             }
             AgentEvent::ToolEnd {
                 name,
@@ -109,13 +106,19 @@ impl Screen {
                 if let Some(last) = self.lines.last_mut() {
                     if last.1 == placeholder {
                         last.0 = LineKind::Tool { is_error };
-                        last.1 = format!(">> {name} [{verdict}] {preview}", verdict = if is_error { "x" } else { "ok" });
+                        last.1 = format!(
+                            ">> {name} [{verdict}] {preview}",
+                            verdict = if is_error { "x" } else { "ok" }
+                        );
                         return;
                     }
                 }
                 self.push(
                     LineKind::Tool { is_error },
-                    format!(">> {name} [{verdict}] {preview}", verdict = if is_error { "x" } else { "ok" }),
+                    format!(
+                        ">> {name} [{verdict}] {preview}",
+                        verdict = if is_error { "x" } else { "ok" }
+                    ),
                 );
             }
             AgentEvent::AutoCompactStarted => {
@@ -220,7 +223,10 @@ impl Screen {
         }
         // streaming assistant text lives at the bottom of the transcript
         if !self.streaming.is_empty() {
-            for chunk in wrap_text(&self.streaming, body.width.saturating_sub(2).max(20) as usize) {
+            for chunk in wrap_text(
+                &self.streaming,
+                body.width.saturating_sub(2).max(20) as usize,
+            ) {
                 text.lines.push(Line::raw(chunk));
             }
         }
@@ -231,8 +237,7 @@ impl Screen {
         let shown: String = if visible_width(&self.input) + visible_width(prompt)
             > (input.width as usize).saturating_sub(2)
         {
-            let keep = (input.width as usize)
-                .saturating_sub(2 + visible_width(prompt));
+            let keep = (input.width as usize).saturating_sub(2 + visible_width(prompt));
             self.input
                 .chars()
                 .rev()
@@ -255,7 +260,8 @@ impl Screen {
 
         // cursor
         f.set_cursor_position(ratatui::layout::Position {
-            x: (input.x + 1 + prompt.len() as u16 + shown.len() as u16).min(input.right().saturating_sub(1)),
+            x: (input.x + 1 + prompt.len() as u16 + shown.len() as u16)
+                .min(input.right().saturating_sub(1)),
             y: input.y + 1,
         });
     }
@@ -324,7 +330,11 @@ pub async fn chat_loop_with(
     let session_name = match resume.as_deref() {
         Some(name) => super::session::resolve(name).unwrap_or_else(|| name.to_string()),
         None => {
-            let base = match topic.as_deref().map(super::repl::slugify).filter(|s| !s.is_empty()) {
+            let base = match topic
+                .as_deref()
+                .map(super::repl::slugify)
+                .filter(|s| !s.is_empty())
+            {
                 Some(n) => n,
                 None => super::session::default_name(),
             };
@@ -337,11 +347,11 @@ pub async fn chat_loop_with(
             name
         }
     };
-    let mut agent = match Agent::default_cli(&cfg, provider.as_deref(), model.as_deref(), yolo).await
-    {
-        Ok(a) => a,
-        Err(e) => anyhow::bail!("{e}"),
-    };
+    let mut agent =
+        match Agent::default_cli(&cfg, provider.as_deref(), model.as_deref(), yolo).await {
+            Ok(a) => a,
+            Err(e) => anyhow::bail!("{e}"),
+        };
 
     // resume the same way repl.rs does
     if let Some(name) = &resume {
@@ -374,15 +384,7 @@ pub async fn chat_loop_with(
         }
         Err(_) => {
             // terminal can't do alternate screens: classic REPL fallback
-            crate::agent::repl::chat_loop(
-                cfg,
-                provider,
-                model,
-                yolo,
-                topic,
-                resume,
-            )
-            .await
+            crate::agent::repl::chat_loop(cfg, provider, model, yolo, topic, resume).await
         }
     }
 }
@@ -405,7 +407,10 @@ pub async fn chat_loop_tui(
     let mut terminal = Terminal::new(backend)?;
 
     let mut screen = Screen::new(&provider_desc, &session_name, max_rounds);
-    screen.push(LineKind::Dim, "type a task and press Enter (empty line = same task again) — Esc quits".to_string());
+    screen.push(
+        LineKind::Dim,
+        "type a task and press Enter (empty line = same task again) — Esc quits".to_string(),
+    );
 
     let res = tui_inner(&mut terminal, &mut screen, &mut agent, &on_session_save).await;
 
@@ -417,13 +422,7 @@ pub async fn chat_loop_tui(
     if screen.lines.len() > 1 {
         on_session_save(&agent);
     }
-    res.map(|_| {
-        if quit_clean {
-            0
-        } else {
-            1
-        }
-    })
+    res.map(|_| if quit_clean { 0 } else { 1 })
 }
 
 /// Width of a string as terminal columns — chars here is close enough for

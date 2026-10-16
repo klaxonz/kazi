@@ -143,10 +143,12 @@ pub fn resolve(name: &str) -> Option<String> {
 /// `Ok(Some(dirty))` = deleted, `Ok(None)`: ambiguous, `Err`: not found.
 pub fn delete(name: &str) -> Result<Option<String>, SessionError> {
     let dir = sessions_dir()?;
-    let resolved = resolve(name).ok_or_else(|| SessionError::Io(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        format!("no session matches `{name}` (or the prefix is ambiguous)"),
-    )))?;
+    let resolved = resolve(name).ok_or_else(|| {
+        SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no session matches `{name}` (or the prefix is ambiguous)"),
+        ))
+    })?;
     std::fs::remove_file(dir.join(format!("{resolved}.json")))?;
     Ok(Some(resolved))
 }

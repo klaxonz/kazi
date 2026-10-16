@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-17
+
+### Fixed
+
+- CI on v0.9.0 was red: clippy's `question_mark` lint flagged the auto-compact
+  fallback (`let...else` → `?`), and the MSRV job failed because the TUI
+  dependency tree pulls crates on `edition2024`.
+
+### Changed
+
+- MSRV raised 1.80 → 1.85 (required by the TUI dependency tree; CI job updated).
+- Repository URL corrected to github.com/klaxonz (metadata only).
+
 ## [0.9.0] - 2026-10-17
 
 ### Added
