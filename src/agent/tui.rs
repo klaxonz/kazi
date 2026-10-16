@@ -453,7 +453,12 @@ async fn tui_inner(
         Ev(AgentEvent),
         Done(Result<String, super::AgentError>),
     }
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Pump>(256);
+    // Unbounded on purpose: the producer is the agent callback, which runs
+    // synchronously inside the runner's runtime thread — an async `send`
+    // cannot be awaited there and `blocking_send` would panic ("cannot block
+    // the current thread from within a runtime"). A per-task event stream is
+    // bounded by the answer length, so unbounded is safe here.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Pump>();
     let mut runner: Option<tokio::task::JoinHandle<()>> = None;
 
     // crossterm's async event stream (event-stream feature)
@@ -496,11 +501,11 @@ async fn tui_inner(
                                 runner = Some(tokio::spawn(async move {
                                     let mut owned = owned;
                                     let out = owned.run_task(&task, |ev| {
-                                        let _ = tx.blocking_send(Pump::Ev(ev));
+                                        let _ = tx.send(Pump::Ev(ev));
                                     }).await;
                                     // park the agent back first, THEN report
                                     slot.lock().await.replace(owned);
-                                    let _ = tx.send(Pump::Done(out)).await;
+                                    let _ = tx.send(Pump::Done(out));
                                 }));
                             }
                         }
@@ -587,5 +592,22 @@ mod tests {
         assert!(s.input.is_empty());
         assert!(s.lines.last().unwrap().1.contains("you> hello"));
         assert!(s.take_input().is_none(), "empty input = no task");
+    }
+
+    /// The TUI runner's event callback runs synchronously inside a runtime
+    /// thread, so its send must not block. This pins the unbounded-channel
+    /// pattern that replaced `blocking_send` (which panicked, v0.10.2).
+    #[tokio::test]
+    async fn event_callback_sends_without_blocking() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
+        tokio::spawn(async move {
+            let callback = |v: u8| {
+                tx.send(v).expect("receiver alive");
+            };
+            callback(7);
+        })
+        .await
+        .unwrap();
+        assert_eq!(rx.recv().await, Some(7));
     }
 }

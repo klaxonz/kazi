@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-10-17
+
+### Fixed
+
+- TUI panicked the moment a task started streaming: the event pump called
+  `blocking_send` from inside the tokio runtime thread, which tokio forbids
+  ("cannot block the current thread from within a runtime"). The pump is now
+  an unbounded channel whose synchronous `send` is safe from the agent
+  callback — the bug class is eliminated at the type level, since only
+  bounded senders even expose `blocking_send`.
+
 ## [0.10.1] - 2026-10-17
 
 ### Fixed
