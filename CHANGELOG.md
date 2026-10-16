@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.5] - 2026-10-17
+
+### Fixed
+
+- TUI caret sat one column too far right (the input block has no left
+  border, but the cursor math added a column) — it looked like a stray space
+  between the typed text and the cursor. Caret placement is now a pure,
+  tested function of prompt width + typed display width.
+
 ## [0.10.4] - 2026-10-17
 
 ### Fixed

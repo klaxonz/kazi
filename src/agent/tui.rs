@@ -243,7 +243,6 @@ impl Screen {
         } else {
             self.input.clone()
         };
-        let shown_w = UnicodeWidthStr::width(&*shown);
         let input_text = Line::from(vec![
             Span::styled(prompt, Style::default().fg(CYAN).bold()),
             Span::raw(&shown),
@@ -253,13 +252,21 @@ impl Screen {
             input,
         );
 
-        // cursor
+        // cursor: sits right after the typed text. The block has no left
+        // border, so the paragraph starts at `input.x` itself — adding an
+        // extra column here left a visible gap before the caret.
         f.set_cursor_position(ratatui::layout::Position {
-            x: (input.x + 1 + UnicodeWidthStr::width(prompt) as u16 + shown_w as u16)
-                .min(input.right().saturating_sub(1)),
+            x: cursor_col(input.x, input.right(), prompt, &shown),
             y: input.y + 1,
         });
     }
+}
+
+/// Column for the caret: input origin + prompt width + typed width, clamped
+/// one short of the right edge. Pure so it can be regression-tested.
+fn cursor_col(input_x: u16, input_right: u16, prompt: &str, shown: &str) -> u16 {
+    let x = input_x + UnicodeWidthStr::width(prompt) as u16 + UnicodeWidthStr::width(shown) as u16;
+    x.min(input_right.saturating_sub(1))
 }
 
 /// Opt-in key-event tracing to diagnose terminal quirks: set
@@ -690,6 +697,14 @@ mod tests {
         assert_eq!(tail_by_width("路径abc", 5), "径abc");
         assert_eq!(tail_by_width("ab", 5), "ab");
         assert_eq!(tail_by_width("中文", 1), "");
+    }
+
+    #[test]
+    fn cursor_sits_right_after_text() {
+        // " kazi> " = 7 columns, "你好" = 4 → caret column 11
+        assert_eq!(cursor_col(0, 80, " kazi> ", "你好"), 11);
+        // clamps one short of the right edge
+        assert_eq!(cursor_col(70, 80, " kazi> ", "12345"), 79);
     }
 
     #[test]
