@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Repository URL corrected to github.com/klaxonz (metadata only).
+
 ## [0.6.0] - 2026-10-17
 
 ### Added
