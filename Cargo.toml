@@ -1,0 +1,57 @@
+[package]
+name = "kazi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+description = "A tiny, from-scratch AI agent CLI and library for OpenAI-compatible APIs, Claude, and Ollama"
+repository = "https://github.com/klaxon/kazi"
+keywords = ["ai", "agent", "llm", "cli", "tools"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+# crates.io upload whitelist (include_str! reads config.example.toml at build)
+include = [
+    "src/**/*",
+    "Cargo.toml",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "README.md",
+    "CHANGELOG.md",
+    "docs/**/*",
+    "config.example.toml",
+]
+
+[lib]
+name = "kazi"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kazi"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+# rustls-tls: pure-Rust TLS stack so the same build works on windows-gnu/msvc and linux
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+    "http2",
+    "charset",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+rustyline = "15"
+async-trait = "0.1"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "6"
+
+[profile.release]
+lto = true
+strip = true

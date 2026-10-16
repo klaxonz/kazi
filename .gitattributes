@@ -1,0 +1,5 @@
+# Normalize all text to LF; Windows tools cope fine and it keeps diffs stable.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.zip binary

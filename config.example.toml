@@ -1,0 +1,43 @@
+# kazi configuration example.
+# Copy to the config path shown by `kazi config` and edit.
+# API keys are never stored here - they come from environment variables.
+
+# provider used when --provider is omitted
+provider = "deepseek"
+
+# [agent]
+# max_rounds = 30                  # hard cap on model<->tool rounds per task
+# max_context_tokens = 60000       # rough budget; oldest non-system turns are dropped
+
+# [tools]
+# sandbox_root = ""                # if set, file tools cannot touch paths outside this root
+# command_timeout_secs = 120       # per run_command call
+# output_limit = 64000             # max characters of stdout/stderr fed back to the model
+# allow_commands = ["cargo build", "cargo test", "git status"]   # auto-approved after safety check
+
+# Each entry under [providers.*] is a selectable provider, pick any nickname.
+# type: "openai"  -> any OpenAI-compatible endpoint (OpenAI, DeepSeek, Kimi, Qwen, gateways...)
+# type: "anthropic" -> Anthropic Claude Messages API
+# type: "ollama"  -> local Ollama via its OpenAI-compatible endpoint
+
+[providers.deepseek]
+type = "openai"
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+model = "deepseek-chat"
+
+[providers.openrouter]
+type = "openai"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+model = "anthropic/claude-sonnet-4.5"
+
+[providers.anthropic]
+type = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+model = "claude-sonnet-4-5"
+
+[providers.ollama]
+type = "ollama"
+base_url = "http://localhost:11434/v1"
+model = "qwen3:14b"

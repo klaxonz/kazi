@@ -1,0 +1,5 @@
+/target
+# real config often holds local paths/prefs; keys live in env vars only
+/config.toml
+Cargo.lock.bak
+*.log
