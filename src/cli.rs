@@ -1,5 +1,6 @@
 //! CLI surface (clap subcommands) and dispatch into the agent engine.
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -45,9 +46,14 @@ pub struct EngineArgs {
     /// Auto-approve run_command without asking (dangerous)
     #[arg(long)]
     pub yolo: bool,
-    /// Full-screen TUI instead of the classic line REPL (`kazi chat` only;
-    /// falls back gracefully if the terminal can't do alternate screens)
-    #[arg(long)]
+    /// Force the classic line REPL instead of the TUI (pipes/scripts always
+    /// get the line REPL automatically)
+    #[arg(long = "no-tui")]
+    pub no_tui: bool,
+    /// Force the full-screen TUI even if autodetection would pick the line
+    /// REPL (falls back gracefully if the terminal can't do alternate
+    /// screens)
+    #[arg(long, conflicts_with = "no_tui")]
     pub tui: bool,
 }
 
@@ -140,7 +146,11 @@ async fn chat(
     cfg_path: Option<&Path>,
 ) -> anyhow::Result<u8> {
     let (cfg, _) = config::load(cfg_path)?;
-    if args.tui {
+    // TUI is the default on real terminals; pipes/redirects (scripts, tests)
+    // always get the line REPL unless --tui is forced.
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let want_tui = !args.no_tui && (args.tui || interactive);
+    if want_tui {
         return tui::chat_loop_with(
             cfg,
             args.provider.clone(),

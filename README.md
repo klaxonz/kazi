@@ -60,21 +60,21 @@ allow_commands = ["cargo build", "cargo test", "git status"]  # auto-approved
 
 ## Use
 
-Interactive REPL (streaming, `/compact`, `/model`, `/resume`, TAB completion
-on slash commands, multiline tasks with trailing `\`):
+Interactive chat — **full-screen TUI by default** on a terminal (status bar
+with round/token counters, scrolling transcript with live tool activity,
+input stays responsive while a task streams). Pipes and redirections get the
+classic line REPL automatically, so scripts keep working:
 
 ```sh
-kazi chat
+kazi chat                     # TUI
+kazi chat --no-tui            # force the line REPL (streaming text, /commands)
+echo "/status" | kazi chat    # non-tty → line REPL, scriptable
 ```
 
-Full-screen TUI (same engine: status bar with round/token counters, scrolling
-transcript with live tool activity, input stays responsive while a task
-streams; falls back to the line REPL on terminals without alternate-screen
-support — sessions and flags are identical):
-
-```sh
-kazi chat --tui
-```
+Both share the same engine, sessions, and slash commands (`/compact`,
+`/model`, `/resume`, `/new`, TAB completion, multiline tasks with trailing
+`\`). `--tui` forces the TUI; it falls back gracefully on terminals without
+alternate-screen support.
 
 Headless (exit code 0 + final answer → scriptable):
 

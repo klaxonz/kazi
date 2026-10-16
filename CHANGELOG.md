@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-17
+
+### Changed
+
+- **`kazi chat` now defaults to the full-screen TUI** on interactive
+  terminals (matching how mainstream agent CLIs present by default). When
+  stdin/stdout are not a terminal — pipes, redirection, scripts, tests — the
+  classic line REPL is used automatically, so `echo "/status" | kazi chat`
+  and headless flows behave exactly as before.
+
+### Added
+
+- `--no-tui`: force the classic line REPL even on a terminal.
+- `--tui` now means "force the TUI" (previously it was the only way to get
+  it); the two flags conflict, and `--tui` still falls back gracefully when
+  the terminal can't do alternate screens.
+
 ## [0.9.1] - 2026-10-17
 
 ### Fixed
