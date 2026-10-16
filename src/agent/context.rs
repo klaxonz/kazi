@@ -83,6 +83,60 @@ impl History {
             .collect();
         users.get(1).copied()
     }
+
+    /// /compact path: extract whole turns from the oldest end (serialized as
+    /// a transcript for summarization) until the estimate fits `budget`.
+    /// `None` = nothing needed / nothing droppable (single turn).
+    pub fn take_overshoot_text(&mut self, budget: u64) -> Option<String> {
+        if self.estimate_tokens() <= budget {
+            return None;
+        }
+        let cut = self.trim_point()?;
+        let text = serialize_turns(&self.msgs[..cut]);
+        self.msgs.drain(0..cut);
+        Some(text)
+    }
+
+    /// Append a compaction summary to the system prompt — it rides along on
+    /// every future request without breaking user/assistant alternation.
+    pub fn insert_summary(&mut self, text: String) {
+        let label = format!("[Context summary of dropped conversation turns]\n{text}");
+        self.system = Some(match &self.system {
+            Some(s) => format!("{s}\n\n{label}"),
+            None => label,
+        });
+    }
+}
+
+fn serialize_turns(msgs: &[Message]) -> String {
+    let mut text = String::new();
+    for m in msgs {
+        match m.role {
+            Role::User => text.push_str(&format!("user: {}\n\n", m.text())),
+            Role::Assistant => {
+                text.push_str(&format!("assistant: {}\n\n", m.text()));
+                for tc in &m.tool_calls {
+                    text.push_str(&format!("  (tool call: {} {})\n", tc.name, tc.arguments));
+                }
+            }
+            Role::Tool => text.push_str(&format!(
+                "  (tool result{}: {})\n\n",
+                if m.is_error { " ERROR" } else { "" },
+                first_lines(m.text(), 4)
+            )),
+            Role::System => {} // system lives separately, never dropped
+        }
+    }
+    text
+}
+
+fn first_lines(text: &str, max: usize) -> String {
+    let lines: Vec<&str> = text.lines().take(max).collect();
+    let mut out = lines.join(" | ");
+    if text.lines().count() > max {
+        out.push_str(" | ...");
+    }
+    out
 }
 
 fn estimate_str(s: &str) -> u64 {

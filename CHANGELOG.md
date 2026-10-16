@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-17
+
+### Added
+
+- **`search_files` tool**: recursive literal-text search (case toggle, filename
+  glob, result budget) that skips `.git`/`target`/`node_modules` and binaries —
+  the model can locate symbols/usages without touching the approval-gated
+  shell.Registered between `read_file` and `apply_patch`.
+- **Compacting `/compact`**: instead of silently dropping old turns, the
+  overshooting turns are serialized and summarized by the provider; the
+  summary rides the system prompt so goals/paths/decisions survive while the
+  context shrinks. Plain trimming stays as the fallback if the summarizer
+  call fails.
+
 ## [0.5.0] - 2026-10-17
 
 ### Added

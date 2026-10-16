@@ -350,13 +350,15 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
             live.agent.reset();
             println!("new session -> {}", state.session_name);
         }
-        ("/compact", _) => {
-            live.agent.compact();
-            println!(
-                "compacted (est. {} tokens)",
-                live.agent.history.estimate_tokens()
-            );
-        }
+        ("/compact", _) => match live.agent.compact().await {
+            Ok(note) => {
+                println!(
+                    "{note} (est. {} tokens)",
+                    live.agent.history.estimate_tokens()
+                );
+            }
+            Err(e) => println!("{RED}compact failed: {e}{RESET}"),
+        },
         ("/status", _) => println!("{}", live.status()),
         ("/tools", _) => println!("{}", live.agent.registry().catalog()),
         ("/save", name) => {

@@ -94,6 +94,7 @@ Override anything per call: `--provider <nick>` `--model <name>`
 | tool         | effect                                                  |
 |--------------|---------------------------------------------------------|
 | `list_dir`   | directory listing (names, sizes, dirs marked)           |
+| `search_files` | recursive text search (glob filter, hidden/binaries skipped) |
 | `read_file`  | numbered lines, paging by offset/limit, refuses binaries |
 | `apply_patch`| exact, unique find-and-replace; ambiguity is an error   |
 | `write_file` | create/overwrite, makes parent directories              |
@@ -139,6 +140,8 @@ a single server can answer several calls from one model round at once.
   duplicate an already-printed answer.
 - Token usage of the current task shows in `/status` and in the
   `--output json` report.
+- `/compact` summarizes the overshooting turns into the system prompt
+  instead of dropping them blind — goals, paths and pending steps survive.
 
 Saved conversations are visible and exportable:
 

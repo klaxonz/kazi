@@ -212,9 +212,36 @@ impl Agent {
         self.history.reset_msgs();
     }
 
-    /// Manual compaction (`/compact`): trim oldest turns over the budget.
-    pub fn compact(&mut self) {
-        self.history.trim_to_tokens(self.max_context_tokens);
+    /// Manual compaction (`/compact`): pull overshooting turns OUT of the
+    /// history, ask the provider to compress them into a short summary, and
+    /// splice the summary into the system prompt. Plain trimming remains the
+    /// fallback when the summarizer call fails — compaction never loses the
+    /// latest turn either way.
+    pub async fn compact(&mut self) -> Result<String, AgentError> {
+        let Some(dropped) = self.history.take_overshoot_text(self.max_context_tokens) else {
+            return Ok("nothing to compact — context is already under budget".into());
+        };
+        match self.summarize_dropped(&dropped).await {
+            Ok(summary) if !summary.is_empty() => {
+                self.history.insert_summary(summary);
+                Ok("compacted: dropped turns were replaced by a summary".into())
+            }
+            _ => Ok("compacted: dropped turns without summary (summarizer unavailable)".into()),
+        }
+    }
+
+    const SUMMARY_PROMPT: &'static str = "Compress the following agent conversation transcript for a compacted context window. Keep, as terse bullets: the user's goal, decisions taken, important file paths and messages, open questions, and pending steps. Max 30 lines. No prose introductions.";
+
+    async fn summarize_dropped(&self, transcript: &str) -> Result<String, AgentError> {
+        let req = LlmRequest {
+            messages: vec![
+                Message::system(Self::SUMMARY_PROMPT),
+                Message::user(transcript.to_string()),
+            ],
+            tools: vec![],
+        };
+        let resp = self.provider.complete(req).await?;
+        Ok(resp.text_or_empty().to_string())
     }
 
     /// Drive one user task to its final assistant answer.
@@ -519,6 +546,69 @@ mod tests {
         assert!(msgs
             .iter()
             .any(|m| m.role == crate::llm::Role::Tool && m.is_error));
+    }
+
+    #[tokio::test]
+    async fn compact_summarizes_dropped_turns() {
+        // two tasks → two turns; the first is dropped and summarized
+        let script = vec![
+            LlmResponse {
+                content: Some("task one finished".into()),
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some("task two finished".into()),
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some("BULLET-1 goal; BULLET-2 pending".into()), // summarizer
+                ..Default::default()
+            },
+        ];
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(script));
+        let mut agent = Agent::with_parallel(
+            provider,
+            ToolRegistry::builtin(),
+            test_ctx(),
+            Some("sys".into()),
+            10,
+            120, // small budget: turn 1 must overshoot
+            4,
+        );
+        agent.ctx.cwd = scratch().to_path_buf();
+        let pad = " ".repeat(700); // push token estimate over the budget
+        agent
+            .run_task(&format!("turn one {pad}"), |_| {})
+            .await
+            .unwrap();
+        agent.run_task("turn two", |_| {}).await.unwrap();
+        assert!(agent.history.msgs_len() >= 3, "two turns stored");
+
+        let note = agent.compact().await.unwrap();
+        assert!(note.contains("summary"), "got: {note}");
+        let msgs = agent.history.messages();
+        assert!(
+            msgs.iter()
+                .any(|m| m.role == crate::llm::Role::System && m.text().contains("BULLET-1")),
+            "summary must ride the system prompt"
+        );
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| m.role == crate::llm::Role::User && m.text().contains("turn one")),
+            "dropped turn's user message must be gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_noop_when_under_budget() {
+        let mut a = agent_with(vec![LlmResponse {
+            content: Some("small talk".into()),
+            ..Default::default()
+        }]);
+        a.run_task("tiny", |_| {}).await.unwrap();
+        let note = a.compact().await.unwrap();
+        assert!(note.starts_with("nothing to compact"), "got: {note}");
     }
 
     #[tokio::test]
