@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-10-17
+
+### Fixed
+
+- The TUI command menu is now an **overlay panel** above the input row
+  instead of a layout block: the transcript keeps its rows, no fragments of
+  the covered lines remain (it spans the full width and clears its area), and
+  it lists as many commands as fit on screen (up to 16) with a
+  `… +N more · Tab completes` footer. Before, typing `/` pushed the
+  transcript into a single line at the top of the screen.
+
 ## [0.13.0] - 2026-10-17
 
 ### Added

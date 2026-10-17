@@ -26,7 +26,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use super::{Agent, AgentEvent};
@@ -474,41 +474,18 @@ impl Screen {
         Some(t)
     }
 
-    /// Paint one frame. Height budget: status 1, plan checklist, command
-    /// completion rows, transcript, input 3.
+    /// Paint one frame. Height budget: status 1, plan checklist, transcript,
+    /// input 3. The `/` completion menu is an overlay — it floats above the
+    /// input and never steals layout rows from the transcript.
     fn draw(&self, f: &mut Frame) {
         let todo_rows = self.todos.len().min(6) as u16;
-        let hints = self.command_hints();
-        let hint_rows = hints.len().min(8) as u16;
-        let [status, todos_area, hints_area, body, input] = Layout::vertical([
+        let [status, todos_area, body, input] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(todo_rows),
-            Constraint::Length(hint_rows),
             Constraint::Min(3),
             Constraint::Length(3),
         ])
         .areas(f.area());
-
-        // `/` dropdown: the first row is the one Tab would complete to
-        if hint_rows > 0 {
-            let lines: Vec<Line> = hints
-                .iter()
-                .take(8)
-                .enumerate()
-                .map(|(i, (cmd, help))| {
-                    let cmd_style = if i == 0 {
-                        Style::default().fg(CYAN)
-                    } else {
-                        Style::default().fg(DIM)
-                    };
-                    Line::from(vec![
-                        Span::styled(format!("  {cmd:<26}"), cmd_style),
-                        Span::styled(help.clone(), Style::default().fg(DIM)),
-                    ])
-                })
-                .collect();
-            f.render_widget(Paragraph::new(Text::from(lines)), hints_area);
-        }
 
         if todo_rows > 0 {
             let lines: Vec<Line> = self
@@ -597,6 +574,59 @@ impl Screen {
         let (start, end, off) = scroll_range(all.len(), height, self.scroll.get());
         self.scroll.set(off); // keep the stored offset within bounds
         f.render_widget(Paragraph::new(Text::from(all[start..end].to_vec())), body);
+
+        // -- `/` completion menu --------------------------------------------
+        // An overlay: a full-width panel sitting directly above the input, so
+        // it never steals layout rows from the transcript and never leaves
+        // fragments of the lines it covers. How many entries fit is decided by
+        // the space above the input, not by a fixed budget.
+        if self.pending_approval.is_none() {
+            let hints = self.command_hints();
+            let avail = input.y.saturating_sub(status.y + 1) as usize;
+            if !hints.is_empty() && avail >= 2 {
+                let shown = hints.len().min((avail - 1).min(16));
+                let hidden = hints.len() - shown;
+                let cmd_w = hints
+                    .iter()
+                    .take(shown)
+                    .map(|(c, _)| UnicodeWidthStr::width(c.as_str()))
+                    .max()
+                    .unwrap_or(8);
+                let height = (shown + 1) as u16;
+                let area = ratatui::layout::Rect {
+                    x: 0,
+                    y: input.y - height,
+                    width: f.area().width,
+                    height,
+                };
+                let mut lines: Vec<Line> = hints
+                    .iter()
+                    .take(shown)
+                    .enumerate()
+                    .map(|(i, (cmd, help))| {
+                        let cmd_style = if i == 0 {
+                            Style::default().fg(Color::Black).bg(CYAN).bold()
+                        } else {
+                            Style::default().fg(DIM)
+                        };
+                        Line::from(vec![
+                            Span::styled(format!(" {cmd:<cmd_w$} "), cmd_style),
+                            Span::styled(help.clone(), Style::default().fg(DIM)),
+                        ])
+                    })
+                    .collect();
+                lines.push(Line::styled(
+                    if hidden > 0 {
+                        format!(" … +{hidden} more · Tab completes")
+                    } else {
+                        " Tab completes".to_string()
+                    },
+                    Style::default().fg(DIM),
+                ));
+                f.render_widget(Clear, area);
+                f.render_widget(Paragraph::new(Text::from(lines)), area);
+            }
+        }
 
         // -- input box (or the pending approval question) ---------------------
         if let Some(pending) = &self.pending_approval {
@@ -1149,6 +1179,7 @@ async fn tui_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
 
     /// Input pre-filled with `s`, caret at the end.
     fn input_with(s: &str) -> Input {
@@ -1359,24 +1390,57 @@ mod tests {
         assert_eq!(scroll_range(3, 10, 0), (0, 3, 0));
     }
 
+    /// The rendered frame as one string per screen row.
+    fn frame_rows(term: &Terminal<TestBackend>) -> Vec<String> {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
     #[test]
-    fn command_dropdown_renders_in_frame() {
-        use ratatui::backend::TestBackend;
+    fn command_dropdown_renders_as_overlay() {
         let mut s = Screen::new("deepseek", "sess", 10);
+        for _ in 0..8 {
+            s.push(LineKind::Dim, "TRANSCRIPT_MARKER".to_string());
+        }
         s.input.set_text("/u".into());
         let mut term = Terminal::new(TestBackend::new(64, 12)).unwrap();
         term.draw(|f| s.draw(f)).unwrap();
-        let text: String = term
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol().to_string())
-            .collect();
-        assert!(text.contains("/undo"), "dropdown row missing:\n{text}");
+        let rows = frame_rows(&term);
+
         assert!(
-            text.contains("restore files"),
-            "help column missing:\n{text}"
+            rows.iter().any(|r| r.contains("TRANSCRIPT_MARKER")),
+            "the menu must not steal transcript rows: {rows:#?}"
+        );
+        let menu: Vec<&String> = rows.iter().filter(|r| r.contains("/undo")).collect();
+        assert_eq!(menu.len(), 1, "exactly one /undo row: {rows:#?}");
+        assert!(
+            menu[0].starts_with(" /undo"),
+            "menu row must start at the left edge: {:?}",
+            menu[0]
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("restore files")),
+            "help column missing: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("Tab completes")),
+            "footer missing: {rows:#?}"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("TRANSCRIPT") && r.contains("/undo")),
+            "the panel must not leave fragments of the lines it covers: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("kazi> /u")),
+            "input row untouched: {rows:#?}"
         );
     }
 
