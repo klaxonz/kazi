@@ -3,8 +3,8 @@
 //! Keys saved via `kazi auth` live under the platform data dir
 //! (`dirs::data_dir()/kazi/auth.json`, e.g. `%LOCALAPPDATA%\kazi\auth.json`
 //! on Windows). Environment variables always win over stored keys, so CI
-//! and containers keep working unchanged. The file is user-private by OS
-//! defaults; this is deliberately NOT the config.toml (which must stay
+//! and containers keep working unchanged. On Unix the file is written `0600`
+//! (owner-only); this is deliberately NOT the config.toml (which must stay
 //! shareable and key-free).
 
 use std::collections::BTreeMap;
@@ -76,6 +76,12 @@ fn write(file: &AuthFile) -> Result<PathBuf, AuthError> {
     let json = serde_json::to_vec_pretty(file)
         .map_err(|e| AuthError::Malformed(path.clone(), e.to_string()))?;
     std::fs::write(&path, json)?;
+    // best-effort owner-only permissions: umask defaults leave it world-readable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(path)
 }
 

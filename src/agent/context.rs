@@ -90,10 +90,11 @@ impl History {
         users.get(1).copied()
     }
 
-    /// Compaction path: extract droppable messages from the oldest end
-    /// (serialized as a transcript for summarization).
+    /// Compaction path: pull the oldest droppable messages out (serialized as
+    /// a transcript for summarization) until the history fits `target_tokens`
+    /// — or nothing is left to drop.
     ///
-    /// Two granularities, whichever yields something:
+    /// Two granularities, oldest first:
     /// 1. **Whole completed turns** — everything before the second user
     ///    message (multi-task histories).
     /// 2. **Completed tool ROUNDS inside the current task** — a long single
@@ -103,19 +104,33 @@ impl History {
     ///    needs verbatim. The latest round (with its pending tool results)
     ///    is always kept intact so the next provider call stays legal.
     ///
-    /// `None` = nothing droppable (fewer than two rounds).
-    pub fn take_beyond_text(&mut self, _budget: u64) -> Option<String> {
-        if let Some(cut) = self.turn_cut() {
-            let text = serialize_turns(&self.msgs[..cut]);
-            self.msgs.drain(0..cut);
-            return Some(text);
+    /// `None` = already under `target_tokens` / nothing droppable.
+    pub fn take_beyond_text(&mut self, target_tokens: u64) -> Option<String> {
+        if self.estimate_tokens() <= target_tokens {
+            return None;
         }
-        // single task in flight: cut at the last round boundary, keeping the
-        // final (assistant-with-calls → tool results) group intact
-        let cut = self.last_round_cut()?;
-        let text = serialize_rounds(&self.msgs[..cut]);
-        self.msgs.drain(0..cut);
-        Some(text)
+        let mut dropped: Vec<Message> = Vec::new();
+        loop {
+            if self.estimate_tokens() <= target_tokens {
+                break;
+            }
+            // turns first, then rounds of the one remaining task. `cut > 0`
+            // guards the mid-task case where the newest round *starts* at the
+            // head: nothing older is left to drop, so stop instead of spinning.
+            let Some(cut) = self
+                .turn_cut()
+                .or_else(|| self.last_round_cut())
+                .filter(|cut| *cut > 0)
+            else {
+                break;
+            };
+            dropped.extend(self.msgs.drain(0..cut));
+        }
+        if dropped.is_empty() {
+            None
+        } else {
+            Some(serialize_turns(&dropped))
+        }
     }
 
     /// Boundary before the second-to-last assistant-with-tool-calls message,
@@ -151,27 +166,6 @@ impl History {
 /// is droppable, everything from it onward is the newest round.
 fn cutsweep(calls: Vec<usize>) -> usize {
     calls[calls.len() - 2]
-}
-
-/// Serialize round-trip messages (user task intro, assistant text, tool
-/// calls/results) — same content as [`serialize_turns`] but tolerates a
-/// history that starts mid-task (no leading user message).
-fn serialize_rounds(msgs: &[Message]) -> String {
-    if msgs.first().map(|m| m.role) == Some(Role::User) {
-        return serialize_turns(msgs);
-    }
-    // No user message at the head: emit only assistant/tool bodies so the
-    // summary prompt sees something coherent.
-    let mut text = String::new();
-    for m in msgs {
-        match m.role {
-            Role::User => {}
-            _ => {
-                text.push_str(&serialize_turns(std::slice::from_ref(m)));
-            }
-        }
-    }
-    text
 }
 
 fn serialize_turns(msgs: &[Message]) -> String {
@@ -265,6 +259,44 @@ mod tests {
             0,
             "turn 1 dropped entirely"
         );
+    }
+
+    #[test]
+    fn take_beyond_text_terminates_on_a_mid_task_head() {
+        // A history that starts mid-task (an older drop removed the head) and
+        // holds only the newest round: nothing older is droppable, and asking
+        // for target 0 must say so instead of looping forever.
+        let mut h = History::new(Some("S".into()));
+        h.push(Message::assistant_with_calls(None, vec![call("a")]));
+        h.push(Message::tool_result("a", "x".repeat(5000), false));
+        h.push(Message::assistant_with_calls(None, vec![call("b")]));
+        h.push(Message::tool_result("b", "y".repeat(5000), false));
+
+        assert!(h.take_beyond_text(0).is_none());
+        assert_eq!(h.msgs_len(), 4, "the newest round stays intact");
+    }
+
+    #[test]
+    fn take_beyond_text_stops_at_the_target() {
+        let big = "x".repeat(400); // ≈ 100 est. tokens per message
+        let mut h = History::new(Some("S".into()));
+        for i in 0..4 {
+            h.push(Message::user(format!("task {i} {big}")));
+            h.push(Message::assistant_with_calls(
+                None,
+                vec![call(&format!("c{i}"))],
+            ));
+            h.push(Message::tool_result(format!("c{i}"), big.clone(), false));
+            h.push(Message::assistant(big.clone()));
+        }
+        // dropping toward a target leaves the newest turn in place
+        let dropped = h.take_beyond_text(200).expect("over target");
+        assert!(dropped.contains("task 0"), "oldest turns go first");
+        assert!(
+            !dropped.contains("task 3"),
+            "the newest turn must survive: {dropped}"
+        );
+        assert_eq!(h.msgs_len(), 4, "only the newest turn is left");
     }
 
     #[test]

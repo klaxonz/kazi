@@ -37,8 +37,8 @@ pub enum ConfigError {
     Parse { path: PathBuf, msg: String },
     #[error("provider `{nick}`: {msg}")]
     BadProvider { nick: String, msg: String },
-    #[error("config {path} has no [providers.*] entries — see config.example.toml")]
-    NoProviders { path: PathBuf },
+    #[error("no [providers.*] entries configured\n  →  create a config with: kazi config --init")]
+    NoProviders,
     #[error("unknown provider `{0}` — configured are: {1}")]
     Unknown(String, String),
 }
@@ -225,9 +225,7 @@ impl Config {
             .or_else(|| self.provider.clone())
             .or_else(|| self.providers.keys().next().cloned());
 
-        let nick = nick.ok_or_else(|| ConfigError::NoProviders {
-            path: config_path(),
-        })?;
+        let nick = nick.ok_or(ConfigError::NoProviders)?;
         let entry = self.providers.get(&nick).ok_or_else(|| {
             ConfigError::Unknown(
                 nick.clone(),
@@ -306,6 +304,102 @@ impl Config {
             api_key,
         })
     }
+
+    /// Where the key for `nick` comes from right now: `(env_name, env_present,
+    /// stored)`. Powers `/auth` and the onboarding decisions.
+    pub fn key_sources(&self, nick: &str) -> Result<(String, bool, bool), ConfigError> {
+        let entry = self
+            .providers
+            .get(nick)
+            .ok_or_else(|| ConfigError::Unknown(nick.to_string(), self.nicks().join(", ")))?;
+        let kind = Self::kind_of(nick, entry)?;
+        let env_name = entry
+            .api_key_env
+            .clone()
+            .or_else(|| Self::default_key_env(kind).map(str::to_string))
+            .unwrap_or_default();
+        let env_ok = std::env::var(&env_name)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        let stored = crate::auth::load()
+            .map(|s| s.keys.contains_key(nick))
+            .unwrap_or(false);
+        Ok((env_name, env_ok, stored))
+    }
+
+    /// The first configured provider whose key is already usable (env or
+    /// stored; ollama counts as keyless-usable), skipping `exclude`. Used by
+    /// first-run onboarding so a launch does not re-ask for a provider that is
+    /// already ready.
+    pub fn first_provider_with_key(&self, exclude: Option<&str>) -> Option<String> {
+        self.nicks()
+            .into_iter()
+            .filter(|n| exclude != Some(n.as_str()))
+            .find(|n| self.api_key_for(n).is_ok())
+    }
+}
+
+/// Rewrite `<path>` so `provider = "<nick>"` is the default and the nick's own
+/// `model = "..."` line carries `model`. Deliberately line-based: the user's
+/// comments and layout survive (a toml round-trip would drop them).
+pub fn set_default_provider(path: &Path, nick: &str, model: Option<&str>) -> std::io::Result<()> {
+    let text = std::fs::read_to_string(path)?;
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+
+    // 1) top-level `provider = ...` (ignoring every `[...]` section' body)
+    let mut in_table = false;
+    let mut provider_set = false;
+    for line in lines.iter_mut() {
+        let t = line.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        if t.starts_with('[') {
+            in_table = true;
+            continue;
+        }
+        if !in_table && t.split('=').next().unwrap_or("").trim() == "provider" {
+            *line = format!("provider = \"{nick}\"");
+            provider_set = true;
+            break;
+        }
+    }
+    if !provider_set {
+        lines.insert(0, format!("provider = \"{nick}\""));
+    }
+
+    // 2) `model = ...` inside [providers.<nick>] only
+    if let Some(model) = model {
+        let header = format!("[providers.{nick}]");
+        if let Some(start) = lines.iter().position(|l| l.trim() == header) {
+            let end = lines
+                .iter()
+                .enumerate()
+                .skip(start + 1)
+                .find(|(_, l)| l.trim_start().starts_with('['))
+                .map(|(i, _)| i)
+                .unwrap_or(lines.len());
+            let mut done = false;
+            for line in lines.iter_mut().take(end).skip(start + 1) {
+                let t = line.trim_start();
+                if t.starts_with('#') {
+                    continue;
+                }
+                if t.split('=').next().unwrap_or("").trim() == "model" {
+                    *line = format!("model = \"{model}\"");
+                    done = true;
+                    break;
+                }
+            }
+            if !done {
+                lines.insert(start + 1, format!("model = \"{model}\""));
+            }
+        }
+    }
+
+    let mut out = lines.join("\n");
+    out.push('\n');
+    std::fs::write(path, out)
 }
 
 /// The example config ships inside the binary — `kazi config --init`.
@@ -432,5 +526,47 @@ model = "m2"
         assert_eq!(s.kind, ProviderKind::OpenAiCompat);
         assert_eq!(s.model, "", "discovery does not require a model");
         assert_eq!(s.api_key.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn set_default_provider_edits_in_place_and_keeps_comments() {
+        let dir = std::env::temp_dir().join(format!("kazi-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "# top comment\nprovider = \"a\"\n\n[providers.a]\ntype = \"openai\"\n# keep me\nmodel = \"m1\"\nmodels = [\"m1\", \"m2\"]\n\n[providers.b]\ntype = \"openai\"\nmodel = \"m2\"\n",
+        )
+        .unwrap();
+
+        set_default_provider(&path, "b", Some("m3")).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# top comment"), "comments survive:\n{text}");
+        assert!(text.contains("# keep me"));
+        assert!(text.contains("provider = \"b\""));
+        assert!(
+            text.contains("models = [\"m1\", \"m2\"]"),
+            "the models list is not a `model` key:\n{text}"
+        );
+
+        let parsed: Config = toml::from_str(&text)
+            .unwrap_or_else(|e| panic!("rewritten config must parse: {e}\n---\n{text}"));
+        assert_eq!(parsed.provider.as_deref(), Some("b"));
+        assert_eq!(parsed.providers["b"].model.as_deref(), Some("m3"));
+        assert_eq!(parsed.providers["a"].model.as_deref(), Some("m1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_default_provider_inserts_the_key_when_absent() {
+        let dir = std::env::temp_dir().join(format!("kazi-cfg2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[providers.z]\ntype = \"openai\"\n").unwrap();
+
+        set_default_provider(&path, "z", None).unwrap();
+        let parsed: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed.provider.as_deref(), Some("z"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

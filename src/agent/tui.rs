@@ -7,8 +7,9 @@
 //! falls back to the classic line REPL — the TUI is never load-bearing.
 //!
 //! Input: Enter submits, Esc exits, Ctrl-L clears, typed text supports
-//! backspace; the input keeps prior text across redraws. Mouse events are
-//! ignored; selection stays native (terminal copy).
+//! backspace; the input keeps prior text across redraws. Multi-line pastes are
+//! preserved (`↵` marks the line breaks) instead of firing the first line as a
+//! task. Mouse wheel scrolls; native text selection needs Shift+drag.
 
 use futures::StreamExt;
 use std::io::{Stdout, Write};
@@ -16,8 +17,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream, KeyCode, KeyEventKind,
-    MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as CtEvent, EventStream, KeyCode, KeyEventKind, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -41,11 +42,12 @@ const YELLOW: Color = Color::Yellow;
 /// Key bindings printed by `/help` (the command list itself is shared with
 /// the line REPL — one table, both front-ends).
 const TUI_HELP: &[&str] = &[
-    "keys: Enter submit · Esc interrupt (idle: quit) · Ctrl+C quit",
-    "↑/↓ input history · Ctrl+A/E/U/K/W edit · Ctrl+L clear transcript",
+    "keys: Enter submit · Ctrl+J new line · Esc interrupt (idle: quit) · Ctrl+C quit",
+    "↑/↓ input history (lines inside a multi-line task) · Ctrl+A/E/U/K/W edit · Ctrl+L clear transcript",
     "/ opens the command list · Tab completes",
     "PgUp/PgDn or mouse wheel scroll · Ctrl+Home top · Ctrl+End bottom",
     "Shift+Tab cycles permission mode (read-only → yolo → edit)",
+    "approval prompt: y once · a always (this command) · n/Esc deny",
     "@file in a task attaches the file's contents",
 ];
 
@@ -55,20 +57,29 @@ pub struct ApprovalAsk {
     pub reply: tokio::sync::oneshot::Sender<Decision>,
 }
 
+/// Session-scoped "always allow" memory. Shared by every approver instance so
+/// it survives in-TUI agent rebuilds (`/provider`, `/model`) instead of
+/// forgetting approvals halfway through a session.
+pub type SessionAllows = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
 /// Channel-based approver for the TUI: the agent asks over a channel, the
 /// main loop renders the question and answers with a keystroke. Never touches
-/// stdin (raw mode owns it) and remembers "always" per command prefix.
+/// stdin (raw mode owns it) and remembers "always" for the exact command.
 pub struct TuiApprover {
     tx: tokio::sync::mpsc::UnboundedSender<ApprovalAsk>,
-    session_allows: std::sync::Mutex<Vec<String>>,
+    session_allows: SessionAllows,
 }
 
 impl TuiApprover {
     pub fn new(tx: tokio::sync::mpsc::UnboundedSender<ApprovalAsk>) -> Self {
-        Self {
-            tx,
-            session_allows: std::sync::Mutex::new(Vec::new()),
-        }
+        Self::with_allows(tx, SessionAllows::default())
+    }
+
+    pub fn with_allows(
+        tx: tokio::sync::mpsc::UnboundedSender<ApprovalAsk>,
+        session_allows: SessionAllows,
+    ) -> Self {
+        Self { tx, session_allows }
     }
 }
 
@@ -95,7 +106,7 @@ impl Approver for TuiApprover {
             })
             .is_err()
         {
-            return Decision::Deny; // UI gone: fail closed
+            return Decision::Deny(None); // UI gone: fail closed
         }
         match rrx.await {
             Ok(Decision::AllowSession) => {
@@ -108,7 +119,7 @@ impl Approver for TuiApprover {
                 Decision::Allow
             }
             Ok(d) => d,
-            Err(_) => Decision::Deny,
+            Err(_) => Decision::Deny(None),
         }
     }
 }
@@ -153,6 +164,27 @@ impl Input {
         let b = self.byte_of(self.cursor);
         self.text.insert(b, ch);
         self.cursor += 1;
+    }
+
+    /// Insert a pasted block at the caret. Line breaks normalize to `\n` — the
+    /// buffer keeps the real text (shown as `↵` on the input line), so a
+    /// multi-line paste lands as ONE task instead of submitting at the first
+    /// newline and dumping the rest into a busy input box.
+    fn insert_str(&mut self, text: &str) {
+        let mut after_cr = false;
+        for ch in text.chars() {
+            match ch {
+                '\r' => {
+                    self.insert('\n');
+                    after_cr = true;
+                }
+                '\n' if after_cr => after_cr = false, // CRLF: newline already added
+                c => {
+                    self.insert(c);
+                    after_cr = false;
+                }
+            }
+        }
     }
 
     /// Replace the whole line (Tab completion) and park the caret at the end.
@@ -220,6 +252,121 @@ impl Input {
         let (bs, be) = (self.byte_of(i), self.byte_of(self.cursor));
         self.text.replace_range(bs..be, "");
         self.cursor = i;
+    }
+
+    // ---- multi-line support: Ctrl+J starts a new line inside a task --------
+
+    /// Ctrl+J: start a new line instead of submitting.
+    fn newline(&mut self) {
+        self.insert('\n');
+    }
+
+    fn line_count(&self) -> usize {
+        self.text.matches('\n').count() + 1
+    }
+
+    /// The buffer split into display lines (newlines are the boundaries).
+    fn display_lines(&self) -> Vec<String> {
+        self.text.split('\n').map(str::to_string).collect()
+    }
+
+    /// (first char, one-past-last char) of the caret's display line.
+    fn caret_line(&self) -> (usize, usize) {
+        let chars: Vec<char> = self.text.chars().collect();
+        let cur = self.cursor.min(chars.len());
+        let start = chars[..cur]
+            .iter()
+            .rposition(|c| *c == '\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let end = chars[cur..]
+            .iter()
+            .position(|c| *c == '\n')
+            .map(|i| cur + i)
+            .unwrap_or(chars.len());
+        (start, end)
+    }
+
+    /// Index of the caret's display line (0-based).
+    fn caret_line_index(&self) -> usize {
+        let (start, _) = self.caret_line();
+        self.text.chars().take(start).filter(|c| *c == '\n').count()
+    }
+
+    /// Caret column inside its own display line.
+    fn caret_col(&self) -> usize {
+        let (start, _) = self.caret_line();
+        self.cursor - start
+    }
+
+    /// First display line to render so the caret's line is inside `visible`.
+    fn display_window_start(&self, visible: usize) -> usize {
+        let idx = self.caret_line_index();
+        if visible == 0 || idx < visible {
+            0
+        } else {
+            idx + 1 - visible
+        }
+    }
+
+    /// Move the caret one display line up, keeping its column.
+    fn up(&mut self) {
+        let chars: Vec<char> = self.text.chars().collect();
+        let cur = self.cursor.min(chars.len());
+        let start = chars[..cur]
+            .iter()
+            .rposition(|c| *c == '\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        if start == 0 {
+            return;
+        }
+        let col = cur - start;
+        let prev_start = chars[..start - 1]
+            .iter()
+            .rposition(|c| *c == '\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let prev_len = (start - 1) - prev_start;
+        self.cursor = prev_start + col.min(prev_len);
+    }
+
+    /// Move the caret one display line down, keeping its column.
+    fn down(&mut self) {
+        let chars: Vec<char> = self.text.chars().collect();
+        let cur = self.cursor.min(chars.len());
+        let line_start = chars[..cur]
+            .iter()
+            .rposition(|c| *c == '\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let line_end = chars[cur..]
+            .iter()
+            .position(|c| *c == '\n')
+            .map(|i| cur + i)
+            .unwrap_or(chars.len());
+        if line_end >= chars.len() {
+            return;
+        }
+        let col = cur - line_start;
+        let next_start = line_end + 1;
+        let next_len = chars[next_start..]
+            .iter()
+            .position(|c| *c == '\n')
+            .unwrap_or(chars.len() - next_start);
+        self.cursor = next_start + col.min(next_len);
+    }
+
+    /// Home within the caret's line (multi-line buffers).
+    fn home_line(&mut self) {
+        let (start, _) = self.caret_line();
+        self.cursor = start;
+    }
+
+    /// End within the caret's line (multi-line buffers).
+    fn end_line(&mut self) {
+        let (_, end) = self.caret_line();
+        self.cursor = end;
     }
 
     /// Trimmed submission; empty input clears without pushing history.
@@ -308,6 +455,21 @@ enum PickerKind {
     Model,
 }
 
+/// A provider/model switch finishing in the background, so the event loop keeps
+/// drawing (spinner + elapsed) instead of freezing on MCP/HTTP work.
+enum SwitchDone {
+    Ok {
+        agent: Box<Agent>,
+        provider: Option<String>,
+        model: Option<String>,
+        desc: String,
+    },
+    Failed {
+        agent: Box<Agent>,
+        note: String,
+    },
+}
+
 /// A modal list picker rendered above the input: `/provider` and `/model`
 /// open one. Type to filter, ↑/↓ to move, Enter to select, Esc to cancel.
 #[derive(Debug, Clone)]
@@ -387,6 +549,18 @@ struct Screen {
     /// Transcript scroll: lines above the bottom (0 = follow the tail).
     /// Cell because the clamp depends on the last draw's viewport height.
     scroll: std::cell::Cell<usize>,
+    /// Wrapped-line count of the last draw: while scrolled, new output must
+    /// not drag the viewport out from under the reader.
+    last_total: std::cell::Cell<usize>,
+    /// Bumped whenever the transcript content changes (wrap-cache key).
+    rev: std::cell::Cell<u64>,
+    /// (rev, body width, wrapped rows) — re-wrapping the whole transcript on
+    /// every keystroke is what made long sessions feel sluggish.
+    wrap_cache: std::cell::RefCell<(u64, u16, Vec<Line<'static>>)>,
+    /// Task start time + spinner frame while a run is in flight, so a model
+    /// that thinks quietly is visibly *working*, not hung.
+    started: std::cell::Cell<Option<std::time::Instant>>,
+    spinner: std::cell::Cell<usize>,
     /// While true, input is disabled (a task is in flight).
     busy: bool,
     /// A pending approval question: rendered instead of the input line and
@@ -394,6 +568,8 @@ struct Screen {
     pending_approval: Option<ApprovalAsk>,
     /// A modal list picker (provider/model selection), drawn above the input.
     picker: Option<Picker>,
+    /// Highlighted row of the `/` command dropdown: ↑/↓ move it, Enter runs it.
+    cmd_sel: std::cell::Cell<usize>,
     /// The model's plan checklist: (content, status) pairs.
     todos: Vec<(String, String)>,
     /// Current permission mode (mirrors the shared cell; Shift+Tab cycles).
@@ -404,29 +580,60 @@ struct Screen {
 
 impl Screen {
     fn new(provider_desc: &str, session_name: &str, max_rounds: u32) -> Self {
+        let input = Input {
+            history: super::repl::load_input_history(),
+            ..Default::default()
+        };
         Self {
             provider_desc: provider_desc.to_string(),
             session_name: session_name.to_string(),
             max_rounds,
             lines: Vec::new(),
-            input: Input::default(),
+            input,
             rounds: 0,
             tokens_in: 0,
             tokens_out: 0,
             est_tokens: 0,
             streaming: String::new(),
             scroll: std::cell::Cell::new(0),
+            last_total: std::cell::Cell::new(0),
+            rev: std::cell::Cell::new(0),
+            wrap_cache: std::cell::RefCell::new((u64::MAX, 0, Vec::new())),
+            started: std::cell::Cell::new(None),
+            spinner: std::cell::Cell::new(0),
             busy: false,
             pending_approval: None,
             picker: None,
+            cmd_sel: std::cell::Cell::new(0),
             todos: Vec::new(),
             mode: crate::tools::PermissionMode::Edit,
             quit: false,
         }
     }
 
+    /// Transcript cap: enough for any real session, bounded so a runaway
+    /// stream cannot grow memory (and per-frame work) without limit.
+    const MAX_LINES: usize = 4_000;
+
     fn push(&mut self, kind: LineKind, text: impl Into<String>) {
         self.lines.push((kind, text.into()));
+        if self.lines.len() > Self::MAX_LINES {
+            let excess = self.lines.len() - Self::MAX_LINES;
+            self.lines.drain(0..excess);
+        }
+        self.touch();
+    }
+
+    /// Mark the wrapped-row cache stale after any transcript change.
+    fn touch(&self) {
+        self.rev.set(self.rev.get().wrapping_add(1));
+    }
+
+    /// Ctrl+L: drop the transcript buffer without touching the conversation.
+    fn clear_transcript(&mut self) {
+        self.lines.clear();
+        self.touch();
+        self.scroll_to_bottom();
     }
 
     /// Scroll the transcript (clamped during draw against the viewport).
@@ -457,6 +664,8 @@ impl Screen {
 
     /// Render one agent event into the screen state.
     fn consume(&mut self, ev: AgentEvent) {
+        // in-place edits below must invalidate the wrapped-row cache
+        self.touch();
         match ev {
             AgentEvent::TodosUpdated { items } => self.todos = items,
             AgentEvent::Feedback {
@@ -540,7 +749,53 @@ impl Screen {
     fn take_input(&mut self) -> Option<String> {
         let t = self.input.submit()?;
         self.push(LineKind::User, format!("you> {t}"));
+        // shared with the line REPL: ↑ after a restart recalls the last tasks
+        super::repl::remember_input(&t);
         Some(t)
+    }
+
+    /// Enter/Tab resolution of a half-typed command: the unique match, or the
+    /// row the `/` dropdown is highlighting.
+    fn resolve_command_input(&self) -> Option<String> {
+        let token = super::repl::pending_command(&self.input.text)?;
+        let rows = super::repl::command_rows(token);
+        if rows.is_empty() {
+            return None;
+        }
+        let pick = if rows.len() == 1 {
+            0
+        } else {
+            self.cmd_sel.get().min(rows.len() - 1)
+        };
+        let name = rows[pick].0.split_whitespace().next()?.to_string();
+        Some(name)
+    }
+
+    /// Move the `/` dropdown highlight by `delta` (wrapping).
+    fn move_command_sel(&self, delta: isize) {
+        let len = self.command_hints().len();
+        if len == 0 {
+            return;
+        }
+        let cur = self.cmd_sel.get().min(len - 1) as isize;
+        self.cmd_sel
+            .set((cur + delta).rem_euclid(len as isize) as usize);
+    }
+
+    /// Lines the input buffer occupies on screen (capped while typing).
+    fn input_lines(&self) -> usize {
+        self.input.line_count().min(6)
+    }
+
+    /// Rows the bottom area needs: 3 for a one-line input, more when the task
+    /// spans several lines or when an approval needs the command readable.
+    fn bottom_rows(&self, width: u16, height: u16) -> u16 {
+        if let Some(p) = &self.pending_approval {
+            let w = width.saturating_sub(2).max(20) as usize;
+            let want = wrap_text(&p.summary, w).len() as u16 + 2;
+            return want.clamp(4, 9).min(height.saturating_sub(4).max(3));
+        }
+        (self.input_lines() as u16 + 2).min(8)
     }
 
     /// Paint one frame. Height budget: status 1, plan checklist, transcript,
@@ -548,11 +803,13 @@ impl Screen {
     /// input and never steals layout rows from the transcript.
     fn draw(&self, f: &mut Frame) {
         let todo_rows = self.todos.len().min(6) as u16;
+        // the bottom area grows for a multi-line task and for approvals
+        let input_rows = self.bottom_rows(f.area().width, f.area().height);
         let [status, todos_area, body, input] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(todo_rows),
             Constraint::Min(3),
-            Constraint::Length(3),
+            Constraint::Length(input_rows),
         ])
         .areas(f.area());
 
@@ -574,75 +831,115 @@ impl Screen {
         }
 
         // -- status bar -----------------------------------------------------
+        // A live spinner while a task runs: a model thinking quietly used to
+        // look exactly like a hang.
         let budget_note = if self.busy {
+            let secs = self
+                .started
+                .get()
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0);
             format!(
-                "round {}/{}  in {} out {}  ctx ~{}",
-                self.rounds, self.max_rounds, self.tokens_in, self.tokens_out, self.est_tokens
+                "round {}/{}  in {} out {}  ctx ~{}  {} {secs}s",
+                self.rounds,
+                self.max_rounds,
+                self.tokens_in,
+                self.tokens_out,
+                self.est_tokens,
+                SPINNER[self.spinner.get() % SPINNER.len()]
             )
         } else {
             format!("ctx ~{}", self.est_tokens)
         };
+        // the permission mode comes early on purpose: it must survive a narrow
+        // terminal's truncation
         let mut status_spans = vec![
             Span::styled(" kazi ", Style::default().fg(Color::Black).bg(CYAN).bold()),
-            Span::raw(" "),
-            Span::styled(&self.provider_desc, Style::default().fg(DIM)),
-            Span::raw("  "),
-            Span::styled(&self.session_name, Style::default().fg(CYAN)),
-            Span::raw("  "),
-            Span::styled(budget_note, Style::default().fg(DIM)),
             Span::styled(
-                format!("  [{}]", self.mode.as_str()),
+                format!("[{}] ", self.mode.as_str()),
                 Style::default().fg(match self.mode {
                     crate::tools::PermissionMode::ReadOnly => YELLOW,
                     crate::tools::PermissionMode::Edit => DIM,
                     crate::tools::PermissionMode::Yolo => RED,
                 }),
             ),
+            Span::styled(&self.provider_desc, Style::default().fg(DIM)),
+            Span::raw("  "),
+            Span::styled(&self.session_name, Style::default().fg(CYAN)),
+            Span::raw("  "),
+            Span::styled(budget_note, Style::default().fg(DIM)),
         ];
         if self.scroll.get() > 0 {
             status_spans.push(Span::styled(
-                "  [scrolled — End: bottom]",
+                "  [scrolled — Ctrl+End: bottom]",
                 Style::default().fg(YELLOW),
             ));
         }
         f.render_widget(Line::from(status_spans).style(Style::new()), status);
 
         // -- transcript ------------------------------------------------------
-        let mut all: Vec<Line> = Vec::new();
-        for (kind, content) in &self.lines {
-            let style = match kind {
-                LineKind::User => Style::default().fg(CYAN),
-                LineKind::Assistant => Style::default(),
-                LineKind::Tool { is_error } => {
-                    if *is_error {
-                        Style::default().fg(RED)
-                    } else {
-                        Style::default().fg(GREEN)
+        // Wrapping the whole transcript happens only when its content (or the
+        // window width) changed; every other frame reuses the cached rows.
+        let body_width = body.width.saturating_sub(2).max(20);
+        {
+            let mut cache = self.wrap_cache.borrow_mut();
+            if cache.0 != self.rev.get() || cache.1 != body_width {
+                let mut out: Vec<Line<'static>> = Vec::with_capacity(self.lines.len());
+                for (kind, content) in &self.lines {
+                    let style = match kind {
+                        LineKind::User => Style::default().fg(CYAN),
+                        LineKind::Assistant => Style::default(),
+                        LineKind::Tool { is_error } => {
+                            if *is_error {
+                                Style::default().fg(RED)
+                            } else {
+                                Style::default().fg(GREEN)
+                            }
+                        }
+                        LineKind::Dim => Style::default().fg(DIM),
+                        LineKind::Warn => Style::default().fg(YELLOW),
+                    };
+                    // pre-wrapping keeps the scroll arithmetic honest
+                    for chunk in wrap_text(content, body_width as usize) {
+                        out.push(Line::styled(chunk, style));
                     }
                 }
-                LineKind::Dim => Style::default().fg(DIM),
-                LineKind::Warn => Style::default().fg(YELLOW),
-            };
-            // naive wrap at a comfortable width; ratatui Paragraph would also
-            // wrap, but pre-wrapping keeps the scroll arithmetic honest.
-            let width = body.width.saturating_sub(2) as usize;
-            for chunk in wrap_text(content, width.max(20)) {
-                all.push(Line::styled(chunk, style));
+                *cache = (self.rev.get(), body_width, out);
             }
         }
+
         // streaming assistant text lives at the bottom of the transcript
-        if !self.streaming.is_empty() {
-            for chunk in wrap_text(
-                &self.streaming,
-                body.width.saturating_sub(2).max(20) as usize,
-            ) {
-                all.push(Line::raw(chunk));
-            }
+        let stream_rows: Vec<Line<'static>> = if self.streaming.is_empty() {
+            Vec::new()
+        } else {
+            wrap_text(&self.streaming, body_width as usize)
+                .into_iter()
+                .map(Line::raw)
+                .collect()
+        };
+        let total = self.wrap_cache.borrow().2.len() + stream_rows.len();
+        // a scrolled reader keeps their place: new output moves the anchor too
+        let grew = total.saturating_sub(self.last_total.replace(total));
+        if grew > 0 && self.scroll.get() > 0 {
+            self.scroll.set(self.scroll.get() + grew);
         }
         let height = body.height as usize;
-        let (start, end, off) = scroll_range(all.len(), height, self.scroll.get());
+        let (start, end, off) = scroll_range(total, height, self.scroll.get());
         self.scroll.set(off); // keep the stored offset within bounds
-        f.render_widget(Paragraph::new(Text::from(all[start..end].to_vec())), body);
+        let visible: Vec<Line<'static>> = {
+            let cache = self.wrap_cache.borrow();
+            let static_len = cache.2.len();
+            let mut out = Vec::with_capacity(end.saturating_sub(start));
+            for i in start..end {
+                if i < static_len {
+                    out.push(cache.2[i].clone());
+                } else if let Some(row) = stream_rows.get(i - static_len) {
+                    out.push(row.clone());
+                }
+            }
+            out
+        };
+        f.render_widget(Paragraph::new(Text::from(visible)), body);
 
         // -- `/` completion menu --------------------------------------------
         // An overlay: a full-width panel sitting directly above the input, so
@@ -676,7 +973,8 @@ impl Screen {
                         .take(shown)
                         .enumerate()
                         .map(|(i, (cmd, help))| {
-                            let cmd_style = if i == 0 {
+                            let sel = self.cmd_sel.get().min(shown.saturating_sub(1));
+                            let cmd_style = if i == sel {
                                 Style::default().fg(Color::Black).bg(CYAN).bold()
                             } else {
                                 Style::default().fg(DIM)
@@ -689,9 +987,11 @@ impl Screen {
                         .collect();
                     lines.push(Line::styled(
                         if hidden > 0 {
-                            format!(" … +{hidden} more · Tab completes")
+                            format!(
+                                " … +{hidden} more · ↑/↓ select · Enter runs it · Tab completes"
+                            )
                         } else {
-                            " Tab completes".to_string()
+                            " ↑/↓ select · Enter runs it · Tab completes".to_string()
                         },
                         Style::default().fg(DIM),
                     ));
@@ -703,45 +1003,75 @@ impl Screen {
 
         // -- input box (or the pending approval question) ---------------------
         if let Some(pending) = &self.pending_approval {
-            let first = pending.summary.lines().next().unwrap_or("");
-            let question = Line::from(vec![
-                Span::styled(
-                    " approve ",
-                    Style::default().fg(Color::Black).bg(YELLOW).bold(),
-                ),
-                Span::raw(" "),
-                Span::raw(first.to_string()),
-            ]);
-            let hint = Line::from(vec![Span::styled(
-                " [y] once   [a] always (session)   [n] deny",
+            let width = input.width.saturating_sub(2).max(20) as usize;
+            let summary = wrap_text(&pending.summary, width);
+            // never clip the key hints: they are the only way to answer
+            let room = input.height.saturating_sub(2) as usize;
+            let mut lines: Vec<Line> = Vec::with_capacity(room + 1);
+            for (i, text) in summary.iter().take(room).enumerate() {
+                let mut body = text.clone();
+                if i + 1 == room && summary.len() > room {
+                    body.push_str(" …");
+                }
+                let lead = if i == 0 {
+                    Span::styled(
+                        " approve ",
+                        Style::default().fg(Color::Black).bg(YELLOW).bold(),
+                    )
+                } else {
+                    Span::raw("         ")
+                };
+                lines.push(Line::from(vec![lead, Span::raw(body)]));
+            }
+            lines.push(Line::from(vec![Span::styled(
+                " [y] once   [a] always this command (session)   [n] deny",
                 Style::default().fg(YELLOW),
-            )]);
+            )]));
             f.render_widget(
-                Paragraph::new(Text::from(vec![question, hint]))
-                    .block(Block::default().borders(Borders::TOP)),
+                Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::TOP)),
                 input,
             );
             return;
         }
         let prompt = if self.busy { " [busy] " } else { " kazi> " };
+        let prompt_w = UnicodeWidthStr::width(prompt);
         let budget = (input.width as usize)
             .saturating_sub(1)
-            .saturating_sub(UnicodeWidthStr::width(prompt));
-        let (shown, caret_in_window) =
-            window_for_cursor(&self.input.text, self.input.cursor, budget);
-        let input_text = Line::from(vec![
-            Span::styled(prompt, Style::default().fg(CYAN).bold()),
-            Span::raw(&shown),
-        ]);
+            .saturating_sub(prompt_w);
+        // one row per buffer line (Ctrl+J / paste), windowed on the caret
+        let rows = self.input.display_lines();
+        let visible_rows = (input.height.saturating_sub(1) as usize).max(1);
+        let first = self.input.display_window_start(visible_rows);
+        let caret_line = self.input.caret_line_index();
+        let mut caret_at: Option<(usize, usize)> = None;
+        let mut lines: Vec<Line> = Vec::new();
+        for (i, text) in rows.iter().enumerate().skip(first).take(visible_rows) {
+            let lead = if i == first {
+                Span::styled(prompt, Style::default().fg(CYAN).bold())
+            } else {
+                Span::raw(" ".repeat(prompt_w))
+            };
+            if i == caret_line {
+                let (shown, caret_col) = window_for_cursor(text, self.input.caret_col(), budget);
+                caret_at = Some((lines.len() + 1, caret_col));
+                lines.push(Line::from(vec![lead, Span::raw(shown)]));
+            } else {
+                lines.push(Line::from(vec![
+                    lead,
+                    Span::raw(truncate_display(text, budget)),
+                ]));
+            }
+        }
         f.render_widget(
-            Paragraph::new(input_text).block(Block::default().borders(Borders::TOP)),
+            Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::TOP)),
             input,
         );
 
-        // caret sits at the window offset (display columns), clamped inside
-        let x = (input.x + UnicodeWidthStr::width(prompt) as u16 + caret_in_window as u16)
-            .min(input.right().saturating_sub(1));
-        f.set_cursor_position(ratatui::layout::Position { x, y: input.y + 1 });
+        if let Some((row, col)) = caret_at {
+            let x = (input.x + prompt_w as u16 + col as u16).min(input.right().saturating_sub(1));
+            let y = (input.y + row as u16).min(input.bottom().saturating_sub(1));
+            f.set_cursor_position(ratatui::layout::Position { x, y });
+        }
     }
 }
 
@@ -852,12 +1182,34 @@ fn accepted_char(code: &KeyCode, mods: ratatui::crossterm::event::KeyModifiers) 
     use ratatui::crossterm::event::KeyModifiers as M;
     match code {
         KeyCode::Char('\0') => None,
-        KeyCode::Char(c) if mods.intersects(M::CONTROL | M::ALT) => None,
+        // AltGr arrives as CONTROL|ALT on Windows/X11 keyboard layouts: that is
+        // a real character (`@ \ [ ] { } |`), not a shortcut. Only CONTROL
+        // without ALT is a modifier combo (`Ctrl+Space` IME switch, `Ctrl+A`).
+        KeyCode::Char(c) if mods.contains(M::CONTROL) && !mods.contains(M::ALT) => None,
         KeyCode::Char(' ') if mods.contains(M::SHIFT) => None,
         KeyCode::Char(c) => Some(*c),
         _ => None,
     }
 }
+
+/// First `budget` display columns of a line — non-caret input lines are
+/// clipped, not horizontally scrolled.
+fn truncate_display(text: &str, budget: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in text.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > budget {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out
+}
+
+/// Spinner frames for the busy status (ASCII: renders on legacy consoles).
+const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
 
 /// Word-ish wrap by DISPLAY width (CJK glyphs are double-width): break
 /// preferentially at spaces, hard-break long words glyph by glyph — never by
@@ -950,10 +1302,12 @@ pub async fn chat_loop_with(
     let (ask_tx, ask_rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalAsk>();
     // kept for agents rebuilt inside the TUI (/provider, /model)
     let ask_tx_rebuild = ask_tx.clone();
+    // one shared "always allow" set: rebuilding the agent must not forget it
+    let session_allows = SessionAllows::default();
     let approver: std::sync::Arc<dyn Approver> = if mode == crate::tools::PermissionMode::Yolo {
         std::sync::Arc::new(crate::tools::AutoApprover)
     } else {
-        std::sync::Arc::new(TuiApprover::new(ask_tx))
+        std::sync::Arc::new(TuiApprover::with_allows(ask_tx, session_allows.clone()))
     };
     let mut agent = match Agent::default_cli_with_approver(
         &cfg,
@@ -980,14 +1334,26 @@ pub async fn chat_loop_with(
                 }
                 Err(e) => eprintln!("cannot resume `{n}`: {e}"),
             },
-            None => eprintln!("no stored session matches `{name}`"),
+            None => eprintln!(
+                "no stored session matches `{name}` — starting a NEW session named `{name}`"
+            ),
         }
     }
 
+    // Which session actually reached the disk? Quitting on a still-running
+    // first task must not print "session saved", and an in-TUI `/new` must not
+    // make the exit line name a file that was never written.
+    let saved_name = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
     let save = |name: &str, agent: &Agent| {
-        let _ = super::session::save(name, agent.history.system.as_deref(), &agent.history.msgs);
+        if agent.history.msgs_len() == 0 {
+            return; // empty sessions never touch the disk
+        }
+        if super::session::save(name, agent.history.system.as_deref(), &agent.history.msgs).is_ok()
+        {
+            *saved_name.lock().unwrap_or_else(|e| e.into_inner()) = Some(name.to_string());
+        }
     };
-    let sess = SessionState {
+    let mut sess = SessionState {
         cfg: cfg.clone(),
         provider: provider.clone(),
         model: model.clone(),
@@ -996,16 +1362,20 @@ pub async fn chat_loop_with(
 
     match chat_loop_tui(
         agent,
-        session_name.clone(),
+        session_name,
         save,
         ask_rx,
-        sess,
+        &mut sess,
         ask_tx_rebuild,
+        session_allows,
     )
     .await
     {
         Ok(code) => {
-            println!("\x1b[2msession saved -> {session_name}\x1b[0m");
+            match saved_name.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                Some(name) => println!("\x1b[2msession saved -> {name}\x1b[0m"),
+                None => println!("\x1b[2mnothing to save yet — no task has completed\x1b[0m"),
+            }
             Ok(code)
         }
         Err(_) => {
@@ -1032,21 +1402,33 @@ pub async fn chat_loop_tui(
     session_name: String,
     on_session_save: impl Fn(&str, &Agent),
     mut approvals: tokio::sync::mpsc::UnboundedReceiver<ApprovalAsk>,
-    mut sess: SessionState,
+    sess: &mut SessionState,
     ask_tx: tokio::sync::mpsc::UnboundedSender<ApprovalAsk>,
+    session_allows: SessionAllows,
 ) -> anyhow::Result<u8> {
     let provider_desc = agent.provider().describe();
     let max_rounds = agent.max_rounds();
     let permission = agent.ctx.permission.clone();
+    // provider/model switches run as background tasks and report back here
+    let (switch_tx, mut switches) = tokio::sync::mpsc::unbounded_channel::<SwitchDone>();
 
     enable_raw_mode()?;
     let mut stdout: Stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let mut screen = Screen::new(&provider_desc, &session_name, max_rounds);
     screen.mode = permission.get();
+    // a missing key would otherwise only surface as a 401 on the first task
+    if let Some(hint) = agent.auth_hint() {
+        screen.push(LineKind::Warn, hint.to_string());
+    }
     screen.push(
         LineKind::Dim,
         "type a task and press Enter · / for commands · Esc quits".to_string(),
@@ -1059,19 +1441,87 @@ pub async fn chat_loop_tui(
         &on_session_save,
         &mut approvals,
         &permission,
-        &mut sess,
+        sess,
         &ask_tx,
+        &session_allows,
+        &mut switches,
+        &switch_tx,
     )
     .await;
 
     disable_raw_mode()?;
-    execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        std::io::stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )?;
     std::io::stdout().flush().ok();
 
     let quit_clean = screen.quit;
     // the save already happened inside tui_inner with the real agent
     // (`None` = aborted mid-task: nothing new to persist)
     res.map(|_| if quit_clean { 0 } else { 1 })
+}
+
+/// First few non-empty lines of a message (history replay keeps it readable).
+fn first_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .take(n)
+        .collect();
+    let mut out = lines.join("\n");
+    if text.lines().filter(|l| !l.trim().is_empty()).count() > n {
+        out.push_str("\n…");
+    }
+    out
+}
+
+/// Paint a resumed session's conversation into the transcript: `/resume` used
+/// to load the model's memory while leaving the screen blank, so you had no
+/// idea what you were continuing.
+fn replay_history(screen: &mut Screen, agent: &Agent) {
+    const TAIL: usize = 20;
+    let msgs = &agent.history.msgs;
+    if msgs.is_empty() {
+        return;
+    }
+    let start = msgs.len().saturating_sub(TAIL);
+    screen.push(
+        LineKind::Dim,
+        format!("— replaying the last {} messages —", msgs.len() - start),
+    );
+    for m in &msgs[start..] {
+        match m.role {
+            crate::llm::Role::User => {
+                screen.push(LineKind::User, format!("you> {}", first_lines(m.text(), 6)));
+            }
+            crate::llm::Role::Assistant => {
+                let text = m.text().trim();
+                if !text.is_empty() {
+                    screen.push(LineKind::Assistant, first_lines(text, 12));
+                }
+                for tc in &m.tool_calls {
+                    screen.push(
+                        LineKind::Tool { is_error: false },
+                        format!(">> {} (call)", tc.name),
+                    );
+                }
+            }
+            crate::llm::Role::Tool => screen.push(
+                LineKind::Tool {
+                    is_error: m.is_error,
+                },
+                format!(
+                    ">> tool [{}] {}",
+                    if m.is_error { "x" } else { "ok" },
+                    first_lines(m.text(), 4)
+                ),
+            ),
+            crate::llm::Role::System => {}
+        }
+    }
 }
 
 /// Append multi-line text to the transcript, one line per row.
@@ -1093,17 +1543,25 @@ async fn run_command(
     slot: &std::sync::Arc<tokio::sync::Mutex<Option<Agent>>>,
     sess: &mut SessionState,
     ask_tx: &tokio::sync::mpsc::UnboundedSender<ApprovalAsk>,
+    session_allows: &SessionAllows,
     permission: &crate::tools::Permission,
+    switch_tx: &tokio::sync::mpsc::UnboundedSender<SwitchDone>,
     save: &(impl Fn(&str, &Agent) + ?Sized),
 ) {
     use super::repl;
     use crate::tools::PermissionMode as Mode;
-    let (verb, arg) = cmdline
-        .split_once(' ')
-        .map(|(a, b)| (a, b.trim()))
-        .unwrap_or((cmdline, ""));
+    let verb = cmdline.split_once(' ').map(|(a, _)| a).unwrap_or(cmdline);
+    let arg = cmdline.split_once(' ').map(|(_, b)| b.trim()).unwrap_or("");
+    // `/Undo` must behave like `/undo`: the table is lowercase
+    let verb_key = verb.to_ascii_lowercase();
 
-    match verb {
+    // `/undo 3` and friends: explain instead of silently ignoring the argument
+    if let Some(usage) = repl::no_arg_violation(&verb_key, arg) {
+        push_lines(screen, usage);
+        return;
+    }
+
+    match verb_key.as_str() {
         "" => {} // a bare `/`
         "help" => {
             push_lines(screen, repl::help_text());
@@ -1132,6 +1590,24 @@ async fn run_command(
             };
             push_lines(screen, text);
         }
+        "auth" => {
+            let text = match slot.lock().await.as_ref() {
+                Some(a) => repl::auth_report(a, &sess.cfg),
+                None => BUSY_TEXT.to_string(),
+            };
+            push_lines(screen, text);
+        }
+        "last" => {
+            let Some(back) = repl::parse_back(arg) else {
+                push_lines(screen, repl::usage_for("/last"));
+                return;
+            };
+            let text = match slot.lock().await.as_ref() {
+                Some(a) => repl::last_tool_text(a, back),
+                None => BUSY_TEXT.to_string(),
+            };
+            push_lines(screen, text);
+        }
         "tools" => {
             let text = match slot.lock().await.as_ref() {
                 Some(a) => a.registry().catalog(),
@@ -1140,7 +1616,7 @@ async fn run_command(
             push_lines(screen, text);
         }
         "new" | "clear" => {
-            let topic = if verb == "new" && !arg.is_empty() {
+            let topic = if verb_key == "new" && !arg.is_empty() {
                 Some(arg)
             } else {
                 None
@@ -1151,6 +1627,7 @@ async fn run_command(
                 return;
             };
             let (name, note) = repl::start_new_session(a, topic);
+            screen.est_tokens = a.history.estimate_tokens();
             sess.session_name = name.clone();
             screen.session_name = name;
             push_lines(
@@ -1163,9 +1640,22 @@ async fn run_command(
             );
         }
         "compact" => {
+            let force = match arg {
+                "" => false,
+                "force" | "--force" | "f" => true,
+                _ => {
+                    push_lines(screen, repl::usage_for("/compact"));
+                    return;
+                }
+            };
             let mut guard = slot.lock().await;
             let text = match guard.as_mut() {
-                Some(a) => repl::compact_text(a).await,
+                Some(a) => {
+                    let text = repl::compact_text(a, force).await;
+                    // the status bar's ctx estimate must not go stale
+                    screen.est_tokens = a.history.estimate_tokens();
+                    text
+                }
                 None => BUSY_TEXT.to_string(),
             };
             drop(guard);
@@ -1177,7 +1667,18 @@ async fn run_command(
             } else {
                 let mut guard = slot.lock().await;
                 let text = match guard.as_mut() {
-                    Some(a) => repl::resume_text(a, arg).await,
+                    Some(a) => {
+                        // resolve before printing: auto-save must follow the
+                        // session we just loaded, not the one this TUI started in
+                        let (name, text) = repl::resume_text(a, arg).await;
+                        if let Some(name) = name {
+                            sess.session_name = name.clone();
+                            screen.session_name = name;
+                        }
+                        screen.est_tokens = a.history.estimate_tokens();
+                        replay_history(screen, a);
+                        text
+                    }
                     None => BUSY_TEXT.to_string(),
                 };
                 drop(guard);
@@ -1188,7 +1689,7 @@ async fn run_command(
             if arg.is_empty() {
                 let nicks = sess.cfg.nicks();
                 if nicks.is_empty() {
-                    push_lines(screen, repl::providers_text(&sess.cfg));
+                    push_lines(screen, repl::providers_text(&sess.cfg, None));
                 } else {
                     let current = sess
                         .provider
@@ -1202,15 +1703,19 @@ async fn run_command(
                     ));
                 }
             } else {
-                rebuild_agent(
+                // provider-only switch: the model override is dropped (it may
+                // not exist on the new wire) — /model picks both in one step
+                start_switch(
                     screen,
                     slot,
                     sess,
                     ask_tx,
+                    session_allows,
                     permission,
                     Some(arg.to_string()),
-                    sess.model.clone(),
+                    None,
                     false,
+                    switch_tx,
                 )
                 .await;
             }
@@ -1229,21 +1734,25 @@ async fn run_command(
                                 .ok()
                                 .map(|r| r.settings.model)
                         });
-                        let models = repl::model_catalog(&sess.cfg, &nick, cur.as_deref()).await;
-                        if models.is_empty() {
+                        // ONE list for provider AND model: a row is `nick/model`,
+                        // so a single selection can switch both
+                        let choices =
+                            repl::all_model_choices(&sess.cfg, Some(&nick), cur.as_deref()).await;
+                        if choices.is_empty() {
                             push_lines(
                                 screen,
                                 format!(
-                                    "no model candidates for `{nick}` — use /model <name> ({})",
+                                    "no model candidates — use /model <name> ({})",
                                     repl::usage_for("/model")
                                 ),
                             );
                         } else {
+                            let current = cur.as_deref().map(|m| format!("{nick}/{m}"));
                             screen.picker = Some(Picker::new(
                                 PickerKind::Model,
-                                format!("select model ({nick})"),
-                                models,
-                                cur.as_deref(),
+                                "provider / model",
+                                choices,
+                                current.as_deref(),
                             ));
                         }
                     }
@@ -1252,16 +1761,54 @@ async fn run_command(
                         "no provider resolved — check config (`kazi providers`)",
                     ),
                 }
+            } else if arg.chars().all(|c| c.is_ascii_digit()) {
+                // a bare number indexes the combined list the picker shows
+                let nick = sess
+                    .provider
+                    .clone()
+                    .or_else(|| sess.cfg.resolve(None, None).ok().map(|r| r.nick));
+                let cur = sess.model.clone().or_else(|| {
+                    sess.cfg
+                        .resolve(sess.provider.as_deref(), None)
+                        .ok()
+                        .map(|r| r.settings.model)
+                });
+                let choices =
+                    repl::all_model_choices(&sess.cfg, nick.as_deref(), cur.as_deref()).await;
+                match repl::resolve_model_arg(arg, &choices) {
+                    Ok(chosen) => {
+                        let (provider, model) =
+                            split_model_choice(&sess.cfg, sess.provider.as_deref(), &chosen);
+                        start_switch(
+                            screen,
+                            slot,
+                            sess,
+                            ask_tx,
+                            session_allows,
+                            permission,
+                            provider,
+                            Some(model),
+                            true,
+                            switch_tx,
+                        )
+                        .await;
+                    }
+                    Err(msg) => push_lines(screen, msg),
+                }
             } else {
-                rebuild_agent(
+                let (provider, model) =
+                    split_model_choice(&sess.cfg, sess.provider.as_deref(), arg);
+                start_switch(
                     screen,
                     slot,
                     sess,
                     ask_tx,
+                    session_allows,
                     permission,
-                    sess.provider.clone(),
-                    Some(arg.to_string()),
+                    provider,
+                    Some(model),
                     true,
+                    switch_tx,
                 )
                 .await;
             }
@@ -1336,116 +1883,147 @@ fn mode_note(mode: crate::tools::PermissionMode) -> &'static str {
     }
 }
 
-/// Rebuild the agent for `/provider` and `/model`: a fresh provider, the
-/// same permission cell (so Shift+Tab stays in sync) and the same approval
-/// channel. The conversation is dropped, exactly like the line REPL does.
-/// When `probe` is set, one tiny no-tools round verifies the model before it is
-/// committed — a wrong name is otherwise only rejected on the next real task.
-/// Returns `true` when the switch took (so callers may chain a picker).
+/// Kick off a provider/model switch in the BACKGROUND: the event loop keeps
+/// drawing (spinner + elapsed) while MCP/HTTP work happens, and the rebuilt
+/// agent arrives over `switch_tx` with the conversation carried along.
+/// `probe` verifies the model with one tiny round before the switch commits.
 #[allow(clippy::too_many_arguments)]
-async fn rebuild_agent(
+async fn start_switch(
     screen: &mut Screen,
     slot: &std::sync::Arc<tokio::sync::Mutex<Option<Agent>>>,
-    sess: &mut SessionState,
+    sess: &SessionState,
     ask_tx: &tokio::sync::mpsc::UnboundedSender<ApprovalAsk>,
+    session_allows: &SessionAllows,
     permission: &crate::tools::Permission,
     provider: Option<String>,
     model: Option<String>,
     probe: bool,
-) -> bool {
-    let approver: std::sync::Arc<dyn Approver> =
-        std::sync::Arc::new(TuiApprover::new(ask_tx.clone()));
-    let built = Agent::default_cli_with_approver(
-        &sess.cfg,
-        provider.as_deref(),
-        model.as_deref(),
-        approver,
-        permission.get(),
-    )
-    .await;
-    match built {
-        Ok(mut agent) => {
-            if probe {
-                if let Err(e) = agent.probe().await {
-                    let msg = format!(
-                        "model rejected by provider, staying on {}\n{e}",
-                        screen.provider_desc
-                    );
-                    push_lines(screen, msg);
-                    return false;
+    switch_tx: &tokio::sync::mpsc::UnboundedSender<SwitchDone>,
+) {
+    let Some(old) = slot.lock().await.take() else {
+        push_lines(screen, BUSY_TEXT);
+        return;
+    };
+    let label = match (&provider, &model) {
+        (Some(p), Some(m)) => format!("{p} / {m}"),
+        (Some(p), None) => p.clone(),
+        (None, Some(m)) => m.clone(),
+        (None, None) => "the current provider".to_string(),
+    };
+    screen.busy = true;
+    screen.started.set(Some(std::time::Instant::now()));
+    screen.push(LineKind::Dim, format!("switching -> {label} …"));
+
+    let cfg = sess.cfg.clone();
+    let approver: std::sync::Arc<dyn Approver> = std::sync::Arc::new(TuiApprover::with_allows(
+        ask_tx.clone(),
+        session_allows.clone(),
+    ));
+    let mode = permission.get();
+    let tx = switch_tx.clone();
+    tokio::spawn(async move {
+        let mut old = old;
+        match old
+            .rebuilt_with(&cfg, provider.as_deref(), model.as_deref(), approver, mode)
+            .await
+        {
+            Ok(mut agent) => {
+                if probe {
+                    if let Err(e) = agent.probe().await {
+                        let note = format!(
+                            "model rejected by provider, staying on {}\n{e}",
+                            old.provider().describe()
+                        );
+                        let _ = tx.send(SwitchDone::Failed {
+                            agent: Box::new(old),
+                            note,
+                        });
+                        return;
+                    }
                 }
+                let desc = agent.provider().describe();
+                // a switch changes the wire, not the conversation
+                agent.history =
+                    std::mem::replace(&mut old.history, super::context::History::new(None));
+                let _ = tx.send(SwitchDone::Ok {
+                    agent: Box::new(agent),
+                    provider,
+                    model,
+                    desc,
+                });
             }
-            agent.ctx.permission = permission.clone();
-            let desc = agent.provider().describe();
-            sess.provider = provider;
-            sess.model = model;
-            screen.provider_desc = desc.clone();
-            *slot.lock().await = Some(agent);
-            push_lines(screen, format!("switched -> {desc}"));
-            true
+            Err(e) => {
+                let _ = tx.send(SwitchDone::Failed {
+                    agent: Box::new(old),
+                    note: format!("switch failed: {e}"),
+                });
+            }
         }
-        Err(e) => {
-            push_lines(screen, format!("switch failed: {e}"));
-            false
+    });
+}
+
+/// `/model <nick/model>` picks provider AND model in one step; a bare name (or
+/// number) stays on the current provider.
+fn split_model_choice(
+    cfg: &crate::config::Config,
+    current: Option<&str>,
+    arg: &str,
+) -> (Option<String>, String) {
+    match arg.split_once('/') {
+        Some((nick, model)) if cfg.providers.contains_key(nick) => {
+            (Some(nick.to_string()), model.to_string())
         }
+        _ => (current.map(str::to_string), arg.to_string()),
     }
 }
 
-/// Apply a completed picker choice: a model rebuilds on the same provider; a
-/// provider switch drops the old model override and then offers that
-/// provider's models (choosing a provider usually means choosing a model next).
+/// Apply a completed picker choice. The model list is combined (`nick/model`),
+/// so one selection can switch provider AND model together; a provider row
+/// switches the wire and keeps the conversation.
+#[allow(clippy::too_many_arguments)]
 async fn apply_selection(
     screen: &mut Screen,
     slot: &std::sync::Arc<tokio::sync::Mutex<Option<Agent>>>,
-    sess: &mut SessionState,
+    sess: &SessionState,
     ask_tx: &tokio::sync::mpsc::UnboundedSender<ApprovalAsk>,
+    session_allows: &SessionAllows,
     permission: &crate::tools::Permission,
+    switch_tx: &tokio::sync::mpsc::UnboundedSender<SwitchDone>,
     kind: PickerKind,
     chosen: String,
 ) {
-    use super::repl;
     match kind {
-        PickerKind::Model => {
-            rebuild_agent(
+        PickerKind::Provider => {
+            start_switch(
                 screen,
                 slot,
                 sess,
                 ask_tx,
+                session_allows,
                 permission,
-                sess.provider.clone(),
                 Some(chosen),
-                true,
+                None,
+                false,
+                switch_tx,
             )
             .await;
         }
-        PickerKind::Provider => {
-            let prev_model = sess.model.take();
-            let ok = rebuild_agent(
+        PickerKind::Model => {
+            let (provider, model) =
+                split_model_choice(&sess.cfg, sess.provider.as_deref(), &chosen);
+            start_switch(
                 screen,
                 slot,
                 sess,
                 ask_tx,
+                session_allows,
                 permission,
-                Some(chosen.clone()),
-                None,
-                false,
+                provider,
+                Some(model),
+                true,
+                switch_tx,
             )
             .await;
-            if ok {
-                let cur = sess.model.clone();
-                let models = repl::model_catalog(&sess.cfg, &chosen, cur.as_deref()).await;
-                if !models.is_empty() {
-                    screen.picker = Some(Picker::new(
-                        PickerKind::Model,
-                        format!("select model ({chosen})"),
-                        models,
-                        cur.as_deref(),
-                    ));
-                }
-            } else {
-                // switch failed: keep the provider's previous model override
-                sess.model = prev_model;
-            }
         }
     }
 }
@@ -1454,7 +2032,8 @@ async fn apply_selection(
 /// events through an mpsc channel; the UI loop `select!`s between terminal
 /// input and incoming events, so the screen keeps redrawing (streaming
 /// deltas land live) and Esc stays responsive even while a task runs.
-/// Esc during a busy task aborts the TUI but the task result is still saved.
+/// Every finished task is autosaved; quitting mid-run cancels the task and
+/// waits briefly for the agent to come back before the final save.
 #[allow(clippy::too_many_arguments)]
 async fn tui_inner(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -1465,6 +2044,9 @@ async fn tui_inner(
     permission: &crate::tools::Permission,
     sess: &mut SessionState,
     ask_tx: &tokio::sync::mpsc::UnboundedSender<ApprovalAsk>,
+    session_allows: &SessionAllows,
+    switches: &mut tokio::sync::mpsc::UnboundedReceiver<SwitchDone>,
+    switch_tx: &tokio::sync::mpsc::UnboundedSender<SwitchDone>,
 ) -> anyhow::Result<Option<Agent>> {
     // Agent handoff: the runner task owns the agent while a task runs (the
     // engine needs `&mut`), then parks it back here for the next task and
@@ -1490,14 +2072,48 @@ async fn tui_inner(
 
     // crossterm's async event stream (event-stream feature)
     let mut events = EventStream::new();
+    // heartbeat: keeps the spinner turning and the elapsed time honest while a
+    // task runs (a quietly thinking model used to look frozen)
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(200));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     while !screen.quit {
         let _ = terminal.draw(|f| screen.draw(f));
 
         tokio::select! {
+            // ---- heartbeat (only while a task runs: an idle TUI sleeps) ------
+            _ = ticker.tick(), if screen.busy => {
+                screen.spinner.set(screen.spinner.get().wrapping_add(1));
+            }
+
+            // ---- a provider/model switch landed ----------------------------
+            Some(done) = switches.recv() => {
+                screen.busy = false;
+                screen.started.set(None);
+                match done {
+                    SwitchDone::Ok { agent, provider, model, desc } => {
+                        *shared_agent.lock().await = Some(*agent);
+                        sess.provider = provider;
+                        sess.model = model;
+                        screen.provider_desc = desc.clone();
+                        push_lines(screen, format!("switched -> {desc}"));
+                    }
+                    SwitchDone::Failed { agent, note } => {
+                        *shared_agent.lock().await = Some(*agent);
+                        push_lines(screen, note);
+                    }
+                }
+                screen.scroll_to_bottom();
+            }
+
             // ---- approval requests from the agent --------------------------
             ask = approvals.recv() => {
                 if let Some(ask) = ask {
+                    // echo the full command first: the modal may have to clip a
+                    // very long one, and the transcript is the audit trail
+                    for line in ask.summary.lines() {
+                        screen.push(LineKind::Warn, line.to_string());
+                    }
                     screen.pending_approval = Some(ask);
                 }
             }
@@ -1512,12 +2128,27 @@ async fn tui_inner(
                         Err(super::AgentError::Cancelled) => {
                             screen.push(LineKind::Dim, "(cancelled)".to_string());
                         }
-                        Err(e) => screen.push(LineKind::Warn, format!("error: {e}")),
+                        Err(e) => {
+                            // auth-ish failures get the exact fixing command
+                            let text = shared_agent
+                                .lock()
+                                .await
+                                .as_ref()
+                                .map(|a| a.error_text(&e))
+                                .unwrap_or_else(|| e.to_string());
+                            screen.push(LineKind::Warn, format!("error: {text}"));
+                        }
                         Ok(_) => {}
                     }
                     screen.busy = false;
+                    screen.started.set(None);
                     runner = None;
                     current_cancel = None;
+                    // autosave after EVERY finished task, like the line REPL:
+                    // one Ctrl+C used to throw the whole session away
+                    if let Some(agent) = shared_agent.lock().await.as_ref() {
+                        on_session_save(&sess.session_name, agent);
+                    }
                 }
                 None => { screen.busy = false; runner = None; current_cancel = None; }
             },
@@ -1560,7 +2191,9 @@ async fn tui_inner(
                                 &shared_agent,
                                 sess,
                                 ask_tx,
+                                session_allows,
                                 permission,
+                                switch_tx,
                                 kind,
                                 chosen,
                             )
@@ -1568,22 +2201,32 @@ async fn tui_inner(
                         }
                         continue;
                     }
-                    // a pending approval swallows the next keystroke
+                    // an approval is modal: only y/a/n/Esc answer it. Every
+                    // other key is ignored, so typing the next task can never
+                    // grant an approval by accident (Enter used to = allow).
                     if let Some(pending) = screen.pending_approval.take() {
                         let decision = match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                                Decision::Allow
+                            KeyCode::Char('y') | KeyCode::Char('Y') => Some(Decision::Allow),
+                            KeyCode::Char('a') | KeyCode::Char('A') => {
+                                Some(Decision::AllowSession)
                             }
-                            KeyCode::Char('a') | KeyCode::Char('A') => Decision::AllowSession,
-                            _ => Decision::Deny, // n / Esc / anything else
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                Some(Decision::Deny(None))
+                            }
+                            _ => None,
                         };
-                        let _ = pending.reply.send(decision);
-                        let verdict = match decision {
-                            Decision::Allow => "allowed",
-                            Decision::AllowSession => "allowed (session)",
-                            Decision::Deny => "denied",
-                        };
-                        screen.push(LineKind::Dim, format!("approval: {verdict}"));
+                        match decision {
+                            Some(decision) => {
+                                let verdict = match decision {
+                                    Decision::Allow => "allowed",
+                                    Decision::AllowSession => "allowed (always, this command)",
+                                    Decision::Deny(_) => "denied",
+                                };
+                                let _ = pending.reply.send(decision);
+                                screen.push(LineKind::Dim, format!("approval: {verdict}"));
+                            }
+                            None => screen.pending_approval = Some(pending),
+                        }
                         continue;
                     }
                     match key.code {
@@ -1609,6 +2252,11 @@ async fn tui_inner(
                         );
                     }
                     KeyCode::Enter if !screen.busy => {
+                        // a half-typed command runs the unique match — or the
+                        // row the dropdown is highlighting — instead of erroring
+                        if let Some(complete) = screen.resolve_command_input() {
+                            screen.input.set_text(complete);
+                        }
                         if let Some(task) = screen.take_input() {
                             // a leading `/` is a command, never a task
                             if let Some(cmdline) = task.strip_prefix('/') {
@@ -1618,7 +2266,9 @@ async fn tui_inner(
                                     &shared_agent,
                                     sess,
                                     ask_tx,
+                                    session_allows,
                                     permission,
+                                    switch_tx,
                                     on_session_save,
                                 )
                                 .await;
@@ -1626,6 +2276,8 @@ async fn tui_inner(
                                 continue;
                             }
                             screen.busy = true;
+                            screen.started.set(Some(std::time::Instant::now()));
+                            screen.spinner.set(0);
                             screen.scroll_to_bottom(); // new work pulls the view down
                             // take agent out of the slot for the runner
                             let taken = shared_agent.lock().await.take();
@@ -1646,6 +2298,11 @@ async fn tui_inner(
                             }
                         }
                     }
+                    KeyCode::Enter => {
+                        // busy: no task can start now — say so instead of
+                        // swallowing the keystroke silently
+                        screen.push(LineKind::Dim, BUSY_TEXT.to_string());
+                    }
                     KeyCode::Tab => {
                         // complete the command token; a unique match opens its
                         // argument position (trailing space)
@@ -1656,6 +2313,17 @@ async fn tui_inner(
                             if hints.len() == 1 {
                                 screen.input.set_text(format!("{token} "));
                             } else if let Some(done) = super::repl::command_completion(&token) {
+                                screen.input.set_text(done);
+                            } else if hints.len() > 1 {
+                                // no common prefix to add: walk the candidates
+                                screen.move_command_sel(1);
+                            }
+                        } else {
+                            // `@path` completion for file attachments
+                            let pos = screen.input.byte_of(screen.input.cursor);
+                            if let Some(done) =
+                                super::repl::complete_at_path(&screen.input.text, pos)
+                            {
                                 screen.input.set_text(done);
                             }
                         }
@@ -1678,10 +2346,40 @@ async fn tui_inner(
                     {
                         screen.scroll_to_bottom()
                     }
-                    KeyCode::Home => screen.input.home(),
-                    KeyCode::End => screen.input.end(),
-                    KeyCode::Up => screen.input.history_prev(),
-                    KeyCode::Down => screen.input.history_next(),
+                    KeyCode::Home => {
+                        if screen.input.line_count() > 1 {
+                            screen.input.home_line()
+                        } else {
+                            screen.input.home()
+                        }
+                    }
+                    KeyCode::End => {
+                        if screen.input.line_count() > 1 {
+                            screen.input.end_line()
+                        } else {
+                            screen.input.end()
+                        }
+                    }
+                    KeyCode::Up => {
+                        // the dropdown is the most visible affordance: ↑/↓ drive
+                        // it, then multi-line navigation, then history
+                        if screen.command_hints().len() > 1 {
+                            screen.move_command_sel(-1);
+                        } else if screen.input.line_count() > 1 {
+                            screen.input.up();
+                        } else {
+                            screen.input.history_prev();
+                        }
+                    }
+                    KeyCode::Down => {
+                        if screen.command_hints().len() > 1 {
+                            screen.move_command_sel(1);
+                        } else if screen.input.line_count() > 1 {
+                            screen.input.down();
+                        } else {
+                            screen.input.history_next();
+                        }
+                    }
                     KeyCode::PageUp => screen.scroll_up(10),
                     KeyCode::PageDown => screen.scroll_down(10),
                     KeyCode::Char(c)
@@ -1691,7 +2389,8 @@ async fn tui_inner(
                     {
                         match c {
                             'c' => screen.quit = true,
-                            'l' => screen.lines.clear(),
+                            'j' => screen.input.newline(), // Ctrl+J: new line in the task
+                            'l' => screen.clear_transcript(),
                             'a' => screen.input.home(),
                             'e' => screen.input.end(),
                             'u' => screen.input.kill_to_start(),
@@ -1712,18 +2411,32 @@ async fn tui_inner(
                     MouseEventKind::ScrollDown => screen.scroll_down(3),
                     _ => {}
                 },
+                // bracketed paste: insert the block whole. Without this a
+                // multi-line paste fired its first line as a task.
+                Some(Ok(CtEvent::Paste(text))) => {
+                    if screen.pending_approval.is_none() && screen.picker.is_none() {
+                        screen.input.insert_str(&text);
+                    }
+                }
                 Some(Ok(_)) => {} // resize/focus/mouse: next draw picks size up
                 Some(Err(_)) | None => {} // event loop hiccup: keep going
             },
         }
     }
 
-    // hand the agent back to the caller (None when Esc aborted a busy task)
+    // Quitting with a task in flight: ask it to stop and give the runner a
+    // moment to park the agent back, so the session is saved instead of lost.
+    if let Some(flag) = &current_cancel {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(handle) = runner.take() {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+    // hand the agent back to the caller (None only when the task outlived the
+    // wait above; every earlier task was already autosaved when it finished)
     let returned = shared_agent.lock().await.take();
     if let Some(agent) = &returned {
-        if screen.lines.len() > 1 {
-            on_session_save(&sess.session_name, agent);
-        }
+        on_session_save(&sess.session_name, agent);
     }
     Ok(returned)
 }
@@ -2097,6 +2810,194 @@ mod tests {
         assert_eq!(accepted_char(&KeyCode::Char('\0'), M::NONE), None);
     }
 
+    #[test]
+    fn altgr_characters_are_text() {
+        use ratatui::crossterm::event::KeyModifiers as M;
+        // AltGr arrives as CONTROL|ALT on Windows/X11 layouts: `@ \ [ ] { } |`
+        // must reach the input instead of vanishing
+        assert_eq!(
+            accepted_char(&KeyCode::Char('@'), M::CONTROL | M::ALT),
+            Some('@')
+        );
+        assert_eq!(
+            accepted_char(&KeyCode::Char('\\'), M::CONTROL | M::ALT),
+            Some('\\')
+        );
+        // plain Ctrl combos stay shortcuts
+        assert_eq!(accepted_char(&KeyCode::Char('a'), M::CONTROL), None);
+    }
+
+    #[test]
+    fn paste_keeps_line_breaks_and_submits_as_one_task() {
+        let mut i = Input::default();
+        i.insert_str("line one\r\nline two\nline three");
+        assert_eq!(i.text, "line one\nline two\nline three");
+        assert_eq!(i.cursor, i.chars_len());
+        // one task, submitted on purpose — not at the first newline
+        let task = i.submit().expect("the whole paste is one task");
+        assert!(task.contains("line two"), "got: {task}");
+    }
+
+    #[test]
+    fn completed_command_input_follows_the_dropdown() {
+        let mut s = Screen::new("p", "sess", 10);
+        s.input.set_text("/".into());
+        let rows = crate::agent::repl::command_rows("/");
+        assert!(rows.len() > 1);
+        let word = |row: &(String, String)| row.0.split_whitespace().next().unwrap().to_string();
+
+        // Enter runs the first row while the highlight sits there
+        assert_eq!(s.resolve_command_input(), Some(word(&rows[0])));
+        s.move_command_sel(1);
+        assert_eq!(s.resolve_command_input(), Some(word(&rows[1])));
+        // and wraps around
+        s.move_command_sel(-1);
+        assert_eq!(s.resolve_command_input(), Some(word(&rows[0])));
+
+        // a unique match needs no selection
+        s.input.set_text("/undo".into());
+        assert_eq!(s.resolve_command_input().as_deref(), Some("/undo"));
+        // arguments take the line out of command position
+        s.input.set_text("/model gpt".into());
+        assert_eq!(s.resolve_command_input(), None);
+    }
+
+    #[test]
+    fn model_choice_rows_split_into_provider_and_model() {
+        let cfg: crate::config::Config = toml::from_str(
+            "[providers.a]\ntype = \"openai\"\nmodel = \"m1\"\n[providers.b]\ntype = \"openai\"\nmodel = \"m2\"",
+        )
+        .unwrap();
+        assert_eq!(
+            split_model_choice(&cfg, Some("a"), "b/m2"),
+            (Some("b".to_string()), "m2".to_string())
+        );
+        // a bare name stays on the current provider
+        assert_eq!(
+            split_model_choice(&cfg, Some("a"), "gpt-4o"),
+            (Some("a".to_string()), "gpt-4o".to_string())
+        );
+        // an unknown prefix is not a provider switch
+        assert_eq!(
+            split_model_choice(&cfg, Some("a"), "nope/model"),
+            (Some("a".to_string()), "nope/model".to_string())
+        );
+    }
+
+    #[test]
+    fn multiline_input_navigates_its_own_lines() {
+        let mut i = Input::default();
+        i.insert_str("first line\nsecond\nthird");
+        assert_eq!(i.line_count(), 3);
+        assert_eq!(i.caret_line_index(), 2, "caret starts on the last line");
+
+        i.up();
+        assert_eq!(i.caret_line_index(), 1);
+        assert_eq!(i.caret_col(), 5, "column kept across lines");
+        i.up();
+        assert_eq!(i.caret_line_index(), 0);
+        i.up();
+        assert_eq!(i.caret_line_index(), 0, "clamped at the first line");
+
+        i.down();
+        i.down();
+        assert_eq!(i.caret_line_index(), 2);
+        i.down();
+        assert_eq!(i.caret_line_index(), 2, "clamped at the last line");
+
+        i.home_line();
+        assert_eq!(i.caret_col(), 0);
+        i.end_line();
+        assert_eq!(i.caret_col(), "third".chars().count());
+
+        let task = i.submit().expect("multi-line task submits whole");
+        assert_eq!(task, "first line\nsecond\nthird");
+    }
+
+    #[test]
+    fn newline_inserts_and_line_count_tracks() {
+        let mut i = Input::default();
+        i.insert_str("a");
+        i.newline();
+        i.insert_str("b");
+        assert_eq!(i.text, "a\nb");
+        assert_eq!(i.line_count(), 2);
+        assert_eq!(i.caret_line_index(), 1);
+        i.backspace(); // 'b'
+        i.backspace(); // the newline itself
+        assert_eq!(i.text, "a");
+        assert_eq!(i.line_count(), 1);
+    }
+
+    #[test]
+    fn multiline_input_renders_every_row() {
+        let mut s = Screen::new("deepseek", "sess", 10);
+        s.input.insert_str("alpha\nbeta");
+        let mut term = Terminal::new(TestBackend::new(48, 12)).unwrap();
+        term.draw(|f| s.draw(f)).unwrap();
+        let rows = frame_rows(&term);
+        assert!(rows.iter().any(|r| r.contains("kazi> alpha")), "{rows:#?}");
+        assert!(
+            rows.iter().any(|r| r.contains(" beta")),
+            "the second line needs its own row: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn busy_status_shows_mode_spinner_and_elapsed() {
+        let mut s = Screen::new("deepseek", "sess", 10);
+        s.busy = true;
+        s.started.set(Some(std::time::Instant::now()));
+        let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        term.draw(|f| s.draw(f)).unwrap();
+        let status = frame_rows(&term).into_iter().next().unwrap();
+        assert!(status.contains("[edit]"), "mode tag first: {status}");
+        assert!(status.contains("0s"), "elapsed time shown: {status}");
+    }
+
+    #[test]
+    fn scrolled_view_stays_put_while_output_grows() {
+        let mut s = Screen::new("p", "sess", 10);
+        for i in 0..40 {
+            s.push(LineKind::Dim, format!("line {i}"));
+        }
+        let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        term.draw(|f| s.draw(f)).unwrap();
+        let first_row = |term: &Terminal<TestBackend>| {
+            frame_rows(term)
+                .into_iter()
+                .find(|r| r.contains("line "))
+                .unwrap_or_default()
+        };
+
+        s.scroll_up(5);
+        term.draw(|f| s.draw(f)).unwrap();
+        let before = first_row(&term);
+        assert!(!before.is_empty());
+
+        // new output arrives while the reader is scrolled back
+        s.push(LineKind::Dim, "line 40".to_string());
+        term.draw(|f| s.draw(f)).unwrap();
+        assert_eq!(
+            first_row(&term),
+            before,
+            "the viewport must not slide under the reader"
+        );
+    }
+
+    #[test]
+    fn transcript_is_bounded() {
+        let mut s = Screen::new("p", "sess", 10);
+        for i in 0..(Screen::MAX_LINES + 50) {
+            s.push(LineKind::Dim, format!("l{i}"));
+        }
+        assert_eq!(s.lines.len(), Screen::MAX_LINES);
+        assert!(
+            s.lines.first().unwrap().1.starts_with("l50"),
+            "oldest rows are dropped first"
+        );
+    }
+
     #[tokio::test]
     async fn tui_approver_round_trips_and_remembers() {
         use std::sync::Arc;
@@ -2111,18 +3012,42 @@ mod tests {
         ask.reply.send(Decision::AllowSession).expect("ui replies");
         assert_eq!(task1.await.unwrap(), Decision::Allow);
 
-        // same command prefix afterwards: no question, straight allow
+        // the exact same command afterwards: no question, straight allow
         assert_eq!(
-            approver.decide("run_command", "$ git log --oneline").await,
+            approver.decide("run_command", "$ git status").await,
             Decision::Allow
         );
 
-        // a different command still asks, and deny is honoured
+        // a different command still asks — "always" is per command, not per
+        // binary (approving `git status` must never clear `git push --force`)
         let a2 = approver.clone();
-        let task2 = tokio::spawn(async move { a2.decide("run_command", "$ cargo test").await });
-        let ask2 = rx.recv().await.expect("second ask");
-        ask2.reply.send(Decision::Deny).expect("ui replies");
-        assert_eq!(task2.await.unwrap(), Decision::Deny);
+        let task2 =
+            tokio::spawn(async move { a2.decide("run_command", "$ git log --oneline").await });
+        let ask2 = rx.recv().await.expect("different command asks");
+        ask2.reply.send(Decision::Deny(None)).expect("ui replies");
+        assert_eq!(task2.await.unwrap(), Decision::Deny(None));
+    }
+
+    #[tokio::test]
+    async fn shared_session_allows_survive_agent_rebuilds() {
+        use std::sync::Arc;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalAsk>();
+        let allows = SessionAllows::default();
+        let first = Arc::new(TuiApprover::with_allows(tx.clone(), allows.clone()));
+
+        let a1 = first.clone();
+        let task1 = tokio::spawn(async move { a1.decide("run_command", "$ cargo test").await });
+        let ask = rx.recv().await.expect("ask delivered");
+        ask.reply.send(Decision::AllowSession).expect("ui replies");
+        assert_eq!(task1.await.unwrap(), Decision::Allow);
+
+        // a rebuilt agent gets a fresh approver over the SAME set
+        let rebuilt = TuiApprover::with_allows(tx, allows);
+        assert_eq!(
+            rebuilt.decide("run_command", "$ cargo test").await,
+            Decision::Allow,
+            "an /model or /provider switch must not forget session approvals"
+        );
     }
 
     /// An agent over a script-less mock provider: enough for commands that
@@ -2166,10 +3091,14 @@ mod tests {
         let mut screen = Screen::new("stub-provider", "sess", 5);
         let perm = crate::tools::Permission::default();
         let save = |_: &str, _: &Agent| {};
+        let allows = SessionAllows::default();
+        let (switch_tx, _switch_rx) = tokio::sync::mpsc::unbounded_channel::<SwitchDone>();
 
         for cmd in [
             "help",
             "status",
+            "auth",
+            "last",
             "context",
             "tools",
             "undo",
@@ -2181,7 +3110,18 @@ mod tests {
             "definitely-not-a-command",
             "new demo",
         ] {
-            run_command(cmd, &mut screen, &slot, &mut sess, &tx, &perm, &save).await;
+            run_command(
+                cmd,
+                &mut screen,
+                &slot,
+                &mut sess,
+                &tx,
+                &allows,
+                &perm,
+                &switch_tx,
+                &save,
+            )
+            .await;
         }
 
         let text = screen
@@ -2192,6 +3132,8 @@ mod tests {
             .join("\n");
         assert!(text.contains("show this help"), "help:\n{text}");
         assert!(text.contains("provider/model:"), "status:\n{text}");
+        assert!(text.contains("auth — provider"), "auth:\n{text}");
+        assert!(text.contains("no tool output"), "last:\n{text}");
         assert!(text.contains("context estimate"), "context:\n{text}");
         assert!(
             text.contains("permission mode -> read-only"),

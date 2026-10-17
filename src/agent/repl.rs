@@ -28,7 +28,7 @@ use rustyline::{CompletionType, Config as RlConfig, Context, Editor, Helper, Res
 
 use crate::agent::{context::History, session, Agent, AgentError, AgentEvent};
 use crate::config::Config;
-use crate::tools::{Approver, Decision};
+use crate::tools::{checkpoint, Approver, Decision};
 
 const CYAN: &str = "\x1b[36m";
 const DIM: &str = "\x1b[2m";
@@ -39,20 +39,60 @@ const RESET: &str = "\x1b[0m";
 
 /// Undo the last task's file changes via the agent's checkpoint store.
 /// Shared by the REPL and the TUI.
-pub fn undo_last_task(agent: &Agent) -> std::io::Result<Option<usize>> {
+pub fn undo_last_task(agent: &Agent) -> std::io::Result<checkpoint::UndoOutcome> {
     match &agent.ctx.checkpointing {
         Some(cp) => cp.undo_latest(),
-        None => Ok(None),
+        None => Ok(checkpoint::UndoOutcome::Nothing),
     }
 }
 
+/// Listing cap for the undo report — a big refactor can touch many files.
+const UNDO_LIST_CAP: usize = 25;
+
 /// `/undo` — text both front-ends print.
 pub fn undo_text(agent: &Agent) -> String {
-    match undo_last_task(agent) {
-        Ok(Some(n)) => format!("restored {n} file(s) from the last task's checkpoint"),
-        Ok(None) => "nothing to undo (no checkpointed task yet)".to_string(),
-        Err(e) => format!("undo failed: {e}"),
+    let done = match undo_last_task(agent) {
+        Ok(checkpoint::UndoOutcome::Nothing) => {
+            return "nothing to undo (no checkpointed task yet)".to_string()
+        }
+        Ok(checkpoint::UndoOutcome::AlreadyUndone) => {
+            return "nothing to undo (the last task's checkpoint was already restored)".to_string()
+        }
+        Ok(checkpoint::UndoOutcome::Replayed(done)) => done,
+        Err(e) => return format!("undo failed: {e}"),
+    };
+    if done.restored.is_empty() && done.removed.is_empty() && done.failed.is_empty() {
+        return "nothing to undo (the last task changed no files)".to_string();
     }
+    let mut out = format!(
+        "restored the last task's checkpoint — {} restored, {} removed{}",
+        done.restored.len(),
+        done.removed.len(),
+        if done.failed.is_empty() {
+            String::new()
+        } else {
+            format!(", {} failed", done.failed.len())
+        }
+    );
+    for (label, paths) in [
+        ("restored ", &done.restored),
+        ("removed  ", &done.removed),
+        ("failed   ", &done.failed),
+    ] {
+        for p in paths.iter().take(UNDO_LIST_CAP) {
+            out.push_str(&format!("\n  {label}{}", p.display()));
+        }
+        if paths.len() > UNDO_LIST_CAP {
+            out.push_str(&format!(
+                "\n  {label}… +{} more",
+                paths.len() - UNDO_LIST_CAP
+            ));
+        }
+    }
+    if !done.failed.is_empty() {
+        out.push_str("\n  (failed files stay undoable — /undo retries them)");
+    }
+    out
 }
 
 /// `/status` — provider, budget, usage, history size.
@@ -69,22 +109,254 @@ pub fn status_text(agent: &Agent) -> String {
     )
 }
 
-/// `/resume` with no argument: what is stored.
-pub fn sessions_text() -> String {
-    let have = session::list();
-    if have.is_empty() {
-        "no stored sessions yet — sessions save automatically after each task".to_string()
-    } else {
-        format!(
-            "stored sessions: {}\n{}",
-            have.join(", "),
-            usage_for("/resume")
-        )
+/// `/last [n]` argument: how many tool results back (default 1).
+pub fn parse_back(arg: &str) -> Option<usize> {
+    match arg.trim() {
+        "" => Some(1),
+        n => n.parse::<usize>().ok().filter(|n| *n >= 1),
     }
 }
 
-/// `/resume <prefix>`: load a stored session into the agent.
-pub async fn resume_text(agent: &mut Agent, prefix: &str) -> String {
+/// `/last [n]` — the newest tool output in full, `n` results back. The TUI
+/// only ever shows a one-line preview; this is how you audit what the model
+/// actually read.
+pub fn last_tool_text(agent: &Agent, back: usize) -> String {
+    const CAP_LINES: usize = 200;
+    const CAP_CHARS: usize = 12_000;
+    let msgs = &agent.history.msgs;
+
+    // tool call id → tool name, taken from the assistant turns that asked
+    let mut names: std::collections::HashMap<&str, &str> = Default::default();
+    for m in msgs {
+        for tc in &m.tool_calls {
+            names.insert(tc.id.as_str(), tc.name.as_str());
+        }
+    }
+    let tools: Vec<&crate::llm::Message> = msgs
+        .iter()
+        .filter(|m| m.role == crate::llm::Role::Tool)
+        .collect();
+    let total = tools.len();
+    if total == 0 {
+        return "no tool output in this session yet".to_string();
+    }
+    let back = back.max(1);
+    if back > total {
+        return format!("only {total} tool result(s) in this session");
+    }
+    let m = tools[total - back];
+    let name = m
+        .tool_call_id
+        .as_deref()
+        .and_then(|id| names.get(id).copied())
+        .unwrap_or("tool");
+    let mut text: String = m
+        .text()
+        .lines()
+        .take(CAP_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if m.text().lines().count() > CAP_LINES {
+        text.push_str("\n…[truncated]");
+    }
+    if text.chars().count() > CAP_CHARS {
+        text = text.chars().take(CAP_CHARS).collect::<String>() + "\n…[truncated]";
+    }
+    format!(
+        "tool output {back} of {total} — {name}{}\n{text}",
+        if m.is_error { " (ERROR)" } else { "" }
+    )
+}
+
+/// `/auth` — where the key for the active provider comes from, and the exact
+/// command that fixes a missing one. Read-only: values are never printed.
+pub fn auth_report(agent: &Agent, cfg: &Config) -> String {
+    let nick = agent.nick();
+    let mut out = format!("auth — provider `{nick}`\n");
+    if cfg.kind_of_nick(nick).ok() == Some(crate::llm::ProviderKind::Ollama) {
+        out.push_str("  local ollama provider — no key needed\n");
+        return out;
+    }
+    match cfg.key_sources(nick) {
+        Ok((env_name, env_ok, stored)) => {
+            out.push_str(&format!(
+                "  env {env_name}: {}\n",
+                if env_ok {
+                    "set ✓ (wins over a stored key)"
+                } else {
+                    "not set"
+                }
+            ));
+            out.push_str(&format!(
+                "  stored (kazi auth): {}\n",
+                if stored { "yes ✓" } else { "no" }
+            ));
+            if env_ok || stored {
+                out.push_str("  nothing to do — a key is available\n");
+            } else {
+                out.push_str(&format!(
+                    "  fix:   kazi auth set {nick}\n  or:    export {env_name}=...\n  then reconnect this session: /provider {nick}\n"
+                ));
+            }
+            if let Ok(path) = crate::auth::auth_path() {
+                out.push_str(&format!("  store: {}", path.display()));
+            }
+        }
+        Err(e) => out.push_str(&format!("  {e}\n")),
+    }
+    out
+}
+
+/// `/resume` with no argument: what is stored, newest first, with size and age.
+pub fn sessions_text() -> String {
+    let have = session::list_summaries();
+    if have.is_empty() {
+        return "no stored sessions yet — sessions save automatically after each task".to_string();
+    }
+    let mut out = String::from("stored sessions (newest first):\n");
+    for s in have.iter().take(20) {
+        let topic = s
+            .topic
+            .clone()
+            .unwrap_or_default()
+            .replace(['\n', '\r'], " ");
+        out.push_str(&format!(
+            "  {:<28} {:>4} msgs  {:>3}  {}\n",
+            s.name,
+            s.messages,
+            age_label(s.saved_at),
+            topic
+        ));
+    }
+    if have.len() > 20 {
+        out.push_str(&format!("  … +{} more\n", have.len() - 20));
+    }
+    out.push_str(&usage_for("/resume"));
+    out
+}
+
+/// Human age label for a save timestamp (`3m`, `4h`, `2d`).
+fn age_label(saved_at: u64) -> String {
+    let secs = session::now_secs().saturating_sub(saved_at);
+    match secs {
+        0..=59 => "now".to_string(),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+/// Every configured provider's candidate models as `nick/model` rows, current
+/// provider first — ONE list for provider + model, so switching both is a
+/// single choice. Static (config + built-in) for every provider plus a short
+/// parallel live probe each, capped so opening the picker never hangs.
+pub async fn all_model_choices(
+    cfg: &Config,
+    current_nick: Option<&str>,
+    current_model: Option<&str>,
+) -> Vec<String> {
+    const LIVE_CAP_MS: u64 = 1_200;
+    let nicks = cfg.nicks();
+    let fetches = nicks.iter().cloned().map(|nick| {
+        let cfg = cfg.clone();
+        async move {
+            let live = match cfg
+                .settings_for_nick(&nick)
+                .ok()
+                .and_then(|s| crate::llm::build_provider(&s).ok())
+            {
+                Some(p) => {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(LIVE_CAP_MS),
+                        p.list_models(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(m)) => m,
+                        _ => Vec::new(),
+                    }
+                }
+                None => Vec::new(),
+            };
+            (nick, live)
+        }
+    });
+    let live: Vec<(String, Vec<String>)> = futures::future::join_all(fetches).await;
+
+    // current provider first, then the rest in config order
+    let mut ordered: Vec<String> = Vec::new();
+    if let Some(cur) = current_nick.filter(|c| nicks.iter().any(|n| n == c)) {
+        ordered.push(cur.to_string());
+    }
+    ordered.extend(
+        nicks
+            .iter()
+            .filter(|n| Some(n.as_str()) != current_nick)
+            .cloned(),
+    );
+
+    let mut out: Vec<String> = Vec::new();
+    for nick in ordered {
+        let kind = cfg
+            .kind_of_nick(&nick)
+            .unwrap_or(crate::llm::ProviderKind::OpenAiCompat);
+        let provider_model = cfg.providers.get(&nick).and_then(|e| e.model.clone());
+        let active = if Some(nick.as_str()) == current_nick {
+            current_model.map(str::to_string).or(provider_model.clone())
+        } else {
+            provider_model.clone()
+        };
+        let live_models = live
+            .iter()
+            .find(|(n, _)| n == &nick)
+            .map(|(_, m)| m.clone())
+            .unwrap_or_default();
+        for m in crate::llm::merge_catalog(
+            &cfg.configured_models(&nick),
+            &live_models,
+            kind,
+            active.as_deref(),
+        ) {
+            let row = format!("{nick}/{m}");
+            if !out.contains(&row) {
+                out.push(row);
+            }
+        }
+    }
+    // hoist the exact current pick to the top of the list
+    if let (Some(n), Some(m)) = (current_nick, current_model) {
+        let cur = format!("{n}/{m}");
+        if let Some(i) = out.iter().position(|r| r == &cur) {
+            out.remove(i);
+            out.insert(0, cur);
+        }
+    }
+    out
+}
+
+/// The single command a partial name (`/mod`) refers to, if unambiguous — so
+/// Enter on a half-typed command runs the one the user meant.
+pub fn unique_prefix_command(token: &str) -> Option<String> {
+    let mut hits = COMMANDS.iter().filter(|c| c.name.starts_with(token));
+    let first = hits.next()?;
+    if hits.next().is_some() {
+        return None; // ambiguous: let the caller list the candidates
+    }
+    Some(first.name.to_string())
+}
+
+/// Session names matching a (possibly partial) prefix, newest first.
+fn matching_sessions(prefix: &str) -> Vec<String> {
+    session::list()
+        .into_iter()
+        .filter(|n| n.starts_with(prefix))
+        .collect()
+}
+
+/// `/resume <prefix>`: load a stored session into the agent. Returns the
+/// resolved session name (so the caller repoints auto-save at it) plus the
+/// text both front-ends print.
+pub async fn resume_text(agent: &mut Agent, prefix: &str) -> (Option<String>, String) {
     match session::resolve(prefix) {
         Some(name) => match super::session::load(&name) {
             Ok(file) => {
@@ -92,21 +364,34 @@ pub async fn resume_text(agent: &mut Agent, prefix: &str) -> String {
                 agent.history = History::new(sys);
                 agent.history.msgs = file.messages;
                 let count = agent.history.msgs_len();
-                format!("loaded {name} ({count} messages)")
+                (
+                    Some(name.clone()),
+                    format!("loaded {name} ({count} messages) — auto-save now targets `{name}`"),
+                )
             }
-            Err(e) => format!("resume failed: {e}"),
+            Err(e) => (None, format!("resume failed: {e}")),
         },
         None => {
-            let have = session::list().join(", ");
-            format!("no stored session matches `{prefix}` (stored: {have})")
+            let matches = matching_sessions(prefix);
+            let text = if matches.len() > 1 {
+                format!(
+                    "`{prefix}` is ambiguous — {} sessions match: {}",
+                    matches.len(),
+                    matches.join(", ")
+                )
+            } else {
+                format!("no stored session matches `{prefix}` (bare /resume lists them)")
+            };
+            (None, text)
         }
     }
 }
 
-/// `/compact` — squeeze the dropped turns into a system-prompt summary.
-pub async fn compact_text(agent: &mut Agent) -> String {
-    match agent.compact().await {
-        Ok(note) => format!("{note} (est. {} tokens)", agent.history.estimate_tokens()),
+/// `/compact [force]` — squeeze the oldest messages into a system-prompt
+/// summary. Without `force` it acts only when the context is over budget.
+pub async fn compact_text(agent: &mut Agent, force: bool) -> String {
+    match agent.compact(force).await {
+        Ok(note) => note,
         Err(e) => format!("compact failed: {e}"),
     }
 }
@@ -119,8 +404,142 @@ pub fn usage_for(verb: &str) -> String {
     }
 }
 
+/// Path of the shared input-history file (used by BOTH front-ends).
+pub fn history_path() -> Option<std::path::PathBuf> {
+    dirs::data_dir().map(|d| d.join("kazi").join("history.txt"))
+}
+
+/// One history entry → one file line (multi-line tasks escape their breaks).
+fn encode_history_entry(line: &str) -> String {
+    line.trim().replace('\n', "\\n")
+}
+
+/// One file line → one history entry.
+fn decode_history_entry(line: &str) -> String {
+    line.replace("\\n", "\n")
+}
+
+/// Persisted input history, oldest first, capped to the newest entries.
+/// Multi-line entries are stored with `\n` escaped so one task stays one line.
+pub fn load_input_history() -> Vec<String> {
+    const LIMIT: usize = 500;
+    let Some(path) = history_path() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut lines: Vec<String> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(decode_history_entry)
+        .collect();
+    if lines.len() > LIMIT {
+        lines.drain(0..lines.len() - LIMIT);
+    }
+    lines
+}
+
+/// Append one submitted task to the shared history file (best-effort, no
+/// consecutive duplicates, file stays bounded).
+pub fn remember_input(line: &str) {
+    const LIMIT: usize = 500;
+    let Some(path) = history_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let entry = encode_history_entry(line);
+    if entry.is_empty() {
+        return;
+    }
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    if text.lines().next_back() == Some(entry.as_str()) {
+        return;
+    }
+    text.push_str(&entry);
+    text.push('\n');
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() > LIMIT * 2 {
+        text = format!("{}\n", lines[lines.len() - LIMIT..].join("\n"));
+    }
+    let _ = std::fs::write(&path, text);
+}
+
+/// Filesystem completion for an unfinished `@path` token: `(token_start_byte,
+/// replacements)`. Directories gain a trailing `/` so completion can continue;
+/// dotfiles only show up when the user typed a leading dot.
+pub fn at_path_completions(line: &str, pos: usize) -> Option<(usize, Vec<String>)> {
+    let head = &line[..pos.min(line.len())];
+    let token_start = head.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+    let partial = head[token_start..].strip_prefix('@')?;
+    if partial.contains(char::is_whitespace) {
+        return None;
+    }
+    let (dir_part, name_part) = match partial.rfind(['/', '\\']) {
+        Some(i) => (&partial[..=i], &partial[i + 1..]),
+        None => ("", partial),
+    };
+    let base = if dir_part.is_empty() {
+        std::path::PathBuf::from(".")
+    } else {
+        std::path::PathBuf::from(dir_part)
+    };
+    let mut out: Vec<String> = Vec::new();
+    for e in std::fs::read_dir(&base).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.starts_with(name_part) {
+            continue;
+        }
+        if name.starts_with('.') && !name_part.starts_with('.') {
+            continue;
+        }
+        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        // platform separator: a Windows path completed with `/` reads wrong
+        let suffix = if is_dir {
+            std::path::MAIN_SEPARATOR.to_string()
+        } else {
+            String::new()
+        };
+        out.push(format!("@{dir_part}{name}{suffix}"));
+    }
+    out.sort();
+    out.truncate(50);
+    if out.is_empty() {
+        None
+    } else {
+        Some((token_start, out))
+    }
+}
+
+/// Apply `@path` completion to a line: a single match is inserted whole, several
+/// matches extend to their longest common prefix. `None` = nothing to add.
+pub fn complete_at_path(line: &str, pos: usize) -> Option<String> {
+    let (start, cands) = at_path_completions(line, pos)?;
+    let current = &line[start..pos.min(line.len())];
+    let replacement = if cands.len() == 1 {
+        cands.into_iter().next()?
+    } else {
+        let mut prefix = cands[0].clone();
+        for c in &cands[1..] {
+            let n = prefix
+                .chars()
+                .zip(c.chars())
+                .take_while(|(a, b)| a == b)
+                .count();
+            prefix = prefix.chars().take(n).collect();
+        }
+        prefix
+    };
+    if replacement == current {
+        return None;
+    }
+    Some(format!("{}{}", &line[..start], replacement))
+}
+
 /// `/provider` with no argument: what is configured, as a numbered picker.
-pub fn providers_text(cfg: &Config) -> String {
+pub fn providers_text(cfg: &Config, current: Option<&str>) -> String {
     let nicks = cfg.nicks();
     let mut out = String::from("configured providers:\n");
     for (i, nick) in nicks.iter().enumerate() {
@@ -129,21 +548,42 @@ pub fn providers_text(cfg: &Config) -> String {
             .get(nick)
             .and_then(|e| e.model.clone())
             .unwrap_or_else(|| "(no model set)".to_string());
-        out.push_str(&format!("  {}) {nick:<14} model={model}\n", i + 1));
+        let mark = if Some(nick.as_str()) == current {
+            "  <- current"
+        } else {
+            ""
+        };
+        out.push_str(&format!("  {}) {nick:<14} model={model}{mark}\n", i + 1));
     }
     out.push_str(&usage_for("/provider"));
     out
 }
 
-/// Numbered model list for `/model` with no argument.
-pub fn models_text(nick: &str, models: &[String], current: Option<&str>) -> String {
+/// `/model <name|#>`: a number indexes the candidate list bare `/model` prints;
+/// a bare number with no usable list is an error, not a literal model name
+/// (which used to be probed as a model actually called "2").
+pub fn resolve_model_arg(arg: &str, models: &[String]) -> Result<String, String> {
+    match arg.parse::<usize>() {
+        Ok(n) => match n.checked_sub(1).and_then(|i| models.get(i)) {
+            Some(m) => Ok(m.clone()),
+            None => Err(format!(
+                "no model #{n} in the list — run /model to see the numbered candidates"
+            )),
+        },
+        Err(_) => Ok(arg.to_string()),
+    }
+}
+
+/// Numbered model list for `/model` with no argument (the header names what the
+/// rows are — `provider/model` for the combined list).
+pub fn models_text(header: &str, models: &[String], current: Option<&str>) -> String {
     if models.is_empty() {
         return format!(
-            "no model candidates for `{nick}` — type a name instead ({})",
+            "no model candidates — type a name instead ({})",
             usage_for("/model")
         );
     }
-    let mut out = format!("models for {nick}:\n");
+    let mut out = format!("{header}:\n");
     for (i, m) in models.iter().enumerate() {
         let mark = if Some(m.as_str()) == current {
             "  <- current"
@@ -230,7 +670,8 @@ pub fn unknown_command_text(verb: &str) -> String {
     format!("unknown command `{verb}` — {hint}")
 }
 
-/// `/context`: where the estimated tokens go right now.
+/// `/context`: where the estimated tokens go right now, plus what the
+/// automatic machinery will do next — the numbers a user actually asks about.
 pub fn context_report(agent: &Agent) -> String {
     let h = &agent.history;
     let sys = h
@@ -245,12 +686,27 @@ pub fn context_report(agent: &Agent) -> String {
         .iter()
         .map(|t| (t.name.len() + t.description.len() + t.parameters.to_string().len()) as u64 / 4)
         .sum();
+    let budget = agent.max_context_tokens().max(1);
+    let total = sys + hist + tools;
+    let summary_blocks = h
+        .system
+        .as_deref()
+        .map(|s| {
+            s.matches("[Context summary of dropped conversation turns]")
+                .count()
+        })
+        .unwrap_or(0);
+    let summary_note = match summary_blocks {
+        0 => String::new(),
+        1 => " (1 compaction summary inside)".to_string(),
+        n => format!(" ({n} compaction summaries inside)"),
+    };
     format!(
-        "context estimate:\n  system   ~{sys} tokens\n  history  ~{hist} tokens ({} messages)\n  tools    ~{tools} tokens ({} in catalog)\n  total    ~{} / {} token budget",
+        "context estimate:\n  system   ~{sys} tokens{summary_note}\n  history  ~{hist} tokens ({} messages)\n  tools    ~{tools} tokens ({} in catalog)\n  total    ~{total} / {budget} token budget ({}%)\n  auto-compact fires at {}% of the budget; over-budget rounds are plain-trimmed oldest-first, /compact replaces the trimmed part with a summary",
         h.msgs_len(),
         specs.len(),
-        sys + hist + tools,
-        agent.max_context_tokens()
+        total * 100 / budget,
+        Agent::compact_threshold_percent()
     )
 }
 
@@ -268,7 +724,9 @@ fn decision_from_input(input: &str) -> Decision {
     match input.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" => Decision::Allow,
         "a" | "always" => Decision::AllowSession,
-        _ => Decision::Deny,
+        "" | "n" | "no" => Decision::Deny(None),
+        // anything else is a reason to hand to the model
+        _ => Decision::Deny(Some(input.trim().to_string())),
     }
 }
 
@@ -287,7 +745,7 @@ impl Approver for StdinApprover {
             return Decision::Allow;
         }
         print!(
-            "\n{YELLOW}[{tool}] requests approval{RESET}\n{summary}\napprove? [y] once  [a] always (session)  [N] no "
+            "\n{YELLOW}[{tool}] requests approval{RESET}\n{summary}\napprove? [y] once  [a] always (session)  [n] no  — or type a reason to decline with it: "
         );
         let _ = std::io::stdout().flush();
         let mut line = String::new();
@@ -362,6 +820,8 @@ pub fn render_event(ev: &AgentEvent) {
 enum ArgKind {
     /// no argument
     No,
+    /// optional flag word (`/compact force`)
+    Flag,
     /// optional topic/name; empty → timestamped default
     Topic,
     /// stored-session prefix; TAB lists stored sessions
@@ -372,6 +832,8 @@ enum ArgKind {
     Model,
     /// `on | off`; empty toggles
     Toggle,
+    /// permission mode name; TAB lists the three modes
+    Permission,
 }
 
 /// One row of the command table.
@@ -422,9 +884,9 @@ const COMMANDS: &[CmdSpec] = &[
     },
     CmdSpec {
         name: "/compact",
-        args: "",
-        help: "drop oldest turns under the context budget",
-        arg: ArgKind::No,
+        args: "[force]",
+        help: "summarize old turns away (only over budget; force = always)",
+        arg: ArgKind::Flag,
     },
     CmdSpec {
         name: "/resume",
@@ -454,7 +916,7 @@ const COMMANDS: &[CmdSpec] = &[
         name: "/permission",
         args: "[read-only|edit|yolo]",
         help: "show or set the permission mode",
-        arg: ArgKind::No,
+        arg: ArgKind::Permission,
     },
     CmdSpec {
         name: "/context",
@@ -471,7 +933,19 @@ const COMMANDS: &[CmdSpec] = &[
     CmdSpec {
         name: "/status",
         args: "",
-        help: "provider, model, rounds, usage, session",
+        help: "provider, model, rounds, usage",
+        arg: ArgKind::No,
+    },
+    CmdSpec {
+        name: "/last",
+        args: "[n]",
+        help: "show the newest tool output in full (n = how many back)",
+        arg: ArgKind::Flag,
+    },
+    CmdSpec {
+        name: "/auth",
+        args: "",
+        help: "where the current provider's API key comes from",
         arg: ArgKind::No,
     },
 ];
@@ -504,6 +978,13 @@ fn usage_line(spec: &CmdSpec) -> String {
     } else {
         format!("usage: {} {}", spec.name, spec.args)
     }
+}
+
+/// `Some(usage_line)` when a command that takes NO argument was given one —
+/// `/undo 3` used to silently undo one task.
+pub fn no_arg_violation(verb: &str, arg: &str) -> Option<String> {
+    let spec = spec_of(verb)?;
+    (spec.arg == ArgKind::No && !arg.is_empty()).then(|| usage_line(spec))
 }
 
 /// Completion rows for a partially typed command (`token` includes the
@@ -615,7 +1096,22 @@ impl Completer for SlashHelper {
     type Candidate = Pair;
 
     fn complete(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> RlResult<(usize, Vec<Pair>)> {
-        Ok(self.completions(line, pos).unwrap_or((pos, Vec::new())))
+        if let Some(hit) = self.completions(line, pos) {
+            return Ok(hit);
+        }
+        // `@src/age<TAB>` — attachment paths are a first-class feature, so the
+        // completion must not stop at slash commands
+        if let Some((start, cands)) = at_path_completions(line, pos) {
+            let pairs = cands
+                .into_iter()
+                .map(|c| Pair {
+                    display: c.clone(),
+                    replacement: c,
+                })
+                .collect();
+            return Ok((start, pairs));
+        }
+        Ok((pos, Vec::new()))
     }
 }
 
@@ -681,6 +1177,14 @@ impl SlashHelper {
                     replacement: t.to_string(),
                 })
                 .collect(),
+            ArgKind::Permission => ["read-only", "edit", "yolo"]
+                .into_iter()
+                .filter(|t| t.starts_with(token))
+                .map(|t| Pair {
+                    display: t.to_string(),
+                    replacement: t.to_string(),
+                })
+                .collect(),
             _ => Vec::new(),
         };
         Some((word_start, cands))
@@ -718,6 +1222,8 @@ impl Hinter for SlashHelper {
                 spec.args,
                 if self.yolo { "on" } else { "off" }
             ),
+            ArgKind::Permission => format!(" {} — one of: read-only, edit, yolo", spec.args),
+            ArgKind::Flag => format!(" {}", spec.args),
             _ => format!(" {}", spec.args),
         })
     }
@@ -809,6 +1315,7 @@ impl ChatState {
         &mut self.session_name
     }
 
+    /// Initial build (once at startup): fresh tool registry + MCP servers.
     async fn rebuild(&self) -> anyhow::Result<LiveAgent> {
         Agent::default_cli_mode(
             &self.cfg,
@@ -818,6 +1325,22 @@ impl ChatState {
         )
         .await
         .map(|agent| LiveAgent { agent })
+    }
+
+    /// Switch provider/model around the live agent: same tool registry (no MCP
+    /// re-handshake) with the new provider/model/permission.
+    async fn rebuild_from(&self, live: &LiveAgent) -> anyhow::Result<LiveAgent> {
+        let approver = super::approver(self.mode == crate::tools::PermissionMode::Yolo);
+        live.agent
+            .rebuilt_with(
+                &self.cfg,
+                self.provider.as_deref(),
+                self.model.as_deref(),
+                approver,
+                self.mode,
+            )
+            .await
+            .map(|agent| LiveAgent { agent })
     }
 }
 
@@ -922,14 +1445,17 @@ pub async fn chat_loop(
                 Ok(count) => println!("{DIM}resumed `{n}` ({count} messages){RESET}"),
                 Err(e) => println!("{YELLOW}cannot resume `{n}`: {e}{RESET}"),
             },
-            None => println!("{YELLOW}no stored session matches `{name}`{RESET}"),
+            None => println!(
+                "{YELLOW}no stored session matches `{name}` — starting a NEW session named `{name}`{RESET}"
+            ),
         }
     }
     let banner_provider = live.describe();
     println!(
-        "{CYAN}kazi{RESET} v{} — {banner_provider}{DIM}\nsession: {}{RESET}\n{DIM}{}{RESET}",
+        "{CYAN}kazi{RESET} v{} — {banner_provider}{DIM}\nsession: {}   mode: {} — /permission to change{RESET}\n{DIM}{}{RESET}",
         env!("CARGO_PKG_VERSION"),
         state.session_name,
+        state.mode.as_str(),
         help_text().trim_end()
     );
 
@@ -937,6 +1463,10 @@ pub async fn chat_loop(
         .completion_type(CompletionType::List)
         .build();
     let mut rl: Editor<SlashHelper, DefaultHistory> = Editor::with_config(rl_cfg)?;
+    // shared, persisted history: ↑ after a restart recalls the last tasks
+    for entry in load_input_history() {
+        let _ = rl.add_history_entry(&entry);
+    }
     rl.set_helper(Some(SlashHelper {
         nicks: state.cfg.nicks(),
         model: state.model.clone(),
@@ -945,7 +1475,14 @@ pub async fn chat_loop(
     }));
 
     loop {
-        let line = match rl.readline("kazi> ") {
+        // the mode rides in the prompt: a `--yolo` session must never look
+        // like a prompting one
+        let prompt = match state.mode {
+            crate::tools::PermissionMode::ReadOnly => "kazi[ro]> ",
+            crate::tools::PermissionMode::Yolo => "kazi[yolo]> ",
+            crate::tools::PermissionMode::Edit => "kazi> ",
+        };
+        let line = match rl.readline(prompt) {
             Ok(l) => l,
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
             Err(e) => {
@@ -988,6 +1525,7 @@ pub async fn chat_loop(
             continue;
         }
         let _ = rl.add_history_entry(&line);
+        remember_input(&line);
 
         if line.starts_with('/') {
             // pass the full line (with '/') — match arms key on the slash form
@@ -1025,7 +1563,8 @@ pub async fn chat_loop(
                 );
             }
             Err(AgentError::Provider(e)) => {
-                println!("\n{RED}{e}{RESET}");
+                let text = live.agent.error_text(&AgentError::Provider(e));
+                println!("\n{RED}{text}{RESET}");
                 let _ = session::save(
                     &state.session_name,
                     live.history().system.as_deref(),
@@ -1068,12 +1607,28 @@ impl Flow {
 }
 
 async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) -> Flow {
-    let (verb, arg) = cmd
+    let verb = cmd.split_once(' ').map(|(a, _)| a).unwrap_or(cmd);
+    let arg = cmd
         .split_once(' ')
-        .map(|(a, b)| (a, b.trim()))
-        .unwrap_or((cmd, ""));
+        .map(|(_, b)| b.trim())
+        .unwrap_or("")
+        .to_string();
+    // `/Undo` must behave like `/undo`: the table is lowercase
+    let verb_key = verb.to_ascii_lowercase();
+    // a half-typed command (`/mod`) completes to its unique match: Enter means
+    // "run the one I clearly meant"
+    let verb_key = match spec_of(&verb_key) {
+        Some(_) => verb_key,
+        None => unique_prefix_command(&verb_key).unwrap_or(verb_key),
+    };
 
-    match (verb, arg) {
+    // `/undo 3` and friends: explain instead of silently ignoring the argument
+    if let Some(usage) = no_arg_violation(&verb_key, &arg) {
+        println!("{YELLOW}{usage}{RESET}");
+        return Flow::Continue;
+    }
+
+    match (verb_key.as_str(), arg.as_str()) {
         ("/help", _) => println!("{}", help_text()),
         ("/undo", _) => println!("{}", undo_text(&live.agent)),
         ("/context", _) => println!("{}", context_report(&live.agent)),
@@ -1091,19 +1646,44 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
             *state.session_name_mut() = name;
             println!("{note}");
         }
-        ("/compact", _) => println!("{}", compact_text(&mut live.agent).await),
+        ("/compact", arg) => {
+            let force = match arg {
+                "" => false,
+                "force" | "--force" | "f" => true,
+                _ => {
+                    println!(
+                        "{YELLOW}{}{RESET}",
+                        usage_line(spec_of("/compact").unwrap())
+                    );
+                    return Flow::Continue;
+                }
+            };
+            println!("{}", compact_text(&mut live.agent, force).await);
+        }
         ("/status", _) => println!("{}", status_text(&live.agent)),
+        ("/last", arg) => match parse_back(arg) {
+            Some(back) => println!("{}", last_tool_text(&live.agent, back)),
+            None => println!("{YELLOW}{}{RESET}", usage_line(spec_of("/last").unwrap())),
+        },
+        ("/auth", _) => println!("{}", auth_report(&live.agent, &state.cfg)),
         ("/tools", _) => println!("{}", live.agent.registry().catalog()),
         ("/resume", prefix) => {
             if prefix.is_empty() {
                 println!("{}", sessions_text());
             } else {
-                println!("{}", resume_text(&mut live.agent, prefix).await);
+                // resolve before printing: auto-save must follow the session
+                // we just loaded, not the one this chat started in
+                let (name, text) = resume_text(&mut live.agent, prefix).await;
+                if let Some(name) = name {
+                    *state.session_name_mut() = name;
+                }
+                println!("{text}");
             }
         }
         ("/provider", arg) => {
             if arg.is_empty() {
-                println!("{}", providers_text(&state.cfg));
+                let current = effective_nick(&state.cfg, &state.provider, &state.model);
+                println!("{}", providers_text(&state.cfg, current.as_deref()));
             } else {
                 let nicks = state.cfg.nicks();
                 let nick = match listed_index(arg, nicks.len()) {
@@ -1116,9 +1696,15 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
                 // new one — drop it and the now-stale candidate cache
                 next.model = None;
                 next.models.clear();
-                match next.rebuild().await {
-                    Ok(new) => {
-                        println!("switched -> {}", new.describe());
+                match next.rebuild_from(live).await {
+                    Ok(mut new) => {
+                        // a provider switch changes the wire, not the conversation
+                        new.agent.history =
+                            std::mem::replace(&mut live.agent.history, History::new(None));
+                        println!(
+                            "switched -> {}{DIM}\n(/model picks provider and model in one step){RESET}",
+                            new.describe()
+                        );
                         *state = next;
                         *live = new;
                     }
@@ -1136,27 +1722,42 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
                         .ok()
                         .map(|r| r.settings.model)
                 });
-                state.models = match &nick {
-                    Some(n) => model_catalog(&state.cfg, n, current.as_deref()).await,
-                    None => Vec::new(),
+                println!("{DIM}checking the configured providers for their model lists…{RESET}");
+                state.models =
+                    all_model_choices(&state.cfg, nick.as_deref(), current.as_deref()).await;
+                let current_row = match (nick.as_deref(), current.as_deref()) {
+                    (Some(n), Some(m)) => Some(format!("{n}/{m}")),
+                    _ => None,
                 };
                 println!(
                     "{}",
                     models_text(
-                        nick.as_deref().unwrap_or("(none)"),
+                        "providers / models (one step: pick a row to switch both)",
                         &state.models,
-                        current.as_deref()
+                        current_row.as_deref()
                     )
                 );
             } else {
-                // a bare number indexes the list printed by bare `/model`
-                let chosen = match listed_index(arg, state.models.len()) {
-                    Some(i) => state.models[i].clone(),
-                    None => arg.to_string(),
+                // a number indexes the list bare `/model` printed; a bad number
+                // is an error, never a literal model name
+                let chosen = match resolve_model_arg(arg, &state.models) {
+                    Ok(m) => m,
+                    Err(msg) => {
+                        println!("{YELLOW}{msg}{RESET}");
+                        return Flow::Continue;
+                    }
+                };
+                // a combined `nick/model` row switches provider AND model
+                let (provider, model) = match chosen.split_once('/') {
+                    Some((nick, m)) if state.cfg.providers.contains_key(nick) => {
+                        (Some(nick.to_string()), m.to_string())
+                    }
+                    _ => (state.provider.clone(), chosen.clone()),
                 };
                 let mut next = state.clone();
-                next.model = Some(chosen);
-                match next.rebuild().await {
+                next.provider = provider;
+                next.model = Some(model);
+                match next.rebuild_from(live).await {
                     Ok(mut new) => {
                         // Dry-run before committing: a wrong model name only
                         // fails at the next API call otherwise (HTTP 4xx with
@@ -1165,6 +1766,12 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
                         // current live agent untouched.
                         match new.agent.probe().await {
                             Ok(()) => {
+                                // keep the conversation: switching the model
+                                // must not silently start from scratch
+                                new.agent.history = std::mem::replace(
+                                    &mut live.agent.history,
+                                    History::new(None),
+                                );
                                 println!("switched -> {}", new.describe());
                                 *state = next;
                                 *live = new;
@@ -1196,26 +1803,19 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
                     return Flow::Continue;
                 }
             };
-            let prev = state.mode;
             state.mode = next;
-            match state.rebuild().await {
-                Ok(new) => {
-                    *live = new;
-                    println!(
-                        "permission mode: {GREEN}{}{RESET} ({})",
-                        state.mode.as_str(),
-                        if state.mode == PermissionMode::Yolo {
-                            "run_command executes without prompts"
-                        } else {
-                            "run_command asks for approval"
-                        }
-                    );
+            // flip the shared permission cell in place: rebuilding the agent
+            // here used to throw the whole conversation away
+            live.agent.ctx.permission.set(next);
+            println!(
+                "permission mode: {GREEN}{}{RESET} ({})",
+                state.mode.as_str(),
+                if state.mode == PermissionMode::Yolo {
+                    "run_command executes without prompts"
+                } else {
+                    "run_command asks for approval"
                 }
-                Err(e) => {
-                    state.mode = prev; // roll back on failed rebuild
-                    println!("{RED}toggle failed: {e}{RESET}");
-                }
-            }
+            );
         }
         ("/permission", arg) => {
             use crate::tools::PermissionMode;
@@ -1239,18 +1839,9 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
                     state.mode.as_str()
                 ),
                 Some(m) => {
-                    let prev = state.mode;
                     state.mode = m;
-                    match state.rebuild().await {
-                        Ok(new) => {
-                            *live = new;
-                            println!("permission mode -> {}", state.mode.as_str());
-                        }
-                        Err(e) => {
-                            state.mode = prev;
-                            println!("{RED}switch failed: {e}{RESET}");
-                        }
-                    }
+                    live.agent.ctx.permission.set(m); // in place: keep the history
+                    println!("permission mode -> {}", state.mode.as_str());
                 }
             }
         }
@@ -1262,6 +1853,159 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_entries_roundtrip_multiline_tasks() {
+        let task = "line one\nline two";
+        let encoded = encode_history_entry(task);
+        assert_eq!(encoded, "line one\\nline two");
+        assert_eq!(decode_history_entry(&encoded), task);
+        // blank submissions never enter the history
+        assert_eq!(encode_history_entry("   "), "");
+    }
+
+    #[test]
+    fn at_path_completions_offer_attachment_paths() {
+        let dir = std::env::temp_dir().join(format!("kazi-at-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for f in ["alpha.txt", "alpine.txt", "beta.txt"] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        let base = dir.display().to_string();
+        let sep = std::path::MAIN_SEPARATOR;
+
+        let line = format!("look at @{base}{sep}al");
+        let (start, cands) = at_path_completions(&line, line.len()).expect("in scope");
+        assert_eq!(start, 8, "token starts after the space");
+        assert!(cands.iter().any(|c| c.ends_with("alpha.txt")), "{cands:?}");
+        assert!(cands.iter().any(|c| c.ends_with("alpine.txt")), "{cands:?}");
+        assert!(!cands.iter().any(|c| c.ends_with("beta.txt")), "{cands:?}");
+
+        // a unique match completes whole, several extend to the common prefix
+        let line = format!("read @{base}{sep}beta");
+        assert_eq!(
+            complete_at_path(&line, line.len()),
+            Some(format!("read @{base}{sep}beta.txt"))
+        );
+        let line = format!("read @{base}{sep}al");
+        assert_eq!(
+            complete_at_path(&line, line.len()),
+            Some(format!("read @{base}{sep}alp"))
+        );
+
+        // directories keep the separator so completion can continue
+        let line = format!("look @{base}{sep}su");
+        let done = complete_at_path(&line, line.len()).expect("dir match");
+        assert!(done.ends_with(&format!("sub{sep}")), "{done}");
+
+        // no @ token → not our business
+        assert!(complete_at_path("no refs here", 12).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn partial_commands_complete_to_their_unique_match() {
+        assert_eq!(unique_prefix_command("/mod").as_deref(), Some("/model"));
+        assert_eq!(unique_prefix_command("/resu").as_deref(), Some("/resume"));
+        // ambiguous or unknown prefixes stay with the caller to explain
+        assert_eq!(unique_prefix_command("/co"), None);
+        assert_eq!(unique_prefix_command("/zzz"), None);
+    }
+
+    #[tokio::test]
+    async fn all_model_choices_prefix_rows_with_the_provider() {
+        // no usable key → no live fetch, so this stays offline and instant
+        let cfg: Config = toml::from_str(
+            "[providers.a]\ntype = \"openai\"\nmodel = \"m1\"\napi_key_env = \"KAZI_TEST_NOPE_A\"\n[providers.b]\ntype = \"openai\"\nmodel = \"m2\"\napi_key_env = \"KAZI_TEST_NOPE_B\"",
+        )
+        .unwrap();
+        std::env::remove_var("KAZI_TEST_NOPE_A");
+        std::env::remove_var("KAZI_TEST_NOPE_B");
+
+        let rows = all_model_choices(&cfg, Some("b"), Some("m2")).await;
+        assert!(
+            rows.iter()
+                .all(|r| r.starts_with("a/") || r.starts_with("b/")),
+            "{rows:?}"
+        );
+        assert_eq!(rows[0], "b/m2", "the current pick is hoisted: {rows:?}");
+        assert!(rows.iter().any(|r| r == "a/m1"), "{rows:?}");
+    }
+
+    #[test]
+    fn model_arg_resolves_numbers_or_errors() {
+        let models = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(resolve_model_arg("2", &models).unwrap(), "b");
+        assert_eq!(resolve_model_arg("gpt-4o", &models).unwrap(), "gpt-4o");
+        assert!(resolve_model_arg("5", &models).is_err(), "out of range");
+        assert!(resolve_model_arg("0", &models).is_err(), "1-based");
+        assert!(resolve_model_arg("1", &[]).is_err(), "nothing cached");
+    }
+
+    #[test]
+    fn providers_text_marks_the_current_one() {
+        let cfg: Config = toml::from_str(
+            "[providers.a]\ntype = \"openai\"\nmodel = \"m1\"\n[providers.b]\ntype = \"anthropic\"\nmodel = \"m2\"",
+        )
+        .unwrap();
+        let text = providers_text(&cfg, Some("b"));
+        assert!(text.contains("2) b"), "{text}");
+        assert!(text.contains("<- current"), "{text}");
+        assert_eq!(text.matches("<- current").count(), 1, "exactly one: {text}");
+    }
+
+    #[test]
+    fn last_tool_text_walks_back_through_tool_results() {
+        use crate::llm::{Message, ToolCall};
+        let provider: std::sync::Arc<dyn crate::llm::Provider> =
+            std::sync::Arc::new(crate::llm::mock::MockProvider::new(vec![]));
+        let ctx = crate::tools::ToolCtx {
+            cwd: std::env::temp_dir(),
+            sandbox_root: None,
+            timeout: std::time::Duration::from_secs(1),
+            output_limit: 1024,
+            allow_commands: vec![],
+            approver: std::sync::Arc::new(crate::tools::AutoApprover),
+            checkpointing: None,
+            todos: None,
+            permission: crate::tools::Permission::default(),
+            subagent: None,
+        };
+        let mut agent = Agent::new(
+            provider,
+            crate::tools::ToolRegistry::builtin(),
+            ctx,
+            Some("sys".into()),
+            4,
+            1_000,
+        );
+        assert!(last_tool_text(&agent, 1).contains("no tool output"));
+
+        agent.history.push(Message::assistant_with_calls(
+            None,
+            vec![ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "x"}),
+            }],
+        ));
+        agent
+            .history
+            .push(Message::tool_result("c1", "line one\nline two", false));
+
+        let text = last_tool_text(&agent, 1);
+        assert!(text.contains("read_file"), "{text}");
+        assert!(
+            text.contains("line two"),
+            "full output, not a preview: {text}"
+        );
+        assert!(last_tool_text(&agent, 2).contains("only 1 tool result"));
+        assert_eq!(parse_back(""), Some(1));
+        assert_eq!(parse_back("3"), Some(3));
+        assert_eq!(parse_back("0"), None);
+        assert_eq!(parse_back("nope"), None);
+    }
 
     #[test]
     fn continuation_backslash_detected() {
@@ -1383,7 +2127,8 @@ mod tests {
     #[test]
     fn models_text_marks_current_and_handles_empty() {
         let models = vec!["a".to_string(), "b".to_string()];
-        let t = models_text("deepseek", &models, Some("b"));
+        let t = models_text("providers / models", &models, Some("b"));
+        assert!(t.contains("providers / models:"), "{t}");
         assert!(t.contains("1) a"), "{t}");
         assert!(t.contains("2) b  <- current"), "{t}");
         assert!(models_text("x", &[], None).contains("no model candidates"));
@@ -1450,9 +2195,13 @@ mod slug_tests {
         assert_eq!(decision_from_input("Yes"), Decision::Allow);
         assert_eq!(decision_from_input(" a "), Decision::AllowSession);
         assert_eq!(decision_from_input("always\n"), Decision::AllowSession);
-        assert_eq!(decision_from_input("n\n"), Decision::Deny);
-        assert_eq!(decision_from_input(""), Decision::Deny);
-        assert_eq!(decision_from_input("what?\n"), Decision::Deny);
+        assert_eq!(decision_from_input("n\n"), Decision::Deny(None));
+        assert_eq!(decision_from_input(""), Decision::Deny(None));
+        // a free-text answer becomes a reason the model can act on
+        assert_eq!(
+            decision_from_input("use --verbose instead\n"),
+            Decision::Deny(Some("use --verbose instead".into()))
+        );
     }
     use super::slugify;
 

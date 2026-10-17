@@ -180,6 +180,9 @@ impl Tool for SearchFiles {
         }
         let rel = optional_str(args, "path").unwrap_or(".");
         let root = ctx.cwd.join(rel);
+        // the sandbox covers every file tool, not just read/write: searching
+        // above the root used to leak content outside it
+        super::file::ensure_sandbox(ctx.sandbox_root.as_deref(), &root)?;
         if !root.exists() {
             return Err(ToolError::new(format!("path {root:?} does not exist")));
         }

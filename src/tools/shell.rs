@@ -2,7 +2,8 @@
 //!
 //! 1. **Allowlist** — commands whose *exact prefix* matches a configured
 //!    `tools.allow_commands` entry AND that contain no shell separators
-//!    (`; & | < > backtick`, newline) run without prompting.
+//!    (`; & | < > backtick`, newline, `$(`; `%` on Windows, where cmd expands
+//!    it before parsing) run without prompting.
 //! 2. **Prompt** — otherwise the user confirms via the [`Approver`]; in
 //!    headless mode the CLI denies unless `--yolo` was passed.
 //! 3. Denials are reported as tool errors, so the model adapts instead of
@@ -25,6 +26,17 @@ pub struct RunCommand;
 pub const COMMAND_DENIED: &str =
     "the user declined to run this command. Do not retry it; acknowledge and propose a different approach.";
 
+/// Denial text for the model: a typed reason lets it *correct* the command
+/// instead of giving up on the approach.
+pub fn command_denied(reason: Option<&str>) -> String {
+    match reason.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(reason) => format!(
+            "the user declined to run this command. Their reason: {reason}\nFix the command along those lines and retry a corrected version if it still serves the task."
+        ),
+        None => COMMAND_DENIED.to_string(),
+    }
+}
+
 /// True when an allowlist entry covers this command *and* the command cannot
 /// smuggle a second statement through shell metacharacters.
 pub fn is_auto_approved(cmd: &str, allow: &[String]) -> bool {
@@ -34,7 +46,12 @@ pub fn is_auto_approved(cmd: &str, allow: &[String]) -> bool {
     }
     let smuggleable = t
         .chars()
-        .any(|c| matches!(c, ';' | '&' | '|' | '`' | '\n' | '<' | '>'));
+        .any(|c| matches!(c, ';' | '&' | '|' | '`' | '\n' | '<' | '>'))
+        // command substitution runs a nested command without any separator
+        // (`git log $(cat secret)` under sh); cmd expands `%VAR%` the same way,
+        // which is why `%` is only a hazard on Windows
+        || t.contains("$(")
+        || (cfg!(windows) && t.contains('%'));
     if smuggleable {
         return false;
     }
@@ -104,6 +121,8 @@ impl Tool for RunCommand {
                 if !p.is_dir() {
                     return Err(ToolError::new(format!("cwd {p:?} is not a directory")));
                 }
+                // a sandboxed session must not run commands *outside* its root
+                super::file::ensure_sandbox(ctx.sandbox_root.as_deref(), &p)?;
                 p
             }
             None => ctx.cwd.clone(),
@@ -200,6 +219,12 @@ mod tests {
         assert!(!is_auto_approved("cargo test && cargo build", &allow));
         assert!(!is_auto_approved("type a | findstr b", &allow));
         assert!(!is_auto_approved("", &allow));
+        // command substitution / cmd variable expansion must never auto-approve
+        assert!(!is_auto_approved("cargo test $(cat secret)", &allow));
+        assert!(!is_auto_approved("cargo test `rm -rf x`", &allow));
+        if cfg!(windows) {
+            assert!(!is_auto_approved("cargo test %PWN%", &allow));
+        }
     }
 
     #[tokio::test]
@@ -211,6 +236,21 @@ mod tests {
             .expect("echo must work on both platforms");
         assert!(out.contains("exit code: 0"));
         assert!(out.contains("kazi-ok"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_blocks_a_cwd_outside_the_root() {
+        let root = std::env::temp_dir().join(format!("kazi-sbx-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut ctx = super::super::tests::test_ctx();
+        ctx.sandbox_root = Some(root.clone());
+        // the test cwd lives in the repo; `..` is outside the temp sandbox
+        let err = RunCommand
+            .run(&json!({"command": "echo hi", "cwd": ".."}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.0.contains("sandbox"), "got: {}", err.0);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

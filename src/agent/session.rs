@@ -77,11 +77,28 @@ pub struct SessionSummary {
     pub messages: usize,
     pub saved_at: u64,
     pub topic: Option<String>,
+    /// Working directory recorded in the session's system prompt.
+    pub cwd: Option<String>,
+}
+
+/// The working directory recorded in a session's system prompt, if present.
+/// Sessions are per-directory, so this is how a user tells two `chat-*`
+/// sessions apart.
+pub fn session_cwd(f: &SessionFile) -> Option<String> {
+    let sys = f.system.as_deref()?;
+    let line = sys.lines().find(|l| l.starts_with("Working directory:"))?;
+    let dir = line.trim_start_matches("Working directory:").trim();
+    let dir = dir.trim_end_matches('.');
+    if dir.is_empty() {
+        None
+    } else {
+        Some(dir.to_string())
+    }
 }
 
 /// Stored sessions newest-first, with message counts and save times.
 pub fn list_summaries() -> Vec<SessionSummary> {
-    let mut out: Vec<(u64, usize, String, Option<String>)> = vec![];
+    let mut out: Vec<SessionSummary> = Vec::new();
     if let Ok(dir) = sessions_dir() {
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for e in entries.flatten() {
@@ -105,21 +122,20 @@ pub fn list_summaries() -> Vec<SessionSummary> {
                                 .find(|m| m.role == crate::llm::Role::User)
                                 .map(|m| m.text().chars().take(40).collect::<String>())
                         });
-                        out.push((mtime, messages, stem.to_string(), topic));
+                        out.push(SessionSummary {
+                            name: stem.to_string(),
+                            messages,
+                            saved_at: mtime,
+                            topic,
+                            cwd: parsed.as_ref().and_then(session_cwd),
+                        });
                     }
                 }
             }
         }
     }
-    out.sort_by_key(|e| std::cmp::Reverse(e.0));
-    out.into_iter()
-        .map(|(mtime, messages, name, topic)| SessionSummary {
-            name,
-            messages,
-            saved_at: mtime,
-            topic,
-        })
-        .collect()
+    out.sort_by_key(|s| std::cmp::Reverse(s.saved_at));
+    out
 }
 
 /// Resolve a (possibly partial) session name: exact wins, then a unique
@@ -279,6 +295,20 @@ mod tests {
         assert!(delete(&b).is_err(), "already deleted → missing name");
 
         std::fs::remove_file(sessions_dir().unwrap().join(format!("{a}.json"))).unwrap();
+    }
+
+    #[test]
+    fn session_cwd_reads_the_system_prompt() {
+        let f = SessionFile {
+            version: 1,
+            name: "cwd-test".into(),
+            system: Some("You are kazi.\nWorking directory: D:/Code/init/kazi.\n".into()),
+            messages: vec![],
+            saved_at: 0,
+        };
+        assert_eq!(session_cwd(&f).as_deref(), Some("D:/Code/init/kazi"));
+        let none = SessionFile { system: None, ..f };
+        assert_eq!(session_cwd(&none), None);
     }
 
     #[test]

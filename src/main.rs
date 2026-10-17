@@ -9,10 +9,9 @@ async fn main() -> ExitCode {
     match kazi::cli::execute(cli).await {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
+            // `{e:#}` already prints the whole cause chain — the extra loop
+            // printed every cause a second time
             eprintln!("{e:#}");
-            for cause in e.chain().skip(1) {
-                eprintln!("  caused by: {cause}");
-            }
             ExitCode::FAILURE
         }
     }

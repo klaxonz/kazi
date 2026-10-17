@@ -77,7 +77,9 @@ impl ToolOutcome {
 pub struct ToolCtx {
     /// Working directory the user launched kazi from.
     pub cwd: std::path::PathBuf,
-    /// If set, file tools may not touch paths outside this directory.
+    /// If set, file tools (list/read/write/patch/search) may not touch paths
+    /// outside this directory, and `run_command` may not run from a cwd
+    /// outside it.
     pub sandbox_root: Option<std::path::PathBuf>,
     pub timeout: Duration,
     /// Max characters of tool output fed back to the model.
@@ -177,30 +179,24 @@ fn mode_code(m: PermissionMode) -> u8 {
 }
 
 /// One approval answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     /// Run it this once.
     Allow,
     /// Run it and remember the approval for the rest of the session
     /// (implementations key that on [`approval_key`]).
     AllowSession,
-    /// Refuse; the model gets an error tool-result.
-    Deny,
+    /// Refuse; the model gets an error tool-result. A typed reason travels with
+    /// it so the model can correct the command instead of retrying blindly.
+    Deny(Option<String>),
 }
 
-/// Stable per-command key used for session-scoped approval memory:
-/// the first token of the summary (e.g. `$ git` → `git`).
+/// Stable key used for session-scoped approval memory: the WHOLE approval
+/// summary (command + cwd), whitespace-normalized. Keying on the first token
+/// made "always" a per-binary yolo — approving `git log` silently cleared
+/// `git push --force` for the rest of the session too.
 pub fn approval_key(summary: &str) -> String {
-    summary
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .trim_start_matches('$')
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_string()
+    summary.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Interactive gate for potentially-impactful actions (`run_command`).
@@ -227,7 +223,7 @@ pub struct DenyApprover;
 #[async_trait]
 impl Approver for DenyApprover {
     async fn decide(&self, _tool: &str, _summary: &str) -> Decision {
-        Decision::Deny
+        Decision::Deny(None)
     }
 }
 
@@ -439,10 +435,23 @@ mod tests {
     }
 
     #[test]
-    fn approval_key_takes_first_command_token() {
-        assert_eq!(approval_key("$ git status --short\n  cwd: /tmp"), "git");
-        assert_eq!(approval_key(" $ cargo test"), "cargo");
+    fn approval_key_is_the_whole_command() {
+        assert_eq!(
+            approval_key("$ git status --short\n  cwd: /tmp"),
+            "$ git status --short cwd: /tmp"
+        );
+        assert_eq!(approval_key(" $ cargo test"), "$ cargo test");
         assert_eq!(approval_key(""), "");
+        // one session approval must never cover a different command
+        assert_ne!(
+            approval_key("$ git log"),
+            approval_key("$ git push --force")
+        );
+        // ... and not the same command in another directory
+        assert_ne!(
+            approval_key("$ rm -rf build\n  cwd: /a"),
+            approval_key("$ rm -rf build\n  cwd: /b")
+        );
     }
 
     #[test]

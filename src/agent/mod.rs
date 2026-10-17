@@ -308,6 +308,11 @@ pub struct Agent {
     /// Optional post-edit check (`agent.feedback_command`): run after a round
     /// that changed files, its output is fed back to the model.
     feedback: Option<String>,
+    /// Provider nickname this agent resolved to (`[providers.<nick>]`).
+    nick: String,
+    /// Set when the provider has no usable credential: an actionable line the
+    /// UI shows at startup and appends to auth-ish provider errors.
+    auth_hint: Option<String>,
 }
 
 impl Agent {
@@ -353,6 +358,8 @@ impl Agent {
             usage: Usage::default(),
             cancel: Arc::new(AtomicBool::new(false)),
             feedback: None,
+            nick: String::new(),
+            auth_hint: None,
         }
     }
 
@@ -365,6 +372,31 @@ impl Agent {
     /// Handle for interrupting a running task (Esc in the TUI).
     pub fn cancel_token(&self) -> Arc<AtomicBool> {
         self.cancel.clone()
+    }
+
+    /// Provider nickname this agent resolved to.
+    pub fn nick(&self) -> &str {
+        &self.nick
+    }
+
+    /// Actionable key hint when the provider has no usable credential
+    /// (env var and local store both empty).
+    pub fn auth_hint(&self) -> Option<&str> {
+        self.auth_hint.as_deref()
+    }
+
+    /// Error text for the UI: provider failures that look like a missing or
+    /// rejected key gain the exact command that fixes them.
+    pub fn error_text(&self, e: &AgentError) -> String {
+        let base = e.to_string();
+        let authish = matches!(e, AgentError::Provider(_))
+            && ["authentication", "API key", "401", "authorization"]
+                .iter()
+                .any(|needle| base.contains(needle));
+        match (&self.auth_hint, authish) {
+            (Some(hint), true) => format!("{base}\n→ {hint}"),
+            _ => base,
+        }
     }
 
     /// Clear the flag; call before starting a new task.
@@ -387,6 +419,12 @@ impl Agent {
     /// Context budget in estimated tokens (`/context` display).
     pub fn max_context_tokens(&self) -> u64 {
         self.max_context_tokens
+    }
+
+    /// Share of the budget at which auto-compaction fires (percent) — reported
+    /// by `/context` so the number is not a mystery.
+    pub fn compact_threshold_percent() -> u32 {
+        (Self::COMPACT_THRESHOLD * 100.0) as u32
     }
 
     /// Token usage of the current ([`Agent::run_task`]) task.
@@ -434,6 +472,119 @@ impl Agent {
         Self::default_cli_with_approver(cfg, provider, model_override, a, mode).await
     }
 
+    /// Resolve provider settings (key included) + the actionable hint when no
+    /// credential is available. Shared by every constructor.
+    fn resolved_settings(
+        cfg: &crate::config::Config,
+        provider: Option<&str>,
+        model_override: Option<&str>,
+    ) -> anyhow::Result<(crate::llm::ProviderSettings, String, Option<String>)> {
+        let resolved = cfg.resolve(provider, model_override)?;
+        let mut settings = resolved.settings;
+        let hint = match cfg.api_key_for(&resolved.nick) {
+            Ok(key) => {
+                settings.api_key = key;
+                None
+            }
+            Err(e) => {
+                let env_name = cfg
+                    .key_sources(&resolved.nick)
+                    .map(|(env, _, _)| env)
+                    .unwrap_or_default();
+                eprintln!("warning: {e}");
+                eprintln!("         fix it with: kazi auth set {}", resolved.nick);
+                Some(format!(
+                    "no usable key for `{nick}`: run `kazi auth set {nick}`{env} — then reconnect this session with /provider {nick}",
+                    nick = resolved.nick,
+                    env = if env_name.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (or export {env_name})")
+                    },
+                ))
+            }
+        };
+        Ok((settings, resolved.nick, hint))
+    }
+
+    /// Wrap the wire provider with the retry policy from config.
+    fn provider_arc(
+        cfg: &crate::config::Config,
+        settings: crate::llm::ProviderSettings,
+    ) -> anyhow::Result<Arc<dyn Provider>> {
+        let inner = crate::llm::build_provider(&settings)?;
+        Ok(Arc::new(crate::llm::RetryProvider::new(
+            inner,
+            cfg.agent.max_retries.unwrap_or(3),
+        )))
+    }
+
+    /// Assemble an agent around an already-built provider + tool registry.
+    /// Shared by the constructors so a provider/model switch can reuse the live
+    /// registry — MCP servers are provider-agnostic and must not be
+    /// re-handshaked (that was the multi-second stall on every switch).
+    fn assemble(
+        wrapped: Arc<dyn Provider>,
+        registry: ToolRegistry,
+        mut ctx: ToolCtx,
+        cfg: &crate::config::Config,
+        nick: String,
+        auth_hint: Option<String>,
+    ) -> Self {
+        let max_rounds = cfg.agent.max_rounds.unwrap_or(DEFAULT_MAX_ROUNDS);
+        let max_context_tokens = cfg
+            .agent
+            .max_context_tokens
+            .unwrap_or(DEFAULT_MAX_CONTEXT_TOKENS);
+        let system = system_prompt(&ctx.cwd);
+        let runner = Arc::new(SubAgentRunnerImpl::new(
+            wrapped.clone(),
+            ctx.clone(),
+            system.clone(),
+            max_rounds,
+            max_context_tokens,
+        ));
+        ctx.subagent = Some(runner);
+        let mut agent = Self::with_parallel(
+            wrapped,
+            registry,
+            ctx,
+            Some(system),
+            max_rounds,
+            max_context_tokens,
+            cfg.agent.max_parallel_tools.unwrap_or(DEFAULT_MAX_PARALLEL),
+        )
+        .with_feedback(cfg.agent.feedback_command.clone());
+        agent.nick = nick;
+        agent.auth_hint = auth_hint;
+        agent
+    }
+
+    /// Rebuild for a provider/model switch: same tool registry, same cwd, no
+    /// MCP re-handshake, no config re-read of everything else.
+    pub async fn rebuilt_with(
+        &self,
+        cfg: &crate::config::Config,
+        provider: Option<&str>,
+        model_override: Option<&str>,
+        given_approver: Arc<dyn crate::tools::Approver>,
+        mode: crate::tools::PermissionMode,
+    ) -> anyhow::Result<Self> {
+        let (settings, nick, hint) = Self::resolved_settings(cfg, provider, model_override)?;
+        let wrapped = Self::provider_arc(cfg, settings)?;
+        let mut ctx = self.ctx.clone();
+        ctx.approver = given_approver;
+        ctx.permission = crate::tools::Permission::new(mode);
+        Ok(Self::assemble(
+            wrapped,
+            self.registry.clone(),
+            ctx,
+            cfg,
+            nick,
+            hint,
+        ))
+    }
+
     /// Like [`Agent::default_cli`], but the caller supplies the approver —
     /// the TUI injects a channel-based one so prompts never touch stdin —
     /// and the startup permission mode.
@@ -444,17 +595,8 @@ impl Agent {
         given_approver: Arc<dyn crate::tools::Approver>,
         mode: crate::tools::PermissionMode,
     ) -> anyhow::Result<Self> {
-        let resolved = cfg.resolve(provider, model_override)?;
-        let mut settings = resolved.settings;
-        match cfg.api_key_for(&resolved.nick) {
-            Ok(key) => settings.api_key = key,
-            Err(e) => eprintln!("warning: {e} — will fail on first request if the provider needs a key"),
-        }
-        let inner_provider = crate::llm::build_provider(&settings)?;
-        let wrapped: Arc<dyn Provider> = Arc::new(crate::llm::RetryProvider::new(
-            inner_provider,
-            cfg.agent.max_retries.unwrap_or(3),
-        ));
+        let (settings, nick, auth_hint) = Self::resolved_settings(cfg, provider, model_override)?;
+        let wrapped = Self::provider_arc(cfg, settings)?;
         let mut registry = crate::tools::ToolRegistry::builtin();
         for tool in crate::mcp::load_mcp_tools(
             &cfg.mcp,
@@ -464,35 +606,9 @@ impl Agent {
         {
             registry = registry.register(tool);
         }
-
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let mut ctx = crate::tools::tool_ctx(&cfg.tools, &cwd, given_approver, mode);
-        let max_rounds = cfg.agent.max_rounds.unwrap_or(DEFAULT_MAX_ROUNDS);
-        let max_context_tokens = cfg
-            .agent
-            .max_context_tokens
-            .unwrap_or(DEFAULT_MAX_CONTEXT_TOKENS);
-        let system = system_prompt(&cwd);
-        // the `delegate` tool needs a factory; it clones the context handed
-        // down, so a sub-agent can never delegate again
-        let runner = Arc::new(SubAgentRunnerImpl::new(
-            wrapped.clone(),
-            ctx.clone(),
-            system.clone(),
-            max_rounds,
-            max_context_tokens,
-        ));
-        ctx.subagent = Some(runner);
-        Ok(Self::with_parallel(
-            wrapped,
-            registry,
-            ctx,
-            Some(system),
-            max_rounds,
-            max_context_tokens,
-            cfg.agent.max_parallel_tools.unwrap_or(DEFAULT_MAX_PARALLEL),
-        )
-        .with_feedback(cfg.agent.feedback_command.clone()))
+        let ctx = crate::tools::tool_ctx(&cfg.tools, &cwd, given_approver, mode);
+        Ok(Self::assemble(wrapped, registry, ctx, cfg, nick, auth_hint))
     }
 
     pub fn registry(&self) -> &ToolRegistry {
@@ -518,21 +634,36 @@ impl Agent {
         Ok(())
     }
 
-    /// Manual compaction (`/compact`): pull overshooting turns OUT of the
-    /// history, ask the provider to compress them into a short summary, and
-    /// splice the summary into the system prompt. Plain trimming remains the
-    /// fallback when the summarizer call fails — compaction never loses the
-    /// latest turn either way.
-    pub async fn compact(&mut self) -> Result<String, AgentError> {
-        let Some(dropped) = self.history.take_beyond_text(self.max_context_tokens) else {
-            return Ok("nothing to compact — context is already under budget".into());
+    /// Manual compaction (`/compact`): pull the oldest droppable messages OUT
+    /// of the history — only as many as the budget requires; `force` drops
+    /// everything droppable — ask the provider to compress them into a short
+    /// summary, and splice the summary into the system prompt. When the
+    /// summarizer fails the messages are gone anyway, so the note says so.
+    pub async fn compact(&mut self, force: bool) -> Result<String, AgentError> {
+        let before_tokens = self.history.estimate_tokens();
+        let before_msgs = self.history.msgs_len();
+        let target = if force { 0 } else { self.max_context_tokens };
+        let Some(dropped) = self.history.take_beyond_text(target) else {
+            return Ok(if force {
+                "nothing to compact — no droppable turns yet".into()
+            } else {
+                "nothing to compact — context is already under budget (use `/compact force` to drop anyway)"
+                    .into()
+            });
         };
+        let dropped_msgs = before_msgs - self.history.msgs_len();
         match self.summarize_dropped(&dropped).await {
             Ok(summary) if !summary.is_empty() => {
                 self.history.insert_summary(summary);
-                Ok("compacted: dropped turns were replaced by a summary".into())
+                Ok(format!(
+                    "compacted: {dropped_msgs} messages replaced by a summary ({before_tokens} → {} est. tokens)",
+                    self.history.estimate_tokens()
+                ))
             }
-            _ => Ok("compacted: dropped turns without summary (summarizer unavailable)".into()),
+            _ => Ok(format!(
+                "compacted: {dropped_msgs} messages DROPPED with no summary (summarizer unavailable) — lossy ({before_tokens} → {} est. tokens)",
+                self.history.estimate_tokens()
+            )),
         }
     }
 
@@ -540,6 +671,9 @@ impl Agent {
     /// round preemptively compacts (summary replaces dropped turns) instead of
     /// letting plain trimming silently lose them mid-task.
     const COMPACT_THRESHOLD: f64 = 0.8;
+    /// Level auto-compaction compacts down to — headroom for the rounds that
+    /// follow, instead of hugging the budget edge.
+    const COMPACT_TARGET: f64 = 0.6;
 
     /// Proactive compaction, called between rounds inside `run_task`. Returns
     /// `Some(note)` when it acted. Compacts whatever overshoots the budget so
@@ -554,7 +688,9 @@ impl Agent {
         if (self.history.estimate_tokens() as f64) < budget as f64 * Self::COMPACT_THRESHOLD {
             return None;
         }
-        let dropped = self.history.take_beyond_text(budget)?;
+        let dropped = self
+            .history
+            .take_beyond_text((budget as f64 * Self::COMPACT_TARGET) as u64)?;
         on_event(AgentEvent::AutoCompactStarted);
         let note: String = match self.summarize_dropped(&dropped).await {
             Ok(summary) if !summary.is_empty() => {
@@ -647,8 +783,10 @@ impl Agent {
                         name: call.name.clone(),
                     });
                     match self.ctx.approver.decide(&call.name, &summary).await {
-                        crate::tools::Decision::Deny => {
-                            let denied = ToolOutcome::err(crate::tools::shell::COMMAND_DENIED);
+                        crate::tools::Decision::Deny(reason) => {
+                            let denied = ToolOutcome::err(crate::tools::shell::command_denied(
+                                reason.as_deref(),
+                            ));
                             on_event(AgentEvent::ToolEnd {
                                 name: call.name.clone(),
                                 is_error: true,
@@ -682,14 +820,32 @@ impl Agent {
                     (i, outcome)
                 });
             }
-            while let Some(done) = set.join_next().await {
-                let (i, outcome) = done.expect("task join");
-                on_event(AgentEvent::ToolEnd {
-                    name: calls[i].name.clone(),
-                    is_error: outcome.is_error,
-                    preview: outcome.first_line_preview(160),
-                });
-                verdicts[i] = Some(outcome);
+            // Esc must bite while a tool runs too: poll the flag and abort the
+            // tool tasks (spawned commands are kill_on_drop, so a hung
+            // `run_command` dies with its task instead of holding the run).
+            let mut remaining = set.len();
+            while remaining > 0 {
+                tokio::select! {
+                    joined = set.join_next() => match joined {
+                        Some(Ok((i, outcome))) => {
+                            on_event(AgentEvent::ToolEnd {
+                                name: calls[i].name.clone(),
+                                is_error: outcome.is_error,
+                                preview: outcome.first_line_preview(160),
+                            });
+                            verdicts[i] = Some(outcome);
+                            remaining -= 1;
+                        }
+                        Some(Err(_)) => remaining -= 1, // panicked tool task
+                        None => break,
+                    },
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                        if self.cancelled() {
+                            set.abort_all();
+                            return Err(AgentError::Cancelled);
+                        }
+                    }
+                }
             }
 
             // did this round change files? (before outcomes are taken)
@@ -1018,7 +1174,7 @@ mod tests {
         agent.run_task("turn two", |_| {}).await.unwrap();
         assert!(agent.history.msgs_len() >= 3, "two turns stored");
 
-        let note = agent.compact().await.unwrap();
+        let note = agent.compact(false).await.unwrap();
         assert!(note.contains("summary"), "got: {note}");
         let msgs = agent.history.messages();
         assert!(
@@ -1036,13 +1192,44 @@ mod tests {
 
     #[tokio::test]
     async fn compact_noop_when_under_budget() {
-        let mut a = agent_with(vec![LlmResponse {
-            content: Some("small talk".into()),
-            ..Default::default()
-        }]);
-        a.run_task("tiny", |_| {}).await.unwrap();
-        let note = a.compact().await.unwrap();
+        // two turns under a generous budget: plain /compact must not touch them
+        let script = vec![
+            LlmResponse {
+                content: Some("first answer".into()),
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some("second answer".into()),
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some("SUMMARY".into()), // summarizer (only `force` gets here)
+                ..Default::default()
+            },
+        ];
+        let mut a = agent_with(script);
+        a.run_task("tiny one", |_| {}).await.unwrap();
+        a.run_task("tiny two", |_| {}).await.unwrap();
+        let msgs_before = a.history.msgs_len();
+
+        let note = a.compact(false).await.unwrap();
         assert!(note.starts_with("nothing to compact"), "got: {note}");
+        assert_eq!(
+            a.history.msgs_len(),
+            msgs_before,
+            "under budget nothing may be dropped"
+        );
+
+        // ... but `force` drops the droppable part on purpose
+        let forced = a.compact(true).await.unwrap();
+        assert!(
+            !forced.starts_with("nothing to compact"),
+            "force must act under budget: {forced}"
+        );
+        assert!(
+            a.history.msgs_len() < msgs_before,
+            "force dropped the older turn"
+        );
     }
 
     #[tokio::test]
@@ -1520,6 +1707,72 @@ mod tests {
             .messages()
             .iter()
             .any(|m| m.role == crate::llm::Role::User));
+    }
+
+    #[tokio::test]
+    async fn cancel_bites_while_a_tool_runs() {
+        struct SlowTool;
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for SlowTool {
+            fn name(&self) -> &'static str {
+                "slow_tool"
+            }
+            fn description(&self) -> &'static str {
+                "sleeps for a long time"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                json!({"type": "object", "properties": {}})
+            }
+            async fn run(
+                &self,
+                _args: &serde_json::Value,
+                _ctx: &ToolCtx,
+            ) -> Result<String, crate::tools::ToolError> {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok("never reached".into())
+            }
+        }
+
+        let script = vec![
+            LlmResponse {
+                tool_calls: vec![ToolCall {
+                    id: "s1".into(),
+                    name: "slow_tool".into(),
+                    arguments: json!({}),
+                }],
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some("should never be reached".into()),
+                ..Default::default()
+            },
+        ];
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(script));
+        let registry = ToolRegistry::new().register(Arc::new(SlowTool));
+        let mut agent = Agent::with_parallel(
+            provider,
+            registry,
+            test_ctx(),
+            Some("sys".into()),
+            4,
+            1_000,
+            4,
+        );
+        let flag = agent.cancel_token();
+        let started = std::time::Instant::now();
+        let out = agent
+            .run_task("run the slow tool", move |ev| {
+                if matches!(ev, AgentEvent::ToolStart { .. }) {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            })
+            .await;
+        assert!(matches!(out.unwrap_err(), AgentError::Cancelled));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cancel must bite during a tool, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

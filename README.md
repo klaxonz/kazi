@@ -25,13 +25,20 @@ explicit patent grant and NOTICE-file requirements.
 cargo install kazi
 ```
 
-## Configure (no API keys in files)
+## Configure (keys stay out of the file)
 
 ```sh
-kazi config --init          # writes the platform's config path, prints it
-export DEEPSEEK_API_KEY=...  # keys live in environment variables only
-kazi providers               # see what is configured
+kazi                       # first run offers to create the config and walks you through
+kazi config --init         # or do it explicitly: writes the example, prints the path
+kazi auth set deepseek     # store a key locally (hidden prompt); env vars still win
+kazi providers             # see what is configured and which keys are ready
 ```
+
+Bare `kazi` with no config offers to create one, then asks for provider and model
+and stores the key — the choice is written back to `config.toml`, so the next
+launch goes straight to work. `/auth` inside a session shows where the current
+provider's key comes from, and a 401 tells you the exact `kazi auth set <nick>`
+command that fixes it.
 
 `config.toml` (excerpt):
 
@@ -92,30 +99,50 @@ Both share the same engine, sessions, and slash commands (`/compact`,
 `\`). `--tui` forces the TUI; it falls back gracefully on terminals without
 alternate-screen support.
 
-TUI keys: `↑/↓` input history, `←/→ Home/End Ctrl+A/E/U/K/W` line editing,
-`/` opens the command dropdown and `Tab` completes, `PgUp/PgDn` or the mouse
+TUI keys: `↑/↓` input history (line navigation inside a multi-line task),
+`Ctrl+J` starts a new line, `←/→ Home/End Ctrl+A/E/U/K/W` line editing,
+`/` opens the command dropdown and `Tab` completes (also `@path` for file
+attachments), `PgUp/PgDn` or the mouse
 wheel to scroll (`Ctrl+Home/End` jump), `Esc` interrupts a running task (and
-quits when idle), `Ctrl+C` quits. The TUI runs the **same slash commands** as
+quits when idle), `Ctrl+C` quits. Pasting a multi-line block keeps it as one
+task; approval prompts take `y` (once), `a`
+(always this exact command, for the session) or `n`/`Esc` (the line REPL also
+takes a typed reason, which is handed to the model). The TUI runs the
+**same slash commands** as
 the line REPL — `/new`, `/compact`, `/resume`, `/provider`, `/model`,
-`/permission`, `/status`, `/tools`, `/undo`, `/context` — so there is no
+`/permission`, `/status`, `/tools`, `/undo`, `/context`, `/last`, `/auth` — so
+there is no
 second-class front-end. `/undo` restores the files the last task changed and
-`/help` prints the table plus the key bindings.
+`/help` prints the table plus the key bindings. Every finished task autosaves,
+so quitting mid-task never costs you the session. `/last [n]` prints the newest
+tool output in full (the transcript only shows a one-line preview), and a live
+spinner with elapsed seconds shows that a task is running, not hung.
 
 Picking a provider or model never means typing a name from memory:
 
-- **TUI** — bare `/provider` and `/model` open a list overlay: type to filter,
-  `↑/↓` to move, `Enter` to switch, `Esc` to cancel. Choosing a provider then
-  offers that provider's models.
+- **TUI** — bare `/model` opens ONE list of `provider/model` rows (the current
+  pick first, live model lists merged with the config + built-in fallback), so a
+  single selection switches provider and model together; type to filter, `↑/↓`
+  to move, `Enter` to switch, `Esc` to cancel. Bare `/provider` stays for
+  provider-only switches. Switching keeps the conversation — only the wire
+  changes — and it runs in the background with the spinner visible instead of
+  freezing the screen. `/resume` repoints autosave at the session it loaded.
 - **Line REPL** — bare `/provider` / `/model` print a numbered list; follow up
-  with `/model 2` (by number) or `/model gpt-4o` (by name). `/model` also gets
-  TAB completion.
+  with `/model 2` (by number) or `/model <provider>/<model>` (by name, one
+  step). `/model` also gets TAB completion.
+- Slash commands complete as you type: `Enter` on a half-typed command runs the
+  unique match (`/mod` → `/model`) or the row the dropdown highlights, and an
+  ambiguous prefix (`/co`) lists its candidates.
 - Candidates come from the provider's `models = [...]` config list, a live
-  `GET /models` query, and a built-in fallback — merged and deduped, so the
-  picker works offline and never blocks on a dead endpoint. First run (missing
-  key) walks you through choosing a provider and model before asking for the key.
+  `GET /models` query (parallel, capped at 1.2 s each), and a built-in
+  fallback — merged and deduped, so the picker works offline and never blocks
+  on a dead endpoint. First run (missing key) walks you through choosing a
+  provider and model before asking for the key.
 
 Every task run checkpoints the files it is about to modify (newest 20 kept),
-so `/undo` is a one-keystroke safety net after an aggressive edit.
+so `/undo` is a one-keystroke safety net after an aggressive edit. The report
+names every path it restored, removed or failed on, and a checkpoint that was
+already replayed is never applied twice — hand fixes in between stay safe.
 
 Permission modes: `edit` (default) gates commands behind approval, `read-only`
 refuses anything that writes, and `yolo` runs unattended. `Shift+Tab` cycles
@@ -203,8 +230,10 @@ a single server can answer several calls from one model round at once.
   duplicate an already-printed answer.
 - Token usage of the current task shows in `/status` and in the
   `--output json` report.
-- `/compact` summarizes the overshooting turns into the system prompt
-  instead of dropping them blind — goals, paths and pending steps survive.
+- `/compact` acts only when the context is over budget (it reports how many
+  messages it replaced and says plainly when the summarizer failed and the
+  drop was lossy); `/compact force` drops anyway. `/context` shows the budget,
+  the auto-compact threshold and how many summaries ride in the system prompt.
 
 Saved conversations are visible and exportable:
 
@@ -221,9 +250,15 @@ kazi export fix-kproxy-delay notes.md
 
 - `run_command` never executes without either a config allowlist match, a **y/N
   confirmation**, or the explicit `--yolo` flag.
-- Allowlisted commands must be separator-free (`; & | < > backtick`, newline) —
-  otherwise they still prompt.
-- File tools can be sandboxed with `tools.sandbox_root`.
+- Allowlisted commands must be separator-free (`; & | < > backtick`, newline,
+  `$(`, and `%` on Windows, where cmd expands it before parsing) — otherwise
+  they still prompt. `a` ("always") remembers the exact command line, not the
+  binary, so approving `git log` never clears `git push --force`.
+- File tools can be sandboxed with `tools.sandbox_root` — that now covers
+  `search_files` and `run_command`'s `cwd` too, not just read/write.
+- A denial can carry a reason (type it at the line REPL's approval prompt):
+  the model receives it and may correct the command, instead of being told
+  never to retry.
 - `fetch_url` refuses localhost/private IPs by design.
 - Model responses can lie or edit aggressively; skim `--yolo` sessions.
 - Session transcripts may contain prompt-injected content from fetched pages;

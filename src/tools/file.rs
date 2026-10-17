@@ -308,7 +308,11 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "v2");
 
-        assert_eq!(store.undo_latest().unwrap(), Some(1));
+        let crate::tools::checkpoint::UndoOutcome::Replayed(done) = store.undo_latest().unwrap()
+        else {
+            panic!("epoch exists");
+        };
+        assert_eq!(done.restored, vec![d.join("a.txt")]);
         assert_eq!(
             std::fs::read_to_string(d.join("a.txt")).unwrap(),
             "v1",

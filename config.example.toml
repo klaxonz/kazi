@@ -1,6 +1,8 @@
 # kazi configuration example.
-# Copy to the config path shown by `kazi config` and edit.
-# API keys are never stored here - they come from environment variables.
+# `kazi config --init` writes this file; running bare `kazi` offers to as well.
+# API keys never live in this file: they come from environment variables
+# (`api_key_env` below) or from the local store written by `kazi auth set <nick>`.
+# When both are set, the environment variable wins.
 
 # provider used when --provider is omitted
 provider = "deepseek"
@@ -22,7 +24,7 @@ provider = "deepseek"
 # api_key_env = "EXAMPLE_TOKEN"
 
 # [tools]
-# sandbox_root = ""                # if set, file tools cannot touch paths outside this root
+# sandbox_root = "D:/Code"         # if set, file tools stay inside this root; leave the line commented to disable
 # command_timeout_secs = 120       # per run_command call
 # output_limit = 64000             # max characters of stdout/stderr fed back to the model
 # allow_commands = ["cargo build", "cargo test", "git status"]   # auto-approved after safety check

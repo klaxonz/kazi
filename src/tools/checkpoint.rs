@@ -9,7 +9,9 @@
 //! ```
 //! Entries record `existed: false` for to-be-created files, so undo deletes
 //! them. Undo replays entries in reverse (last snapshot wins per file) and is
-//! best-effort per file: one failure does not abort the rest.
+//! best-effort per file: one failure does not abort the rest. A replayed epoch
+//! gets a `.undone` marker, so `/undo` can never apply the same backup twice
+//! over whatever the user edited in between.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -19,6 +21,9 @@ use serde::{Deserialize, Serialize};
 
 /// How many epochs to keep on disk.
 const KEEP_EPOCHS: usize = 20;
+
+/// Marker file inside a replayed epoch dir.
+const UNDONE_MARKER: &str = ".undone";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Entry {
@@ -30,14 +35,43 @@ struct Entry {
     existed: bool,
 }
 
+/// Paths a replay touched, split by what happened to them.
+#[derive(Debug, Default)]
+pub struct Undone {
+    /// Files whose pre-write content was put back.
+    pub restored: Vec<PathBuf>,
+    /// Files that did not exist before the task and were deleted again.
+    pub removed: Vec<PathBuf>,
+    /// Files that could not be touched (locked, missing, permissions).
+    pub failed: Vec<PathBuf>,
+}
+
+/// What `/undo` found for the newest checkpoint.
+#[derive(Debug)]
+pub enum UndoOutcome {
+    /// No checkpointed task exists yet.
+    Nothing,
+    /// The newest checkpoint was already replayed before.
+    AlreadyUndone,
+    /// A checkpoint was replayed; [`Undone`] says what happened per file.
+    Replayed(Undone),
+}
+
 /// Low-level store: epoch allocation, snapshots, undo.
 pub struct Checkpoints {
     root: PathBuf,
+    /// Held across snapshot index allocation + manifest append: parallel tool
+    /// calls in one round used to read the same line count and claim the same
+    /// `files/<idx>` slot, so `/undo` restored one file's bytes into another.
+    write_lock: Mutex<()>,
 }
 
 impl Checkpoints {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            write_lock: Mutex::new(()),
+        }
     }
 
     /// Allocate the next epoch (`max-on-disk + 1`) and prune old ones.
@@ -67,6 +101,7 @@ impl Checkpoints {
     /// swallowed (an un-undoable write is worse than no safety net, but must
     /// never block the write itself).
     pub fn snapshot(&self, epoch: u64, path: &Path) {
+        let _serialized = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let dir = self.epoch_dir(epoch);
         let files = dir.join("files");
         if std::fs::create_dir_all(&files).is_err() {
@@ -101,38 +136,58 @@ impl Checkpoints {
         }
     }
 
-    /// Restore the newest epoch. Returns how many files were restored/removed.
-    pub fn undo_latest(&self) -> std::io::Result<Option<usize>> {
+    /// Restore the newest epoch unless it was already replayed. An epoch with
+    /// failures stays replayable so a locked file can be retried.
+    pub fn undo_latest(&self) -> std::io::Result<UndoOutcome> {
         let Some(epoch) = self.latest_epoch() else {
-            return Ok(None);
+            return Ok(UndoOutcome::Nothing);
         };
-        self.undo(epoch).map(Some)
+        if self.epoch_dir(epoch).join(UNDONE_MARKER).exists() {
+            return Ok(UndoOutcome::AlreadyUndone);
+        }
+        let undone = self.undo(epoch)?;
+        if undone.failed.is_empty() {
+            let _ = std::fs::write(self.epoch_dir(epoch).join(UNDONE_MARKER), b"");
+        }
+        Ok(UndoOutcome::Replayed(undone))
     }
 
-    /// Restore one epoch: entries replayed last-first so the newest snapshot
-    /// of a repeatedly-written file wins.
-    pub fn undo(&self, epoch: u64) -> std::io::Result<usize> {
+    /// Replay one epoch: entries last-first so the newest snapshot of a
+    /// repeatedly-written file wins. Best-effort per file — a failure lands in
+    /// [`Undone::failed`] and does not abort the rest. An epoch whose manifest
+    /// is absent means the task changed nothing (the dir is created up front).
+    pub fn undo(&self, epoch: u64) -> std::io::Result<Undone> {
         let dir = self.epoch_dir(epoch);
         let manifest = dir.join("manifest.jsonl");
-        let text = std::fs::read_to_string(&manifest)?;
+        let text = match std::fs::read_to_string(&manifest) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e),
+        };
         let entries: Vec<Entry> = text
             .lines()
             .filter_map(|l| serde_json::from_str(l).ok())
             .collect();
 
-        let mut restored = 0usize;
+        let mut done = Undone::default();
         for entry in entries.iter().rev() {
-            let ok = match (&entry.backup, entry.existed) {
-                (Some(rel), true) => std::fs::copy(dir.join(rel), &entry.path).is_ok(),
-                (None, false) => !entry.path.exists() || std::fs::remove_file(&entry.path).is_ok(),
-                (Some(_), false) => true, // inconsistent manifest: skip
-                (None, true) => false,
-            };
-            if ok {
-                restored += 1;
+            match (&entry.backup, entry.existed) {
+                (Some(rel), true) => match std::fs::copy(dir.join(rel), &entry.path) {
+                    Ok(_) => done.restored.push(entry.path.clone()),
+                    Err(_) => done.failed.push(entry.path.clone()),
+                },
+                (None, false) => {
+                    if !entry.path.exists() || std::fs::remove_file(&entry.path).is_ok() {
+                        done.removed.push(entry.path.clone());
+                    } else {
+                        done.failed.push(entry.path.clone());
+                    }
+                }
+                (Some(_), false) => {} // inconsistent manifest: skip
+                (None, true) => done.failed.push(entry.path.clone()),
             }
         }
-        Ok(restored)
+        Ok(done)
     }
 
     fn prune(&self) {
@@ -190,7 +245,7 @@ impl Checkpointing {
     }
 
     /// `/undo`: restore the newest epoch.
-    pub fn undo_latest(&self) -> std::io::Result<Option<usize>> {
+    pub fn undo_latest(&self) -> std::io::Result<UndoOutcome> {
         self.store.undo_latest()
     }
 }
@@ -221,8 +276,11 @@ mod tests {
         cp.snapshot(&file);
         std::fs::write(&file, "changed by the agent").unwrap();
 
-        let restored = cp.undo_latest().unwrap().expect("epoch exists");
-        assert_eq!(restored, 1);
+        let UndoOutcome::Replayed(done) = cp.undo_latest().unwrap() else {
+            panic!("epoch exists");
+        };
+        assert_eq!(done.restored, vec![file.clone()]);
+        assert!(done.failed.is_empty());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "original");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -238,8 +296,10 @@ mod tests {
         std::fs::write(&file, "created").unwrap();
         assert!(file.exists());
 
-        let restored = cp.undo_latest().unwrap().expect("epoch exists");
-        assert_eq!(restored, 1);
+        let UndoOutcome::Replayed(done) = cp.undo_latest().unwrap() else {
+            panic!("epoch exists");
+        };
+        assert_eq!(done.removed, vec![file.clone()]);
         assert!(!file.exists(), "undo must remove created files");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -260,16 +320,101 @@ mod tests {
         std::fs::write(&file, "v3").unwrap();
 
         // undo only touches the newest epoch → back to v2
-        assert_eq!(cp.undo_latest().unwrap(), Some(1));
+        let UndoOutcome::Replayed(done) = cp.undo_latest().unwrap() else {
+            panic!("epoch exists");
+        };
+        assert_eq!(done.restored.len(), 1);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "v2");
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn undo_without_epochs_is_none() {
+    fn undo_without_epochs_is_nothing() {
         let root = tempdir("empty");
         let cp = Checkpointing::new(root.join("store"));
-        assert_eq!(cp.undo_latest().unwrap(), None);
+        assert!(matches!(cp.undo_latest().unwrap(), UndoOutcome::Nothing));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_second_undo_never_replays_the_same_epoch() {
+        let root = tempdir("twice");
+        let cp = Checkpointing::new(root.join("store"));
+        let file = root.join("f.txt");
+        std::fs::write(&file, "v1").unwrap();
+
+        let _epoch = cp.begin_epoch();
+        cp.snapshot(&file);
+        std::fs::write(&file, "agent edit").unwrap();
+
+        assert!(matches!(
+            cp.undo_latest().unwrap(),
+            UndoOutcome::Replayed(_)
+        ));
+        // the user fixes things by hand; a repeated /undo must not clobber that
+        std::fs::write(&file, "hand-fixed").unwrap();
+        assert!(matches!(
+            cp.undo_latest().unwrap(),
+            UndoOutcome::AlreadyUndone
+        ));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hand-fixed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn undo_after_a_task_that_changed_nothing_is_empty_not_an_error() {
+        let root = tempdir("nochanges");
+        let cp = Checkpointing::new(root.join("store"));
+        let _epoch = cp.begin_epoch(); // dir created up front, nothing snapshotted
+
+        let UndoOutcome::Replayed(done) = cp.undo_latest().unwrap() else {
+            panic!("epoch exists");
+        };
+        assert_eq!(
+            done.restored.len() + done.removed.len() + done.failed.len(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Parallel tool calls in one round snapshot concurrently: every file must
+    /// get its own backup slot, or undo restores one file's bytes into another.
+    #[test]
+    fn parallel_snapshots_keep_distinct_backups() {
+        let root = tempdir("parallel");
+        let cp = std::sync::Arc::new(Checkpointing::new(root.join("store")));
+        let _epoch = cp.begin_epoch();
+        let files: Vec<PathBuf> = (0..8).map(|i| root.join(format!("f{i}.txt"))).collect();
+        for (i, f) in files.iter().enumerate() {
+            std::fs::write(f, format!("v{i}")).unwrap();
+        }
+
+        let handles: Vec<_> = files
+            .iter()
+            .cloned()
+            .map(|f| {
+                let cp = cp.clone();
+                std::thread::spawn(move || cp.snapshot(&f))
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        for f in &files {
+            std::fs::write(f, "clobbered").unwrap();
+        }
+
+        let UndoOutcome::Replayed(done) = cp.undo_latest().unwrap() else {
+            panic!("epoch exists");
+        };
+        assert_eq!(done.restored.len(), files.len(), "one backup per file");
+        for (i, f) in files.iter().enumerate() {
+            assert_eq!(
+                std::fs::read_to_string(f).unwrap(),
+                format!("v{i}"),
+                "file {i} must restore from its own backup"
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 }

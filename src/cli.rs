@@ -52,7 +52,11 @@ pub struct EngineArgs {
     #[arg(long)]
     pub yolo: bool,
     /// Startup permission mode: read-only | edit (default) | yolo
-    #[arg(long = "permission-mode", value_name = "MODE")]
+    #[arg(
+        long = "permission-mode",
+        value_name = "MODE",
+        value_parser = parse_permission_mode
+    )]
     pub permission_mode: Option<String>,
     /// Force the classic line REPL instead of the TUI (pipes/scripts always
     /// get the line REPL automatically)
@@ -119,6 +123,9 @@ pub enum Command {
         session: String,
         /// Output path (default: `<session>.md` in the working directory)
         out: Option<PathBuf>,
+        /// Overwrite the target file if it already exists
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -173,7 +180,11 @@ pub async fn execute(cli: Cli) -> anyhow::Result<u8> {
         Some(Command::Tools) => tools_cmd(),
         Some(Command::Sessions) => sessions_cmd(),
         Some(Command::Rm { session }) => rm_cmd(&session),
-        Some(Command::Export { session, out }) => export_cmd(&session, out.as_deref()),
+        Some(Command::Export {
+            session,
+            out,
+            force,
+        }) => export_cmd(&session, out.as_deref(), force),
     }
 }
 
@@ -182,24 +193,51 @@ async fn chat(
     topic: Option<String>,
     cfg_path: Option<&Path>,
 ) -> anyhow::Result<u8> {
-    let (cfg, _) = config::load(cfg_path)?;
     // TUI is the default on real terminals; pipes/redirects (scripts, tests)
     // always get the line REPL unless --tui is forced.
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let want_tui = !args.no_tui && (args.tui || interactive);
-    // On a real terminal a missing key should not hard-exit: offer to store
-    // one (like claude/codex onboarding). Non-interactive paths keep the
-    // fail-fast contract.
+
+    let (cfg, cfg_file) = match config::load(cfg_path) {
+        Ok(v) => v,
+        Err(config::ConfigError::Missing { path }) => {
+            // A truly fresh install: offer to create the file right here
+            // instead of bouncing the user to another command first.
+            if !interactive {
+                return Err(config::ConfigError::Missing { path }.into());
+            }
+            println!("{YELLOW}no config file yet at {}{RESET}", path.display());
+            if !ask_yes("create it from the built-in example now?", true)? {
+                return Err(config::ConfigError::Missing { path }.into());
+            }
+            config::write_example(&path)?;
+            println!("{DIM}wrote {}{RESET}", path.display());
+            config::load(cfg_path)?
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    // On a real terminal a missing key should not hard-exit: use a provider
+    // that is already ready, or offer to store a key (like claude/codex
+    // onboarding). Non-interactive paths keep the fail-fast contract.
     let mut provider = args.provider.clone();
     let mut model = args.model.clone();
     match cfg.resolve(provider.as_deref(), model.as_deref()) {
         Ok(r) => {
             if let Err(e) = cfg.api_key_for(&r.nick) {
-                if !interactive {
+                if let Some(alt) = cfg.first_provider_with_key(Some(&r.nick)) {
+                    // another provider is ready — use it instead of repeating
+                    // the onboarding ceremony on every single launch
+                    println!(
+                        "{DIM}`{}` has no key — using `{alt}` instead (fix it with: kazi auth set {}){RESET}",
+                        r.nick, r.nick
+                    );
+                    provider = Some(alt);
+                    model = None;
+                } else if !interactive {
                     return Err(e.into());
-                }
-                if let Some((p, m)) = onboarding_pick(&cfg, &r.nick, Some(&e)).await? {
-                    println!("{DIM}using `{p}` / `{m}` for this session — add them to config.toml to keep them{RESET}");
+                } else if let Some((p, m)) = onboarding_pick(&cfg, &r.nick, Some(&e)).await? {
+                    persist_choice(&cfg_file, &p, Some(&m));
                     provider = Some(p);
                     model = Some(m);
                 }
@@ -213,7 +251,7 @@ async fn chat(
             }
             match onboarding_pick(&cfg, "", None).await? {
                 Some((p, m)) => {
-                    println!("{DIM}using `{p}` / `{m}` for this session — add them to config.toml to keep them{RESET}");
+                    persist_choice(&cfg_file, &p, Some(&m));
                     provider = Some(p);
                     model = Some(m);
                 }
@@ -226,6 +264,38 @@ async fn chat(
         return tui::chat_loop_with(cfg, provider, model, mode, topic, args.resume.clone()).await;
     }
     repl::chat_loop(cfg, provider, model, mode, topic, args.resume.clone()).await
+}
+
+/// Remember a first-run choice in the config file, so the next launch does not
+/// ask again. Best-effort: a read-only config must never block the session.
+fn persist_choice(cfg_file: &Path, nick: &str, model: Option<&str>) {
+    match config::set_default_provider(cfg_file, nick, model) {
+        Ok(()) => println!(
+            "{DIM}saved `{nick}` as the default in {}{RESET}",
+            cfg_file.display()
+        ),
+        Err(e) => println!(
+            "{YELLOW}could not save the choice to {}: {e}{RESET}",
+            cfg_file.display()
+        ),
+    }
+}
+
+/// `[Y/n]`-style confirmation for pre-REPL flows; EOF takes the default.
+fn ask_yes(prompt: &str, default_yes: bool) -> anyhow::Result<bool> {
+    let hint = if default_yes { "[Y/n]" } else { "[y/N]" };
+    print!("{prompt} {hint}: ");
+    use std::io::Write;
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line)? == 0 {
+        return Ok(default_yes);
+    }
+    match line.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(default_yes),
+        "y" | "yes" => Ok(true),
+        _ => Ok(false),
+    }
 }
 
 #[cfg(test)]
@@ -299,7 +369,23 @@ fn startup_mode(cfg: &config::Config, args: &EngineArgs) -> crate::tools::Permis
     {
         return m;
     }
+    // a typo in the config used to silently mean "edit"
+    if let Some(raw) = cfg.agent.permission_mode.as_deref() {
+        if crate::tools::PermissionMode::parse(raw).is_none() {
+            eprintln!(
+                "{YELLOW}config agent.permission_mode = \"{raw}\" is not a mode (read-only | edit | yolo) — using edit{RESET}"
+            );
+        }
+    }
     Agent::initial_mode(cfg, args.yolo)
+}
+
+/// clap validator for `--permission-mode`: a typo fails loudly instead of
+/// silently starting in `edit`.
+fn parse_permission_mode(s: &str) -> Result<String, String> {
+    crate::tools::PermissionMode::parse(s)
+        .map(|m| m.as_str().to_string())
+        .ok_or_else(|| format!("unknown permission mode `{s}` (allowed: read-only | edit | yolo)"))
 }
 
 #[derive(Serialize)]
@@ -352,12 +438,12 @@ async fn run_once(
                     a
                 }
                 Err(e) => {
-                    println!("cannot resume `{name}`: {e}");
+                    eprintln!("cannot resume `{name}`: {e}");
                     agent
                 }
             },
             None => {
-                println!("no stored session matches `{raw}`");
+                eprintln!("no stored session matches `{raw}`");
                 agent
             }
         }
@@ -428,7 +514,11 @@ fn config_cmd(init: bool) -> anyhow::Result<u8> {
                 return Ok(1);
             }
         }
-        println!("edit provider/model there, then export its `api_key_env` variable.");
+        println!("next steps:");
+        println!("  1. just run `kazi` — it walks you through provider/model and stores a key");
+        println!("  2. or edit the file by hand, then make a key available:");
+        println!("       export <PROVIDER>_API_KEY=...   (env vars always win)");
+        println!("       kazi auth set <provider>        (stored locally, see `kazi providers`)");
         return Ok(0);
     }
     println!("config path: {}", path.display());
@@ -437,6 +527,8 @@ fn config_cmd(init: bool) -> anyhow::Result<u8> {
             Ok(t) => println!("\n{DIM}--- contents ---{RESET}\n{t}"),
             Err(e) => println!("{RED}cannot read {path:?}: {e}{RESET}"),
         }
+    } else {
+        println!("{YELLOW}no file there yet — create it with: kazi config --init{RESET}");
     }
     Ok(0)
 }
@@ -456,9 +548,7 @@ fn providers_cmd(cfg_path: Option<&Path>) -> anyhow::Result<u8> {
                 let env_name = entry
                     .api_key_env
                     .clone()
-                    .or_else(|| {
-                        config::Config::default_key_env(kind).map(str::to_string)
-                    })
+                    .or_else(|| config::Config::default_key_env(kind).map(str::to_string))
                     .unwrap_or_default();
                 let env_ok = std::env::var(&env_name)
                     .map(|v| !v.trim().is_empty())
@@ -472,7 +562,9 @@ fn providers_cmd(cfg_path: Option<&Path>) -> anyhow::Result<u8> {
                 } else if stored {
                     format!("{DIM}key: stored (kazi auth){RESET}")
                 } else {
-                    format!("{YELLOW}key: missing — export {env_name} or `kazi auth set {nick}`{RESET}")
+                    format!(
+                        "{YELLOW}key: missing — export {env_name} or `kazi auth set {nick}`{RESET}"
+                    )
                 }
             }
             Err(_) => String::new(),
@@ -491,12 +583,34 @@ fn auth_cmd(cmd: Option<AuthCmd>, cfg_path: Option<&Path>) -> anyhow::Result<u8>
     match cmd {
         AuthCmd::List => {
             let store = crate::auth::load()?;
+            let path = crate::auth::auth_path()?;
             if store.keys.is_empty() {
-                println!("no stored keys yet — add one with: {CYAN}kazi auth set <provider>{RESET}");
+                println!(
+                    "no stored keys yet — the store would be {}{DIM}(env vars always win over it){RESET}",
+                    path.display()
+                );
+                // name the providers: "<provider>" is not a usable instruction
+                if let Ok((cfg, _)) = config::load(cfg_path) {
+                    let need: Vec<String> = cfg
+                        .nicks()
+                        .into_iter()
+                        .filter(|n| {
+                            cfg.kind_of_nick(n)
+                                .map(|k| k != crate::llm::ProviderKind::Ollama)
+                                .unwrap_or(true)
+                        })
+                        .collect();
+                    if !need.is_empty() {
+                        println!("providers that need one: {}", need.join(", "));
+                        println!("store one with: {CYAN}kazi auth set <provider>{RESET}");
+                    }
+                }
                 return Ok(0);
             }
-            let path = crate::auth::auth_path()?;
-            println!("{DIM}stored keys (env vars still win): {}{RESET}", path.display());
+            println!(
+                "{DIM}stored keys (env vars still win): {}{RESET}",
+                path.display()
+            );
             for nick in store.keys.keys() {
                 println!("  {CYAN}{nick}{RESET}");
             }
@@ -522,7 +636,14 @@ fn auth_cmd(cmd: Option<AuthCmd>, cfg_path: Option<&Path>) -> anyhow::Result<u8>
                             "usage: kazi auth set <provider> [KEY] — run `kazi providers` to list them"
                         );
                     }
-                    match pick_one("pick a provider to store a key for", &candidates, 0) {
+                    // default to the provider the config actually selects, not
+                    // whatever sorts first alphabetically
+                    let default = cfg
+                        .resolve(None, None)
+                        .ok()
+                        .and_then(|r| candidates.iter().position(|c| c == &r.nick))
+                        .unwrap_or(0);
+                    match pick_one("pick a provider to store a key for", &candidates, default) {
                         Some(i) => candidates[i].clone(),
                         None => return Ok(1),
                     }
@@ -702,8 +823,8 @@ fn resolve_pick(input: &str, items: &[String], default: usize) -> Option<usize> 
 }
 
 /// Numbered picker for the pre-REPL/pre-TUI flows (onboarding, `kazi auth
-/// set`): prints the items and reads one line from stdin. `None` on EOF or
-/// nothing to choose.
+/// set`): prints the items and reads one line from stdin. Blank takes the
+/// default, `q` cancels; `None` on EOF or nothing to choose.
 fn pick_one(prompt: &str, items: &[String], default: usize) -> Option<usize> {
     if items.is_empty() {
         return None;
@@ -714,11 +835,19 @@ fn pick_one(prompt: &str, items: &[String], default: usize) -> Option<usize> {
         let mark = if i == default { "  (default)" } else { "" };
         println!("  {}) {it}{mark}", i + 1);
     }
-    print!("choose [1-{}, Enter = {}]: ", items.len(), default + 1);
+    print!(
+        "choose [1-{}, Enter = {}, q = cancel]: ",
+        items.len(),
+        default + 1
+    );
     use std::io::Write;
     let _ = std::io::stdout().flush();
     let mut line = String::new();
     if std::io::stdin().read_line(&mut line).is_err() {
+        return None;
+    }
+    if matches!(line.trim().to_ascii_lowercase().as_str(), "q" | "quit") {
+        println!("{DIM}cancelled{RESET}");
         return None;
     }
     resolve_pick(&line, items, default)
@@ -799,13 +928,33 @@ fn sessions_cmd() -> anyhow::Result<u8> {
         return Ok(0);
     }
     for s in summaries {
-        let topic = s.topic.unwrap_or_else(|| "-".into());
+        let topic: String = s
+            .topic
+            .unwrap_or_else(|| "-".into())
+            .replace(['\n', '\r'], " ");
+        let age = age_label(s.saved_at);
+        let cwd = s
+            .cwd
+            .as_deref()
+            .map(|c| format!("  {DIM}in {c}{RESET}"))
+            .unwrap_or_default();
         println!(
-            "{CYAN}{:<24}{RESET} {:>3} msgs  {DIM}{}{RESET}",
-            s.name, s.messages, topic
+            "{CYAN}{:<24}{RESET} {:>3} msgs  {DIM}{age:>4}{RESET}  {topic}{cwd}",
+            s.name, s.messages
         );
     }
     Ok(0)
+}
+
+/// Human age label for a save timestamp (`3m`, `4h`, `2d`).
+fn age_label(saved_at: u64) -> String {
+    let secs = crate::agent::session::now_secs().saturating_sub(saved_at);
+    match secs {
+        0..=59 => "now".to_string(),
+        60..=3_599 => format!("{}m", secs / 60),
+        3_600..=86_399 => format!("{}h", secs / 3_600),
+        _ => format!("{}d", secs / 86_400),
+    }
 }
 
 /// Delete a saved session (`kazi rm <name-prefix>`).
@@ -823,14 +972,20 @@ fn rm_cmd(session: &str) -> anyhow::Result<u8> {
     }
 }
 
-fn export_cmd(session: &str, out: Option<&Path>) -> anyhow::Result<u8> {
+fn export_cmd(session: &str, out: Option<&Path>, force: bool) -> anyhow::Result<u8> {
     let name = match crate::agent::session::resolve(session) {
         Some(n) => n,
         None => {
-            let have = crate::agent::session::list().join(", ");
-            println!(
-                "{RED}no saved session matches `{session}`{RESET}{DIM}(stored: {have}){RESET}"
-            );
+            let matches: Vec<String> = crate::agent::session::list()
+                .into_iter()
+                .filter(|n| n.starts_with(session))
+                .collect();
+            let why = if matches.len() > 1 {
+                format!("`{session}` is ambiguous — matches: {}", matches.join(", "))
+            } else {
+                format!("no saved session matches `{session}`")
+            };
+            println!("{RED}{why}{RESET}");
             return Ok(1);
         }
     };
@@ -839,6 +994,13 @@ fn export_cmd(session: &str, out: Option<&Path>) -> anyhow::Result<u8> {
     let target = out
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from(format!("{name}.md")));
+    if target.exists() && !force {
+        println!(
+            "{RED}{} already exists — pass --force to overwrite{RESET}",
+            target.display()
+        );
+        return Ok(1);
+    }
     if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }

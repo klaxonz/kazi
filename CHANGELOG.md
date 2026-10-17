@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Bare `/resume` now lists stored sessions with message count, age and topic
+  (same data as `kazi sessions`) instead of a bare name dump; an ambiguous
+  prefix names the sessions that match instead of pretending nothing was found.
+- Approval prompts state their scope: `a` = "always this command (session)".
+  Session approvals are shared across agent rebuilds, so `/provider` or
+  `/model` no longer forgets them.
+- The TUI's pending approval is echoed (command + `cwd`) into the transcript
+  and rendered wrapped over as many rows as it needs, instead of a single
+  clipped line.
 - **Provider and model selection no longer means typing a name from memory.**
   Bare `/provider` and `/model` now offer a picker: the TUI opens a list
   overlay (type to filter, `↑/↓` to move, `Enter` to switch, `Esc` to cancel,
@@ -22,9 +31,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and Anthropic; Ollama reuses the OpenAI wire), and a built-in fallback —
   deduped with the current model first, tolerant of an offline endpoint. The
   `Provider` trait gained a defaulted `list_models()`.
+- `/last [n]` prints the newest tool output in full (the transcript only ever
+  shows a clipped one-line preview), so what the model actually read is
+  auditable.
+- `/auth` reports where the active provider's key comes from (env vs stored)
+  and the exact command that fixes a missing one; a 401 appends that hint, and
+  the TUI shows it before the first task instead of failing mid-run.
+- Real multi-line input in the TUI: `Ctrl+J` starts a new line (so do pastes),
+  the input box grows, `↑/↓` move between lines, `Home`/`End` stay inside the
+  current line.
+- Shared, persisted input history (`<data-dir>/kazi/history.txt`): `↑` after a
+  restart recalls the last tasks in both front-ends.
+- `@path` TAB completion in both front-ends (directories keep the separator so
+  completion can continue).
+- `/resume` replays the loaded conversation into the TUI transcript instead of
+  loading only the model's memory.
+- The TUI status bar shows a live spinner and elapsed seconds while a task
+  runs — a model thinking quietly used to look exactly like a hang.
+- `kazi sessions` shows age and the session's working directory; bare `/resume`
+  shows the same table.
+- First run: bare `kazi` with no config offers to create it, the provider /
+  model / key choice is written back into `config.toml`, and a provider that is
+  already ready is used automatically — onboarding stops repeating every
+  launch. `kazi config` says when the file is missing, `kazi auth list` names
+  the providers that need a key.
+- `kazi export` refuses to overwrite an existing file without `--force`.
 
 ### Fixed
 
+- **Quitting the TUI mid-task no longer discards the session.** Every finished
+  task autosaves (matching the line REPL), quitting with a task in flight
+  cancels it and waits briefly for the agent before the final save, and the
+  exit line stops claiming "session saved" when nothing reached the disk.
+- **`/resume` repoints autosave at the loaded session** in both front-ends.
+  Follow-up work used to be written into the session the chat started in, so
+  the resumed conversation appeared to vanish on the next launch.
+- **`/undo` can no longer corrupt files or replay itself.** Parallel tool calls
+  in one round could claim the same backup slot (undo restored one file's bytes
+  into another); snapshots are serialized now. A replayed checkpoint is marked
+  `.undone`, so a second `/undo` reports it instead of clobbering later hand
+  edits, and the report lists the restored / removed / failed paths.
+- **Permission changes no longer throw the conversation away.** `/yolo` and
+  `/permission` in the line REPL flip the shared cell in place, and a
+  `/provider` or `/model` switch (both front-ends) carries the history over —
+  only the wire changes.
+- **The TUI approval prompt is modal.** `Enter` no longer means "allow" and
+  stray keystrokes are ignored — only `y`/`a`/`n`/`Esc` answer, so typing the
+  next task can never grant an approval by accident.
+- Allowlist hardening: `$(` (command substitution) and, on Windows, `%VAR%`
+  expansion count as separators; a command that matches `tools.allow_commands`
+  but contains either now prompts.
+- TUI paste is bracketed: a multi-line paste lands as ONE task (`↵` marks the
+  breaks) instead of firing its first line as a task and stuffing the rest into
+  the input box.
+- AltGr characters (`@ \ [ ] { } |` on non-US layouts) reach the TUI input
+  again, the scroll hint names the real key (`Ctrl+End`), and pressing `Enter`
+  while a task runs says so instead of silently doing nothing.
+- **`/compact` honours the budget now** (`/compact force` drops anyway) and
+  reports how many messages it replaced; a summarizer failure says plainly that
+  the drop was lossy. `/context` explains the auto-compact threshold and counts
+  the summary blocks riding in the system prompt.
+- **Esc cancels during tool execution too** — the flag was only polled between
+  rounds and while streaming, so a 120-second `run_command` ignored it.
+- Command verbs are case-insensitive; `/undo 3` explains instead of silently
+  ignoring the argument; `/model <#>` no longer turns a stale number into a
+  literal model name; `/provider` marks the current entry.
+- The line REPL shows the permission mode in the banner and in the prompt
+  (`kazi[ro]>`, `kazi[yolo]>`); a `--permission-mode` typo fails loudly, and a
+  bad `agent.permission_mode` warns instead of silently meaning `edit`.
+- The TUI status bar keeps the permission tag visible on narrow terminals (it
+  moved ahead of the provider text).
+- Sandbox: `search_files` and `run_command`'s `cwd` are checked against
+  `tools.sandbox_root` too — both used to reach outside it. The example config
+  no longer suggests an empty `sandbox_root` that silently means the cwd.
+- `run --output json` keeps stdout valid JSON (resume notices moved to stderr).
+- A denial can carry a reason (line REPL: type it instead of `n`) which the
+  model receives, so it can correct the command instead of being told never to
+  retry.
+- The TUI transcript is capped (4000 rows) and wrapped rows are cached: long
+  sessions no longer re-wrap everything on every keystroke, and a scrolled
+  reader keeps their place as new output arrives.
+- Errors print their cause chain once; `auth.json` is written `0600` on Unix.
+- **Half-typed commands do what you meant.** The TUI dropdown is a real
+  selector now (`↑/↓` move the highlight, `Enter` runs the highlighted row,
+  `Tab` completes a unique match or walks the candidates), and both front-ends
+  complete a partial command name to its unique match (`/mod` → `/model`)
+  instead of erroring — an ambiguous prefix lists its candidates.
+- **Provider/model switching no longer freezes the UI.** The rebuild reused
+  nothing, so every switch re-handshaked MCP servers (60 s timeout each) before
+  the screen moved again; it now reuses the live tool registry, runs as a
+  background task with the spinner and elapsed seconds visible, and the live
+  model probe is capped at 1.2 s per provider, fetched in parallel.
+- The line REPL builds switches through the same path (no MCP re-handshake) and
+  says it is checking the providers before listing models.
+- **`/model` picks provider AND model in one step**: one list of `provider/model`
+  rows, with `/model <provider>/<model>` as the direct form. The old two-overlay
+  chain (provider → model picker) is gone; `/provider` remains for
+  provider-only switches.
 - The model picker no longer offers models its wire cannot serve. An
   Anthropic-wire provider (`/v1/messages`) only answers for Claude models, but
   a gateway's `/models` endpoint may list its whole catalog — Command Code's
@@ -39,6 +142,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The line REPL now remembers a `/provider` or `/model` switch: subsequent
   rebuilds used the config default provider because the switch only updated the
   live agent, never the loop state (the TUI already got this right).
+
+### Changed
+
+- `/compact` without `force` is a no-op when the context is under budget — the
+  documented behaviour now matches the code.
 
 ## [0.14.2] - 2026-10-17
 
