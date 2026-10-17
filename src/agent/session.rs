@@ -65,6 +65,85 @@ pub fn load(name: &str) -> Result<SessionFile, SessionError> {
     serde_json::from_slice(&bytes).map_err(|e| SessionError::Malformed(path, e.to_string()))
 }
 
+/// One match from a cross-session search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionHit {
+    pub session: String,
+    pub saved_at: u64,
+    pub role: &'static str,
+    /// 1-based line inside that message.
+    pub line: usize,
+    pub snippet: String,
+}
+
+/// Search every stored session's user/assistant text (tool output is
+/// deliberately excluded: it is noise for "where did we discuss X"). Newest
+/// sessions first; at most `per_session` hits each, `max_hits` overall.
+pub fn search(query: &str, per_session: usize, max_hits: usize) -> Vec<SessionHit> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<SessionHit> = Vec::new();
+    for summary in list_summaries() {
+        if hits.len() >= max_hits {
+            break;
+        }
+        let Ok(file) = load(&summary.name) else {
+            continue;
+        };
+        let mut found = 0usize;
+        for m in &file.messages {
+            if found >= per_session || hits.len() >= max_hits {
+                break;
+            }
+            let role = match m.role {
+                crate::llm::Role::User => "you",
+                crate::llm::Role::Assistant => "kazi",
+                _ => continue,
+            };
+            for (i, line) in m.text().lines().enumerate() {
+                if found >= per_session || hits.len() >= max_hits {
+                    break;
+                }
+                if line.to_lowercase().contains(&needle) {
+                    hits.push(SessionHit {
+                        session: summary.name.clone(),
+                        saved_at: summary.saved_at,
+                        role,
+                        line: i + 1,
+                        snippet: snippet_around(line, &needle, 80),
+                    });
+                    found += 1;
+                }
+            }
+        }
+    }
+    hits
+}
+
+/// A window around the first match, marked with `…` when clipped.
+fn snippet_around(line: &str, needle: &str, width: usize) -> String {
+    let lower = line.to_lowercase();
+    let Some(pos) = lower.find(needle) else {
+        return line.chars().take(width).collect();
+    };
+    let chars: Vec<char> = line.chars().collect();
+    // byte position → char position (the needle may follow multi-byte text)
+    let char_pos = line[..pos].chars().count();
+    let start = char_pos.saturating_sub(width / 3);
+    let end = (char_pos + needle.chars().count() + width / 2).min(chars.len());
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.extend(chars[start..end].iter());
+    if end < chars.len() {
+        out.push('…');
+    }
+    out.trim().to_string()
+}
+
 /// Names of all stored sessions, sorted newest first.
 pub fn list() -> Vec<String> {
     list_summaries().into_iter().map(|s| s.name).collect()
@@ -266,6 +345,46 @@ mod tests {
         assert!(back.messages[2].is_error);
         assert_eq!(back.system.as_deref(), Some("sys"));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn search_finds_text_across_sessions_and_reports_where() {
+        let base = format!("find-test-{}", std::process::id());
+        let a = format!("{base}-a");
+        let b = format!("{base}-b");
+        // a unique needle: earlier failed runs leave sessions behind, and a
+        // global word like "kproxy" would count those too
+        let needle = format!("kproxy{}", std::process::id());
+        let msgs_a = vec![
+            crate::llm::Message::user(format!("we discussed the {needle} delay problem")),
+            crate::llm::Message::assistant(format!("the {needle} fix was to retry the socket")),
+            crate::llm::Message::tool_result(
+                "t1",
+                format!("{needle} delay appears in tool output"),
+                false,
+            ),
+        ];
+        let msgs_b = vec![crate::llm::Message::assistant("no such topic here")];
+        save(&a, None, &msgs_a).unwrap();
+        save(&b, None, &msgs_b).unwrap();
+
+        let hits = search(&needle, 3, 10);
+        assert_eq!(hits.len(), 2, "tool output is not searched: {hits:?}");
+        assert!(hits.iter().all(|h| h.session == a));
+        assert!(hits
+            .iter()
+            .any(|h| h.role == "you" && h.snippet.contains("kproxy")));
+        assert!(hits.iter().any(|h| h.role == "kazi"));
+
+        // newest-first ordering is stable enough to assert the first session
+        assert_eq!(hits[0].session, a);
+        // an empty query matches nothing rather than everything
+        assert!(search("   ", 3, 10).is_empty());
+        // a miss is a miss
+        assert!(search("definitely-not-present-xyz", 3, 10).is_empty());
+
+        std::fs::remove_file(sessions_dir().unwrap().join(format!("{a}.json"))).unwrap();
+        std::fs::remove_file(sessions_dir().unwrap().join(format!("{b}.json"))).unwrap();
     }
 
     #[test]

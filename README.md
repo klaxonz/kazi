@@ -50,6 +50,16 @@ theme = "dark"                   # dark | light | nord | solarized | mono (Ctrl+
 # details = true                 # start with full tool output expanded (Ctrl+O)
 # bell = true                    # ring the terminal when a task finishes
 
+[agent]
+# preset = "deep"                # fast | balanced | deep (the TUI's /effort writes this line)
+# max_usd_per_task = 1.00        # stop between rounds once the task costs more
+
+# kazi ships no prices: an unpriced model shows tokens, never a guessed number.
+[usage.prices."deepseek-chat"]
+input = 0.27                     # USD per 1M input tokens
+output = 1.10                    # USD per 1M output tokens
+# cache_read = 0.027             # default: the input price
+
 [providers.deepseek]
 type = "openai"                  # any OpenAI-compatible endpoint
 base_url = "https://api.deepseek.com/v1"
@@ -148,13 +158,15 @@ Slash commands: `/help [command]` (overlay, or one command's usage), `/new`,
 `/provider`, `/model`, `/permission`, `/yolo`, `/allow [clear]`, `/status`,
 `/usage [reset]`, `/context`, `/plan`, `/tools`, `/undo`, `/last [n]`,
 `/diff [n]`, `/queue [clear|drop <n>]`, `/auth`, `/theme`, `/details`,
-`/export [path]`, `/copy [all|tool [n]|diff [n]|code [n]]`, `/retry`, `/exit`.
+`/export [path]`, `/copy [all|tool [n]|diff [n]|code [n]]`, `/retry`,
+`/effort [fast|balanced|deep]`, `/cost [reset]`, `/pin [n|off]`, `/find <text>`,
+`/exit`.
 Every finished task autosaves, so quitting mid-task never costs you the session;
 `/undo` restores the files the last task changed; `/rename` repoints autosave
 and keeps the old file. While a task runs, the commands that only read the
 UI/transcript (`/help`, `/theme`, `/details`, `/permission`, `/yolo`, `/allow`,
 `/plan`, `/status`, `/usage`, `/context`, `/sessions`, `/copy`, `/diff`,
-`/queue`) act immediately instead of refusing the keystroke. `/copy` and
+`/queue`, `/cost`, `/find`) act immediately instead of refusing the keystroke. `/copy` and
 right-click copy use the platform clipboard tool (`clip`, `pbcopy`, `wl-copy`,
 `xclip`, `xsel`) and fall back to the terminal's OSC 52 escape over SSH (or with
 `KAZI_OSC52=1`), so a remote session can copy without extra tooling.
@@ -191,12 +203,30 @@ so `/undo` is a one-keystroke safety net after an aggressive edit. The report
 names every path it restored, removed or failed on, and a checkpoint that was
 already replayed is never applied twice — hand fixes in between stay safe.
 
-Permission modes: `edit` (default) gates commands behind approval, `read-only`
-refuses anything that writes, and `yolo` runs unattended. `Shift+Tab` cycles
-them and `/permission` sets them (both in the TUI); `--permission-mode`
-picks the startup one. `@file` in a task attaches a file's contents (the TUI
+Permission modes: `edit` (default) gates commands behind approval, `review`
+stages every write as a changeset you accept file by file, `read-only` refuses
+anything that writes, and `yolo` runs unattended. `Shift+Tab` cycles them and
+`/permission` sets them (both in the TUI); `--permission-mode` picks the startup
+one. `@file` in a task attaches a file's contents (the TUI
 echoes `attaching @a.rs, @b.rs` when the task starts), and `/context` shows
 where the token budget goes.
+
+**Review mode** is for the tasks you want to see before they land: every write is
+parked, and one modal lists the files with their diffs (`space` toggles a file,
+`a` accepts all, `n` rejects all, `Enter` writes the accepted ones). A rejected
+file is reported to the model as an error with that reason, so it keeps working
+on the rest instead of retrying blindly; accepted files are still checkpointed,
+so `/undo` covers them.
+
+**Cost** is only ever shown when you configured a price: `/cost` splits the
+current task, this run, the cache-hit share and the per-task budget, the header
+shows the running task cost, and `agent.max_usd_per_task` stops a task between
+rounds instead of blowing a budget. Prompt caching is on for the Anthropic wire
+(stable system block + tool catalog); `/cost` reports what it saved.
+
+`/effort` swaps the request preset in one keystroke (`fast`, `balanced`, `deep`
+or a `[agent.presets.*]` entry): temperature, output budget and reasoning
+effort, written back to `config.toml` and shown next to the model name.
 
 Set `agent.feedback_command` (say `cargo clippy --all-targets -- -D warnings`)
 and kazi runs it after every round that changed files, feeding the output back
@@ -238,8 +268,10 @@ Override anything per call: `--provider <nick>` `--model <name>`
 | `read_file`  | numbered lines, paging by offset/limit, refuses binaries |
 | `apply_patch`| exact, unique find-and-replace; ambiguity is an error   |
 | `write_file` | create/overwrite, makes parent directories              |
+| `delete_file`| one file, checkpointed for `/undo`, `dry_run` available  |
+| `move_file`  | rename/move, no clobber unless `overwrite = true`       |
 | `run_command`| shell command — **approval-gated** (below)              |
-| `fetch_url`  | https GET → plain text (blocks local networks)          |
+| `fetch_url`  | https GET → text; uncompressed PDF text extracted       |
 
 Agents fail lucidly on purpose: every error text is fed back to the model (`is_error`),
 which usually corrects its next call — that's how the loop learns.
@@ -309,7 +341,10 @@ kazi export fix-kproxy-delay notes.md
 - A denial is reported to the model as an error result (never a silent
   nothing), so it takes a different approach instead of repeating the
   rejected call.
-- `fetch_url` refuses localhost/private IPs by design.
+- `fetch_url` refuses localhost/private IPs on **every redirect hop** (https only,
+  max 5 hops), not just the typed URL.
+- `delete_file` always asks before removing a file (even when `run_command` is
+  allowlisted) and checkpoints the content first, so `/undo` brings it back.
 - Model responses can lie or edit aggressively; skim `--yolo` sessions.
 - Session transcripts may contain prompt-injected content from fetched pages;
   `run_command` approvals are your last human checkpoint.
@@ -332,6 +367,8 @@ let answer = agent
 
 `docs/architecture.md` (中文) explains the loop, the two tool-calling wire protocols,
 hand-rolled SSE streaming, context trimming, and the security model — with code pointers.
+`docs/roadmap.md` (中文) is the product plan: where 0.19–0.21 are headed, what is
+deliberately out of scope, and which known defects come first.
 
 ## License
 

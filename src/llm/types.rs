@@ -146,14 +146,45 @@ pub struct LlmRequest {
 pub struct Usage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Prompt tokens served from the provider's cache (billed cheaper).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    /// Prompt tokens written INTO the cache this round (Anthropic bills these).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
 }
 
 impl Usage {
     /// Accumulate another usage sample (absent counts add zero).
     pub fn add(&mut self, other: &Usage) {
-        self.input_tokens = Some(self.input_tokens.unwrap_or(0) + other.input_tokens.unwrap_or(0));
-        self.output_tokens =
-            Some(self.output_tokens.unwrap_or(0) + other.output_tokens.unwrap_or(0));
+        fn add(a: &mut Option<u64>, b: Option<u64>) {
+            if a.is_some() || b.is_some() {
+                *a = Some(a.unwrap_or(0) + b.unwrap_or(0));
+            }
+        }
+        add(&mut self.input_tokens, other.input_tokens);
+        add(&mut self.output_tokens, other.output_tokens);
+        add(&mut self.cache_read_tokens, other.cache_read_tokens);
+        add(&mut self.cache_write_tokens, other.cache_write_tokens);
+    }
+
+    /// Share of the prompt that came from cache (percent), when the provider
+    /// reports both numbers.
+    pub fn cache_hit_percent(&self) -> Option<u64> {
+        let cached = self.cache_read_tokens?;
+        let input = self.input_tokens?;
+        let denom = input.max(1);
+        Some((cached.min(input) * 100) / denom)
+    }
+
+    /// `(input, output, cache_read, cache_write)` with absent values as 0.
+    pub fn totals(&self) -> (u64, u64, u64, u64) {
+        (
+            self.input_tokens.unwrap_or(0),
+            self.output_tokens.unwrap_or(0),
+            self.cache_read_tokens.unwrap_or(0),
+            self.cache_write_tokens.unwrap_or(0),
+        )
     }
 }
 

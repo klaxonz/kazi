@@ -47,7 +47,7 @@ impl Tool for ApplyPatch {
 
         let path = ctx.cwd.join(rel);
         crate::tools::file::ensure_sandbox(ctx.sandbox_root.as_deref(), &path)?;
-        if ctx.permission.get() == crate::tools::PermissionMode::ReadOnly {
+        if !ctx.permission.get().writes_allowed() {
             return Err(ToolError::new(
                 "apply_patch is blocked in read-only permission mode (Shift+Tab / /permission to change)",
             ));
@@ -65,19 +65,29 @@ impl Tool for ApplyPatch {
             )));
         }
 
-        let bytes = tokio::fs::read(&path)
-            .await
-            .map_err(|e| ToolError::new(format!("cannot read {path:?}: {e}")))?;
-        if bytes.iter().take(8192).any(|b| *b == 0) {
-            return Err(ToolError::new(format!(
-                "{path:?} looks binary; apply_patch is text-only"
-            )));
-        }
-        let text = String::from_utf8(bytes).map_err(|_| {
-            ToolError::new(format!(
-                "{path:?} has parts that are not valid UTF-8; apply_patch is UTF-8-only"
-            ))
-        })?;
+        // In review mode an earlier `write_file` in the same round may already
+        // have parked a new version of this file: patch THAT text, not the
+        // stale disk copy, or the two changes would silently disagree.
+        let staging = ctx.staged.as_ref().filter(|_| ctx.reviewing());
+        let staged_before = staging.and_then(|s| s.pending_text(&path));
+        let text = match staged_before.clone() {
+            Some(t) => t,
+            None => {
+                let bytes = tokio::fs::read(&path)
+                    .await
+                    .map_err(|e| ToolError::new(format!("cannot read {path:?}: {e}")))?;
+                if bytes.iter().take(8192).any(|b| *b == 0) {
+                    return Err(ToolError::new(format!(
+                        "{path:?} looks binary; apply_patch is text-only"
+                    )));
+                }
+                String::from_utf8(bytes).map_err(|_| {
+                    ToolError::new(format!(
+                        "{path:?} has parts that are not valid UTF-8; apply_patch is UTF-8-only"
+                    ))
+                })?
+            }
+        };
 
         let first = match text.find(find) {
             Some(i) => i,
@@ -109,6 +119,22 @@ impl Tool for ApplyPatch {
         patched.push_str(&text[first + find.len()..]);
 
         let start_line = text[..first].matches('\n').count() + 1;
+        if let Some(staging) = staging {
+            // The pre-round content: what the file held before ANY staged
+            // change touched it (a follow-up patch must not report its own
+            // predecessor's text as the baseline).
+            let before = crate::tools::checkpoint::read_text_lossy(&path);
+            staging.stage(crate::tools::checkpoint::StagedChange {
+                tool: self.name().to_string(),
+                path: path.clone(),
+                before,
+                after: patched,
+            });
+            let delta: i64 = replace.chars().count() as i64 - find.chars().count() as i64;
+            return Ok(format!(
+                "staged a patch to {rel} at line {start_line} ({delta:+} chars) for review — nothing written yet"
+            ));
+        }
         // write-ahead checkpoint: keep the pre-patch content for /undo
         if let Some(cp) = &ctx.checkpointing {
             cp.snapshot(&path);
@@ -154,6 +180,8 @@ mod tests {
             todos: None,
             permission: super::super::Permission::default(),
             subagent: None,
+            staged: None,
+            reviewer: None,
         }
     }
 

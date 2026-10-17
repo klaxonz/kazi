@@ -11,6 +11,7 @@ pub mod fetch;
 pub mod file;
 pub mod glob;
 pub mod patch;
+pub mod pdf;
 pub mod search;
 pub mod shell;
 pub mod subagent;
@@ -96,13 +97,42 @@ pub struct ToolCtx {
     pub permission: Permission,
     /// Factory for the `delegate` tool's sub-agents (`None` = tool refuses).
     pub subagent: Option<Arc<dyn subagent::SubAgentRunner>>,
+    /// Review mode staging area (`review` permission): write tools park their
+    /// planned change here instead of touching the disk, and the UI turns the
+    /// batch into a changeset the user accepts file by file. `None` outside
+    /// review mode.
+    pub staged: Option<Arc<checkpoint::Staging>>,
+    /// Who decides on a staged changeset (review mode only).
+    pub reviewer: Option<Arc<dyn Reviewer>>,
+}
+
+impl ToolCtx {
+    /// A child context that may act with a DIFFERENT permission mode without
+    /// touching this one. `ToolCtx` is `Clone`, but `permission` is a shared
+    /// atomic cell: cloning and calling `set` on the copy used to rewrite the
+    /// parent session's mode too (a read-only `delegate` sub-task silently
+    /// turned the whole session read-only). Every derived context therefore
+    /// gets a fresh cell.
+    pub fn derive(&self, mode: PermissionMode) -> ToolCtx {
+        let mut ctx = self.clone();
+        ctx.permission = Permission::new(mode);
+        ctx
+    }
+
+    /// Whether writes should be staged for review instead of applied.
+    pub fn reviewing(&self) -> bool {
+        self.permission.get() == PermissionMode::Review && self.staged.is_some()
+    }
 }
 
 /// How much the agent may do without asking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PermissionMode {
     /// Inspection only: write tools and `run_command` refuse outright.
     ReadOnly,
+    /// Writes are staged as a changeset and only land when the user accepts
+    /// them (file by file); commands are still approval-gated like `Edit`.
+    Review,
     /// Default: writes run, `run_command` is approval-gated.
     Edit,
     /// Everything runs unattended (`--yolo`).
@@ -113,6 +143,7 @@ impl PermissionMode {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "read" | "readonly" | "read-only" => Some(Self::ReadOnly),
+            "review" | "stage" => Some(Self::Review),
             "edit" | "default" => Some(Self::Edit),
             "yolo" | "auto" => Some(Self::Yolo),
             _ => None,
@@ -122,18 +153,28 @@ impl PermissionMode {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::ReadOnly => "read-only",
+            Self::Review => "review",
             Self::Edit => "edit",
             Self::Yolo => "yolo",
         }
     }
 
+    /// Every mode, in `Shift+Tab` order.
+    pub const ALL: [PermissionMode; 4] = [Self::Edit, Self::Review, Self::ReadOnly, Self::Yolo];
+
     /// Next mode in the Shift+Tab cycle.
     pub fn cycle(&self) -> Self {
         match self {
-            Self::Edit => Self::ReadOnly,
+            Self::Edit => Self::Review,
+            Self::Review => Self::ReadOnly,
             Self::ReadOnly => Self::Yolo,
             Self::Yolo => Self::Edit,
         }
+    }
+
+    /// Writes are allowed at all (review stages them instead of refusing).
+    pub fn writes_allowed(&self) -> bool {
+        !matches!(self, Self::ReadOnly)
     }
 }
 
@@ -160,7 +201,8 @@ impl Permission {
     pub fn get(&self) -> PermissionMode {
         match self.mode.load(std::sync::atomic::Ordering::Relaxed) {
             0 => PermissionMode::ReadOnly,
-            2 => PermissionMode::Yolo,
+            1 => PermissionMode::Review,
+            3 => PermissionMode::Yolo,
             _ => PermissionMode::Edit,
         }
     }
@@ -174,8 +216,9 @@ impl Permission {
 fn mode_code(m: PermissionMode) -> u8 {
     match m {
         PermissionMode::ReadOnly => 0,
-        PermissionMode::Edit => 1,
-        PermissionMode::Yolo => 2,
+        PermissionMode::Review => 1,
+        PermissionMode::Edit => 2,
+        PermissionMode::Yolo => 3,
     }
 }
 
@@ -206,6 +249,128 @@ pub fn approval_key(summary: &str) -> String {
 #[async_trait]
 pub trait Approver: Send + Sync {
     async fn decide(&self, tool: &str, summary: &str) -> Decision;
+
+    /// Who is asking. Interactive approvers use this to label a prompt that
+    /// came from a nested agent (`delegate` sub-task) instead of the user's
+    /// own task, so two prompts are never indistinguishable.
+    fn origin(&self) -> Option<String> {
+        None
+    }
+
+    /// A copy of this approver that reports `label` as its origin. Returns
+    /// `None` for approvers that cannot carry a label (they fall back to
+    /// sharing themselves). The sub-agent runner uses it; nothing else needs
+    /// to implement it.
+    fn scoped(&self, _label: &str) -> Option<Arc<dyn Approver>> {
+        None
+    }
+}
+
+/// One file's verdict in a review-mode changeset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewedFile {
+    pub path: std::path::PathBuf,
+    /// The user accepted this file's staged content.
+    pub accepted: bool,
+}
+
+/// The whole changeset's verdict. `note` is shown to the model for the files
+/// it may not write, so a rejection is guidance rather than a dead end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewOutcome {
+    pub files: Vec<ReviewedFile>,
+    pub note: Option<String>,
+}
+
+impl ReviewOutcome {
+    /// Nothing is written (the engine answers the task with a rejection note).
+    pub fn reject_all(changes: &[checkpoint::StagedChange], note: impl Into<String>) -> Self {
+        Self {
+            files: changes
+                .iter()
+                .map(|c| ReviewedFile {
+                    path: c.path.clone(),
+                    accepted: false,
+                })
+                .collect(),
+            note: Some(note.into()),
+        }
+    }
+
+    pub fn accept_all(changes: &[checkpoint::StagedChange]) -> Self {
+        Self {
+            files: changes
+                .iter()
+                .map(|c| ReviewedFile {
+                    path: c.path.clone(),
+                    accepted: true,
+                })
+                .collect(),
+            note: None,
+        }
+    }
+
+    pub fn is_accepted(&self, path: &std::path::Path) -> bool {
+        self.files
+            .iter()
+            .find(|f| f.path == path)
+            .map(|f| f.accepted)
+            .unwrap_or(false)
+    }
+}
+
+/// Review-mode gate: turns a staged changeset into a per-file verdict.
+/// Implementations: the TUI changeset overlay, always-accept (library default,
+/// and `--yolo`), tests.
+#[async_trait]
+pub trait Reviewer: Send + Sync {
+    async fn review(
+        &self,
+        cwd: &std::path::Path,
+        changes: &[checkpoint::StagedChange],
+    ) -> ReviewOutcome;
+}
+
+/// Accepts every staged change (library default; review mode is then a no-op
+/// staging pass, which keeps embedders working without a prompt).
+pub struct AutoReviewer;
+
+#[async_trait]
+impl Reviewer for AutoReviewer {
+    async fn review(
+        &self,
+        _cwd: &std::path::Path,
+        changes: &[checkpoint::StagedChange],
+    ) -> ReviewOutcome {
+        ReviewOutcome::accept_all(changes)
+    }
+}
+
+/// Write a reviewed changeset to disk. `accepted` paths are checkpointed (so
+/// `/undo` still covers them) and written; rejected paths never touch the
+/// disk. Returns one result per staged change, in order.
+pub fn apply_reviewed(
+    changes: &[checkpoint::StagedChange],
+    outcome: &ReviewOutcome,
+    checkpointing: Option<&checkpoint::Checkpointing>,
+) -> Vec<Result<(), String>> {
+    changes
+        .iter()
+        .map(|change| {
+            if !outcome.is_accepted(&change.path) {
+                return Err("rejected by the user".to_string());
+            }
+            if let Some(cp) = checkpointing {
+                cp.snapshot(&change.path);
+            }
+            if let Some(parent) = change.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("cannot create parent dirs: {e}"))?;
+            }
+            std::fs::write(&change.path, change.after.as_bytes())
+                .map_err(|e| format!("cannot write {:?}: {e}", change.path))
+        })
+        .collect()
 }
 
 /// Always allows. Only used with the explicit `--yolo` flag.
@@ -260,6 +425,10 @@ pub fn tool_ctx(
         todos: Some(Arc::new(todo::TodoList::default())),
         permission: Permission::new(mode),
         subagent: None, // the agent wires its own runner in
+        // always present: switching to `review` at runtime (/permission) must
+        // start staging without a rebuild. `reviewing()` gates on the mode.
+        staged: Some(Arc::new(checkpoint::Staging::new())),
+        reviewer: Some(Arc::new(AutoReviewer) as Arc<dyn Reviewer>),
     }
 }
 
@@ -304,14 +473,23 @@ pub(crate) fn optional_usize(args: &Value, key: &str) -> Option<usize> {
 /// paths so the UI can show the resulting diff. `todo_write` and friends never
 /// touch the filesystem.
 pub fn is_edit_tool(name: &str) -> bool {
-    matches!(name, "write_file" | "apply_patch")
+    matches!(
+        name,
+        "write_file" | "apply_patch" | "delete_file" | "move_file"
+    )
 }
 
 /// The path an edit tool is about to write, if it names one.
 pub fn edited_path(call: &ToolCall) -> Option<&str> {
-    is_edit_tool(&call.name)
-        .then(|| call.arguments.get("path").and_then(Value::as_str))
-        .flatten()
+    match call.name.as_str() {
+        "write_file" | "apply_patch" | "delete_file" => {
+            call.arguments.get("path").and_then(Value::as_str)
+        }
+        // the engine diffs the destination; the source is a second path the
+        // checkpoint already covers
+        "move_file" => call.arguments.get("to").and_then(Value::as_str),
+        _ => None,
+    }
 }
 
 /// Compact one-line human summary of a tool call's arguments, shown in the
@@ -369,6 +547,19 @@ pub fn call_summary(call: &ToolCall) -> String {
                 format!("{:?} in {glob}", clip_line(text("pattern"), 60))
             }
         }
+        "delete_file" => {
+            let dry = a.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
+            format!(
+                "{}{}",
+                clip_line(text("path"), 64),
+                if dry { " (dry run)" } else { "" }
+            )
+        }
+        "move_file" => format!(
+            "{} -> {}",
+            clip_line(text("from"), 40),
+            clip_line(text("to"), 40)
+        ),
         "run_command" => clip_line(&one_line(text("command")), 100),
         "fetch_url" => clip_line(text("url"), 100),
         "todo_write" => {
@@ -436,6 +627,8 @@ impl ToolRegistry {
             .register(Arc::new(search::SearchFiles))
             .register(Arc::new(patch::ApplyPatch))
             .register(Arc::new(file::WriteFile))
+            .register(Arc::new(file::DeleteFile))
+            .register(Arc::new(file::MoveFile))
             .register(Arc::new(shell::RunCommand))
             .register(Arc::new(fetch::FetchUrl))
     }
@@ -513,6 +706,8 @@ mod tests {
                 "search_files",
                 "apply_patch",
                 "write_file",
+                "delete_file",
+                "move_file",
                 "run_command",
                 "fetch_url"
             ]
@@ -535,9 +730,21 @@ mod tests {
         assert_eq!(PermissionMode::parse("yolo"), Some(Yolo));
         assert_eq!(PermissionMode::parse("edit"), Some(Edit));
         assert_eq!(PermissionMode::parse("nope"), None);
-        assert_eq!(Edit.cycle(), ReadOnly);
+        assert_eq!(PermissionMode::parse("review"), Some(Review));
+        assert_eq!(Edit.cycle(), Review);
+        assert_eq!(Review.cycle(), ReadOnly);
         assert_eq!(ReadOnly.cycle(), Yolo);
         assert_eq!(Yolo.cycle(), Edit);
+        // every mode is reachable from the cycle: a mode the user cannot get
+        // back to is a mode that silently disappears
+        let mut seen = std::collections::BTreeSet::new();
+        let mut cur = Edit;
+        for _ in 0..PermissionMode::ALL.len() {
+            seen.insert(cur);
+            cur = cur.cycle();
+        }
+        assert_eq!(cur, Edit, "the cycle must return to where it started");
+        assert_eq!(seen.len(), PermissionMode::ALL.len());
 
         let p = Permission::default();
         assert_eq!(p.get(), Edit);
@@ -633,6 +840,8 @@ mod tests {
             todos: None,
             permission: Permission::default(),
             subagent: None,
+            staged: None,
+            reviewer: None,
         }
     }
 }

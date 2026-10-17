@@ -30,6 +30,7 @@ impl OllamaProvider {
                     .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             ),
             api_key: None,
+            tuning: settings.tuning.clone(),
         };
         Self {
             inner: OpenAiProvider::new(http, &settings),

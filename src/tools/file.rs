@@ -222,7 +222,7 @@ impl Tool for WriteFile {
         let content = super::arg_str(args, "content")?;
         let path = ctx.cwd.join(rel);
         ensure_sandbox(ctx.sandbox_root.as_deref(), &path)?;
-        if ctx.permission.get() == crate::tools::PermissionMode::ReadOnly {
+        if !ctx.permission.get().writes_allowed() {
             return Err(ToolError::new(
                 "write_file is blocked in read-only permission mode (Shift+Tab / /permission to change)",
             ));
@@ -232,6 +232,20 @@ impl Tool for WriteFile {
                 "content is {} bytes, over the {WRITE_CAP}-byte write limit",
                 content.len()
             )));
+        }
+        // review mode: park the planned content instead of touching the disk
+        if let Some(staging) = ctx.staged.as_ref().filter(|_| ctx.reviewing()) {
+            let before = super::checkpoint::read_text_lossy(&path);
+            staging.stage(super::checkpoint::StagedChange {
+                tool: self.name().to_string(),
+                path: path.clone(),
+                before,
+                after: content.to_string(),
+            });
+            return Ok(format!(
+                "staged {rel} ({} bytes) for review — nothing written yet",
+                content.len()
+            ));
         }
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             tokio::fs::create_dir_all(parent)
@@ -249,6 +263,151 @@ impl Tool for WriteFile {
             "wrote {} bytes to {}",
             content.len(),
             path.display()
+        ))
+    }
+}
+
+/// ---------------------------------------------------------------------------
+/// delete_file
+/// ---------------------------------------------------------------------------
+pub struct DeleteFile;
+
+#[async_trait]
+impl Tool for DeleteFile {
+    fn name(&self) -> &str {
+        "delete_file"
+    }
+    fn description(&self) -> &str {
+        "Delete ONE file (never a directory). The content is checkpointed first, so /undo restores it. Use dry_run to list what would be deleted. Prefer this over run_command for removing a file."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File to delete"},
+                "dry_run": {"type": "boolean", "description": "Only report what would be deleted (default false)"}
+            },
+            "required": ["path"]
+        })
+    }
+    fn approval_summary(&self, args: &Value, ctx: &ToolCtx) -> Option<String> {
+        // deletion always asks, even when run_command is allowlisted: it is
+        // the one operation /undo can only fix if the checkpoint survived
+        if ctx.permission.get() == crate::tools::PermissionMode::Yolo {
+            return None;
+        }
+        let path = args.get("path").and_then(Value::as_str)?;
+        let abs = ctx.cwd.join(path);
+        Some(format!("delete {}?", abs.display()))
+    }
+    async fn run(&self, args: &Value, ctx: &ToolCtx) -> Result<String, ToolError> {
+        let rel = arg_path(args)?;
+        let path = ctx.cwd.join(rel);
+        ensure_sandbox(ctx.sandbox_root.as_deref(), &path)?;
+        if !ctx.permission.get().writes_allowed() {
+            return Err(ToolError::new(
+                "delete_file is blocked in read-only permission mode (Shift+Tab / /permission to change)",
+            ));
+        }
+        let meta = tokio::fs::metadata(&path)
+            .await
+            .map_err(|e| ToolError::new(format!("cannot stat {path:?}: {e}")))?;
+        if meta.is_dir() {
+            return Err(ToolError::new(format!(
+                "{path:?} is a directory; delete its files individually (rm -r needs a shell command with its own approval)",
+            )));
+        }
+        let dry = args
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if dry {
+            return Ok(format!(
+                "dry run: would delete {} ({} bytes)",
+                path.display(),
+                meta.len()
+            ));
+        }
+        // checkpoint BEFORE deleting, so /undo can put the bytes back
+        if let Some(cp) = &ctx.checkpointing {
+            cp.snapshot(&path);
+        }
+        tokio::fs::remove_file(&path)
+            .await
+            .map_err(|e| ToolError::new(format!("cannot delete {path:?}: {e}")))?;
+        Ok(format!(
+            "deleted {} ({} bytes; /undo restores it)",
+            path.display(),
+            meta.len()
+        ))
+    }
+}
+
+/// ---------------------------------------------------------------------------
+/// move_file
+/// ---------------------------------------------------------------------------
+pub struct MoveFile;
+
+#[async_trait]
+impl Tool for MoveFile {
+    fn name(&self) -> &str {
+        "move_file"
+    }
+    fn description(&self) -> &str {
+        "Move or rename ONE file or directory. Both paths stay inside tools.sandbox_root when it is set. Refuses to overwrite an existing target unless `overwrite` is true. Checkpointed, so /undo restores the previous location."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "from": {"type": "string", "description": "Current path"},
+                "to": {"type": "string", "description": "New path"},
+                "overwrite": {"type": "boolean", "description": "Replace `to` if it exists (default false)"}
+            },
+            "required": ["from", "to"]
+        })
+    }
+    async fn run(&self, args: &Value, ctx: &ToolCtx) -> Result<String, ToolError> {
+        let from_rel = super::arg_str(args, "from")?;
+        let to_rel = super::arg_str(args, "to")?;
+        let from = ctx.cwd.join(from_rel);
+        let to = ctx.cwd.join(to_rel);
+        ensure_sandbox(ctx.sandbox_root.as_deref(), &from)?;
+        ensure_sandbox(ctx.sandbox_root.as_deref(), &to)?;
+        if !ctx.permission.get().writes_allowed() {
+            return Err(ToolError::new(
+                "move_file is blocked in read-only permission mode (Shift+Tab / /permission to change)",
+            ));
+        }
+        if !from.exists() {
+            return Err(ToolError::new(format!("{from:?} does not exist")));
+        }
+        let overwrite = args
+            .get("overwrite")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if to.exists() && !overwrite {
+            return Err(ToolError::new(format!(
+                "{to:?} already exists; pass overwrite=true only if replacing it is intended",
+            )));
+        }
+        if let Some(parent) = to.parent().filter(|p| !p.as_os_str().is_empty()) {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| ToolError::new(format!("cannot create parent dirs: {e}")))?;
+        }
+        // checkpoint both ends: the source disappears and the target appears
+        if let Some(cp) = &ctx.checkpointing {
+            cp.snapshot(&from);
+            cp.snapshot(&to);
+        }
+        tokio::fs::rename(&from, &to)
+            .await
+            .map_err(|e| ToolError::new(format!("cannot move {from:?} -> {to:?}: {e}")))?;
+        Ok(format!(
+            "moved {} -> {} (/undo restores it)",
+            from.display(),
+            to.display()
         ))
     }
 }
@@ -288,6 +447,8 @@ mod tests {
             todos: None,
             permission: super::super::Permission::default(),
             subagent: None,
+            staged: None,
+            reviewer: None,
         }
     }
 
@@ -332,6 +493,86 @@ mod tests {
             .unwrap_err();
         assert!(err.0.contains("read-only"), "got: {}", err.0);
         assert!(!d.join("x.txt").exists(), "nothing may be written");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn delete_is_checkpointed_and_refuses_directories() {
+        let d = tempdir("del");
+        let store = d.join("ckpt");
+        let ctx = {
+            let mut c = ctx_for(d.clone(), None);
+            c.checkpointing = Some(std::sync::Arc::new(
+                crate::tools::checkpoint::Checkpointing::new(store),
+            ));
+            c
+        };
+        ctx.checkpointing.as_ref().unwrap().begin_epoch();
+        std::fs::write(d.join("gone.txt"), "precious").unwrap();
+        // dry run touches nothing
+        let out = DeleteFile
+            .run(&json!({"path": "gone.txt", "dry_run": true}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("would delete"), "{out}");
+        assert!(d.join("gone.txt").exists());
+
+        let out = DeleteFile
+            .run(&json!({"path": "gone.txt"}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("deleted"));
+        assert!(!d.join("gone.txt").exists());
+        // /undo can put it back: the checkpoint ran before the delete
+        let undone = ctx.checkpointing.as_ref().unwrap().undo_latest().unwrap();
+        assert!(matches!(
+            undone,
+            crate::tools::checkpoint::UndoOutcome::Replayed(_)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(d.join("gone.txt")).unwrap(),
+            "precious"
+        );
+
+        std::fs::create_dir_all(d.join("dir")).unwrap();
+        let err = DeleteFile
+            .run(&json!({"path": "dir"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.0.contains("is a directory"), "{}", err.0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn move_file_refuses_to_clobber_without_overwrite() {
+        let d = tempdir("move");
+        let ctx = ctx_for(d.clone(), None);
+        std::fs::write(d.join("a.txt"), "A").unwrap();
+        std::fs::write(d.join("b.txt"), "B").unwrap();
+
+        let err = MoveFile
+            .run(&json!({"from": "a.txt", "to": "b.txt"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.0.contains("already exists"), "{}", err.0);
+        assert_eq!(std::fs::read_to_string(d.join("b.txt")).unwrap(), "B");
+
+        MoveFile
+            .run(&json!({"from": "a.txt", "to": "sub/c.txt"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!d.join("a.txt").exists());
+        assert_eq!(std::fs::read_to_string(d.join("sub/c.txt")).unwrap(), "A");
+
+        // overwrite is explicit
+        MoveFile
+            .run(
+                &json!({"from": "b.txt", "to": "sub/c.txt", "overwrite": true}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(d.join("sub/c.txt")).unwrap(), "B");
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -11,6 +11,24 @@ provider = "deepseek"
 # max_rounds = 30                  # hard cap on model<->tool rounds per task
 # max_context_tokens = 60000       # rough budget; oldest non-system turns are dropped
 # max_parallel_tools = 4           # concurrent tool executions within a round
+# permission_mode = "edit"         # read-only | review | edit | yolo
+# preset = "balanced"              # fast | balanced | deep (the TUI's /effort writes this line)
+# max_usd_per_task = 1.00          # stop between rounds once this task costs more (needs [usage.prices])
+#
+# Request presets: temperature / output budget / reasoning effort sent with
+# every round. The three built-ins exist without config; anything here wins.
+# [agent.presets.deep]
+# temperature = 0.2
+# max_tokens = 8192
+# reasoning_effort = "high"       # low | medium | high, where the endpoint understands it
+#
+# Token prices for /cost and `kazi run`'s cost line. USD per 1M tokens.
+# kazi ships NO prices: an unpriced model shows tokens and never a guessed
+# number. Key by model id (a gateway id also matches its last segment).
+# [usage.prices."deepseek-chat"]
+# input = 0.27
+# output = 1.10
+# cache_read = 0.027
 
 # [ui]
 # theme = "dark"                   # dark | light | nord | solarized | mono (the TUI's /theme changes this line)

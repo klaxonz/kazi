@@ -259,6 +259,8 @@ mod tests {
             todos: None,
             permission: crate::tools::Permission::default(),
             subagent: None,
+            staged: None,
+            reviewer: None,
         }
     }
 

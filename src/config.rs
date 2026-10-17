@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::llm::{ProviderKind, ProviderSettings};
+use crate::llm::{ProviderKind, ProviderSettings, Tuning};
 
 pub fn config_path() -> PathBuf {
     if let Some(p) = std::env::var_os("KAZI_CONFIG") {
@@ -54,6 +54,8 @@ pub struct Config {
     pub ui: UiCfg,
     /// MCP stdio servers to bridge as tools (`[mcp.servers.<nick>]`).
     pub mcp: McpCfg,
+    /// Token prices (`[usage.prices."<model>"]`) for `/cost`.
+    pub usage: UsageCfg,
     /// nickname → entry; BTreeMap keeps stable ordering for errors and `first`.
     pub providers: BTreeMap<String, ProviderEntry>,
 }
@@ -100,11 +102,175 @@ pub struct AgentCfg {
     pub max_parallel_tools: Option<usize>,
     /// Provider retries for rate limits / 5xx / network errors (default 3).
     pub max_retries: Option<u32>,
-    /// Startup permission mode: "read-only" | "edit" (default) | "yolo".
+    /// Startup permission mode: "read-only" | "review" | "edit" (default) | "yolo".
     pub permission_mode: Option<String>,
     /// Check to run after a round that changed files (e.g.
     /// "cargo clippy --all-targets"); its output goes back to the model.
     pub feedback_command: Option<String>,
+    /// Active request preset (`fast` | `balanced` (default) | `deep`), or the
+    /// name of an entry in `presets`. `/effort` writes this line back.
+    pub preset: Option<String>,
+    /// Named request presets (`[agent.presets.deep]`).
+    pub presets: BTreeMap<String, PresetCfg>,
+    /// Stop the task between rounds once its accumulated cost exceeds this
+    /// (USD). Requires `[usage.prices]` for the active model; without a price
+    /// there is nothing to compare against, so the guard stays inert.
+    pub max_usd_per_task: Option<f64>,
+}
+
+/// One model-effort preset: request-level knobs applied on top of the
+/// provider entry (they never modify `[providers.*]`).
+#[derive(Debug, Deserialize, Default, Clone, PartialEq)]
+#[serde(default)]
+pub struct PresetCfg {
+    pub temperature: Option<f64>,
+    /// Output budget; Anthropic requires one (kazi used a hard-coded 4096).
+    pub max_tokens: Option<u32>,
+    /// Reasoning effort passed through where the endpoint understands it
+    /// (`"low"` | `"medium"` | `"high"`); ignored elsewhere.
+    pub reasoning_effort: Option<String>,
+}
+
+/// `[usage]`: what a token costs, so `/cost` can print money instead of
+/// guesses. Prices are USD per 1M tokens and come from the user — kazi never
+/// ships a table that silently goes stale.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default)]
+pub struct UsageCfg {
+    /// model id → price entry.
+    pub prices: BTreeMap<String, PriceCfg>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default)]
+pub struct PriceCfg {
+    /// USD per 1M input tokens.
+    pub input: Option<f64>,
+    /// USD per 1M output tokens.
+    pub output: Option<f64>,
+    /// USD per 1M cached input tokens (defaults to `input`).
+    pub cache_read: Option<f64>,
+    /// USD per 1M cache-write tokens (defaults to `input`).
+    pub cache_write: Option<f64>,
+}
+
+impl PriceCfg {
+    /// Cost of one usage sample in USD, or `None` when the entry has no
+    /// numbers at all (an empty table entry must not print $0.000).
+    pub fn cost(&self, usage: &crate::llm::Usage) -> Option<f64> {
+        let (input, output, cache_read, cache_write) = usage.totals();
+        if self.input.is_none() && self.output.is_none() {
+            return None;
+        }
+        let per_million = |tokens: u64, price: f64| tokens as f64 * price / 1_000_000.0;
+        let in_price = self.input.unwrap_or(0.0);
+        let total = per_million(input, in_price)
+            + per_million(output, self.output.unwrap_or(0.0))
+            + per_million(cache_read, self.cache_read.unwrap_or(in_price))
+            + per_million(cache_write, self.cache_write.unwrap_or(in_price));
+        Some(total)
+    }
+}
+
+/// The request knobs actually sent to a provider.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RequestTuning {
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<u32>,
+    pub reasoning_effort: Option<String>,
+}
+
+/// Built-in presets, used when config names a preset but does not define it.
+pub fn builtin_presets() -> BTreeMap<&'static str, RequestTuning> {
+    let tuning = |t: Option<f64>, m: Option<u32>, r: Option<&str>| RequestTuning {
+        temperature: t,
+        max_tokens: m,
+        reasoning_effort: r.map(str::to_string),
+    };
+    BTreeMap::from([
+        ("fast", tuning(Some(0.3), Some(2048), Some("low"))),
+        ("balanced", tuning(Some(0.7), Some(4096), None)),
+        ("deep", tuning(Some(0.2), Some(8192), Some("high"))),
+    ])
+}
+
+/// Per-session cost ledger (`/cost`): what the provider charged, priced with
+/// the user's own table. Unknown prices stay `None` and are shown as tokens.
+#[derive(Debug, Clone, Default)]
+pub struct CostLedger {
+    pub usage_total: crate::llm::Usage,
+    /// USD accumulated for turns whose model had a price entry.
+    pub usd: f64,
+    /// True once at least one round was actually priced.
+    pub priced: bool,
+    /// model id → its accumulated usage and cost.
+    pub by_model: BTreeMap<String, (crate::llm::Usage, f64)>,
+}
+
+impl Config {
+    /// Prices configured for a model id, if any.
+    pub fn price_for(&self, model: &str) -> Option<&PriceCfg> {
+        self.usage.prices.get(model).or_else(|| {
+            // a gateway id like `commandcode/deepseek/deepseek-v4-pro` should
+            // match a price keyed on its last segment too
+            model
+                .rsplit('/')
+                .next()
+                .and_then(|tail| self.usage.prices.get(tail))
+        })
+    }
+
+    /// The active request preset: `[agent.presets.*]` first, then the
+    /// built-ins. Unknown names fall back to balanced.
+    pub fn active_preset(&self) -> (String, RequestTuning) {
+        let name = self
+            .agent
+            .preset
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("balanced")
+            .to_string();
+        if let Some(p) = self.agent.presets.get(&name) {
+            return (name, tuning_from(p));
+        }
+        let builtin = builtin_presets();
+        if let Some(t) = builtin.get(name.as_str()) {
+            return (name, t.clone());
+        }
+        // a mis-typed preset must not silently disable tuning
+        (
+            "balanced".to_string(),
+            builtin.get("balanced").cloned().unwrap_or_default(),
+        )
+    }
+
+    /// Preset names offered by `/effort` and Tab completion.
+    pub fn preset_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = builtin_presets().keys().map(|s| s.to_string()).collect();
+        names.extend(self.agent.presets.keys().cloned());
+        names.sort();
+        names.dedup();
+        names
+    }
+}
+
+impl From<&RequestTuning> for crate::llm::Tuning {
+    fn from(t: &RequestTuning) -> Self {
+        Self {
+            temperature: t.temperature,
+            max_tokens: t.max_tokens,
+            reasoning_effort: t.reasoning_effort.clone(),
+        }
+    }
+}
+
+fn tuning_from(p: &PresetCfg) -> RequestTuning {
+    RequestTuning {
+        temperature: p.temperature,
+        max_tokens: p.max_tokens,
+        reasoning_effort: p.reasoning_effort.clone(),
+    }
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -291,6 +457,7 @@ impl Config {
                 model,
                 base_url: entry.base_url.clone(),
                 api_key: None,
+                tuning: Tuning::from(&self.active_preset().1),
             },
         })
     }
@@ -334,6 +501,7 @@ impl Config {
             model: entry.model.clone().unwrap_or_default(),
             base_url: entry.base_url.clone(),
             api_key,
+            tuning: Tuning::from(&self.active_preset().1),
         })
     }
 
@@ -438,11 +606,16 @@ pub fn set_default_provider(path: &Path, nick: &str, model: Option<&str>) -> std
 /// `"nord"` or `true`). Line-based like [`set_default_provider`], so the user's
 /// comments and ordering survive; a missing `[ui]` table is appended.
 pub fn set_ui_setting(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
+    set_table_setting(path, "[ui]", key, value)
+}
+
+/// Same in-place rewrite for any table (`/effort` writes `[agent] preset`).
+/// The table header must match exactly, so `[agent]` is never fooled by
+/// `[agent.presets.deep]`.
+pub fn set_table_setting(path: &Path, table: &str, key: &str, value: &str) -> std::io::Result<()> {
     let text = std::fs::read_to_string(path)?;
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    let ui_start = lines
-        .iter()
-        .position(|l| l.trim_start().starts_with("[ui]"));
+    let ui_start = lines.iter().position(|l| l.trim_end() == table.trim());
     match ui_start {
         Some(start) => {
             let end = lines
@@ -471,7 +644,7 @@ pub fn set_ui_setting(path: &Path, key: &str, value: &str) -> std::io::Result<()
             if lines.last().map(|l| !l.trim().is_empty()).unwrap_or(false) {
                 lines.push(String::new());
             }
-            lines.push("[ui]".to_string());
+            lines.push(table.to_string());
             lines.push(format!("{key} = {value}"));
         }
     }
@@ -713,5 +886,91 @@ model = "m2"
         assert_eq!(parsed.ui.details, Some(false));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preset_reaches_the_wire_and_is_written_back_without_losing_comments() {
+        let dir = std::env::temp_dir().join(format!("kazi-preset-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "# keep this comment\n[agent]\n# and this one\nmax_rounds = 12\n\n[providers.p]\ntype = \"openai\"\nmodel = \"m\"\n",
+        )
+        .unwrap();
+
+        // 1) a built-in preset is available without any config table
+        let cfg: Config = toml::from_str(
+            "[agent]\npreset = \"deep\"\n[providers.p]\ntype = \"openai\"\nmodel = \"m\"",
+        )
+        .unwrap();
+        let (name, tuning) = cfg.active_preset();
+        assert_eq!(name, "deep");
+        assert_eq!(tuning.max_tokens, Some(8192));
+        assert_eq!(tuning.reasoning_effort.as_deref(), Some("high"));
+        let wire = cfg.resolve(Some("p"), None).unwrap().settings.tuning;
+        assert_eq!(wire.max_tokens, Some(8192), "the preset reaches settings");
+
+        // 2) a config-defined preset wins over the built-in of the same name
+        let cfg: Config = toml::from_str(
+            "[agent]\npreset = \"deep\"\n[agent.presets.deep]\nmax_tokens = 1234\n[providers.p]\ntype = \"openai\"\nmodel = \"m\"",
+        )
+        .unwrap();
+        assert_eq!(cfg.active_preset().1.max_tokens, Some(1234));
+
+        // 3) an unknown name falls back to balanced instead of silently
+        //    disabling tuning
+        let cfg: Config = toml::from_str(
+            "[agent]\npreset = \"tuurbo\"\n[providers.p]\ntype = \"openai\"\nmodel = \"m\"",
+        )
+        .unwrap();
+        assert_eq!(cfg.active_preset().0, "balanced");
+
+        // 4) /effort writes the key back in place
+        set_table_setting(&path, "[agent]", "preset", "\"deep\"").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep this comment"), "{text}");
+        assert!(text.contains("# and this one"));
+        assert_eq!(text.matches("preset =").count(), 1, "{text}");
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.agent.preset.as_deref(), Some("deep"));
+        assert_eq!(parsed.agent.max_rounds, Some(12), "other keys survive");
+        // the table header must match exactly: [agent.presets.x] is not [agent]
+        assert!(!text.contains("[agent.preset]"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_price_never_prints_money() {
+        let cfg: Config = toml::from_str(
+            r#"[usage.prices."m1"]
+input = 1.0
+output = 2.0
+[providers.p]
+type = "openai"
+model = "m1""#,
+        )
+        .unwrap();
+        let u = crate::llm::Usage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(500_000),
+            cache_read_tokens: Some(1_000_000),
+            cache_write_tokens: None,
+        };
+        let price = cfg.price_for("m1").expect("configured");
+        let cost = price.cost(&u).unwrap();
+        // 1M input + 0.5M output + 1M cache-read at the input price
+        assert!((cost - (1.0 + 1.0 + 1.0)).abs() < 1e-9, "{cost}");
+
+        // a model with no entry costs nothing, and says so
+        assert!(cfg.price_for("m2").is_none());
+        // a gateway id falls back to its last segment
+        assert!(cfg.price_for("gateway/m1").is_some());
+        // an EMPTY entry must not look free
+        let empty: Config =
+            toml::from_str("[usage.prices.m3]\n[providers.p]\ntype = \"openai\"\nmodel = \"m3\"")
+                .unwrap();
+        assert!(empty.price_for("m3").unwrap().cost(&u).is_none());
     }
 }

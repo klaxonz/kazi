@@ -32,6 +32,7 @@ pub struct OpenAiProvider {
     base: String,
     model: String,
     api_key: Option<String>,
+    tuning: super::Tuning,
 }
 
 impl OpenAiProvider {
@@ -46,6 +47,7 @@ impl OpenAiProvider {
                 .to_string(),
             model: settings.model.clone(),
             api_key: settings.api_key.clone(),
+            tuning: settings.tuning.clone(),
         }
     }
 
@@ -96,6 +98,18 @@ impl OpenAiProvider {
             "stream": stream,
             "messages": Self::wire_messages(&req.messages),
         });
+        if let Some(t) = self.tuning.temperature {
+            body["temperature"] = json!(t);
+        }
+        if let Some(n) = self.tuning.max_tokens {
+            body["max_tokens"] = json!(n);
+        }
+        // Only the endpoints that understand it should see it; a gateway that
+        // does not recognises the field as unknown metadata and ignores it,
+        // while a wrong value would 400 — `low|medium|high` is the documented set.
+        if let Some(effort) = &self.tuning.reasoning_effort {
+            body["reasoning_effort"] = json!(effort);
+        }
         if !req.tools.is_empty() {
             body["tools"] = json!(req.tools.iter().map(|t| json!({
                 "type": "function",
@@ -153,6 +167,12 @@ impl OpenAiProvider {
         let usage = Usage {
             input_tokens: v["usage"]["prompt_tokens"].as_u64(),
             output_tokens: v["usage"]["completion_tokens"].as_u64(),
+            // OpenAI-compatible endpoints put the cached share in
+            // prompt_tokens_details.cached_tokens (DeepSeek: prompt_cache_hit_tokens).
+            cache_read_tokens: v["usage"]["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .or_else(|| v["usage"]["prompt_cache_hit_tokens"].as_u64()),
+            cache_write_tokens: None,
         };
         Ok(LlmResponse {
             content,

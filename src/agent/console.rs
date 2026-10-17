@@ -90,6 +90,18 @@ pub fn undo_text(agent: &Agent) -> String {
 }
 
 /// `/status` — provider, budget, usage, history size.
+pub fn status_text_with_cost(agent: &Agent) -> String {
+    let mut out = status_text(agent);
+    if let Some(cost) = agent.cost_usd() {
+        out.push_str(&format!(
+            "\ncost(task):     {} (cache read {} tokens)",
+            money(cost),
+            agent.usage().cache_read_tokens.unwrap_or(0)
+        ));
+    }
+    out
+}
+
 pub fn status_text(agent: &Agent) -> String {
     let u = agent.usage();
     format!(
@@ -630,6 +642,10 @@ pub fn unknown_command_text(verb: &str) -> String {
 
 /// `/context`: where the estimated tokens go right now, plus what the
 /// automatic machinery will do next — the numbers a user actually asks about.
+/// `/context`: where the estimated tokens go right now, plus what the
+/// automatic machinery will do next. The history is split into the three
+/// bands the trimmer actually keeps (pinned head, droppable middle, newest
+/// rounds), so "the model forgot" is never a mystery.
 pub fn context_report(agent: &Agent) -> String {
     let h = &agent.history;
     let sys = h
@@ -659,13 +675,133 @@ pub fn context_report(agent: &Agent) -> String {
         1 => " (1 compaction summary inside)".to_string(),
         n => format!(" ({n} compaction summaries inside)"),
     };
-    format!(
-        "context estimate:\n  system   ~{sys} tokens{summary_note}\n  history  ~{hist} tokens ({} messages)\n  tools    ~{tools} tokens ({} in catalog)\n  total    ~{total} / {budget} token budget ({}%)\n  auto-compact fires at {}% of the budget; over-budget rounds are plain-trimmed oldest-first, /compact replaces the trimmed part with a summary",
+    // --- the three bands ------------------------------------------------
+    let pinned_turns = h
+        .pinned
+        .iter()
+        .map(|i| {
+            // a pin keeps its whole turn: count from the user message that
+            // opened it
+            let start = h.msgs[..=*i]
+                .iter()
+                .rposition(|m| m.role == crate::llm::Role::User)
+                .unwrap_or(*i);
+            start
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let pinned_msgs = pinned_turns.len();
+    let pinned_tokens: u64 = h
+        .msgs
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| pinned_turns.iter().any(|s| *s <= *i))
+        .map(|(_, m)| m.text().chars().count() as u64 / 4 + 32)
+        .sum();
+    // droppable = completed turns before the newest one (what a trim eats)
+    let users: Vec<usize> = h
+        .msgs
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == crate::llm::Role::User)
+        .map(|(i, _)| i)
+        .collect();
+    let newest_turn = users.last().copied().unwrap_or(0);
+    let droppable_msgs = newest_turn.saturating_sub(pinned_msgs.min(newest_turn));
+    let droppable_tokens = if newest_turn == 0 {
+        0
+    } else {
+        h.msgs[..newest_turn]
+            .iter()
+            .map(|m| m.text().chars().count() as u64 / 4 + 32)
+            .sum()
+    };
+    let mut out = format!(
+        "context estimate:\n  system   ~{sys} tokens{summary_note}\n  history  ~{hist} tokens ({} messages)\n  tools    ~{tools} tokens ({} in catalog)\n  total    ~{total} / {budget} token budget ({}%)\n",
         h.msgs_len(),
         specs.len(),
-        total * 100 / budget,
+        total * 100 / budget
+    );
+    out.push_str(&format!(
+        "\n  bands\n    newest turn   ~{} tokens (never dropped)\n    droppable     ~{droppable_tokens} tokens in {droppable_msgs} message(s) — a trim eats these first\n    pinned        {pinned_msgs} turn(s) ~{pinned_tokens} tokens (never dropped; /pin to manage)\n",
+        hist.saturating_sub(droppable_tokens)
+    ));
+    if pinned_msgs == 0 {
+        out.push_str("    (nothing pinned — this long task can lose its oldest instructions)\n");
+    }
+    out.push_str(&format!(
+        "\n  auto-compact fires at {}% of the budget; over-budget rounds are plain-trimmed oldest-first, /compact replaces the trimmed part with a summary",
         Agent::compact_threshold_percent()
-    )
+    ));
+    out
+}
+pub fn money(usd: f64) -> String {
+    if usd.abs() < 0.01 {
+        format!("${usd:.4}")
+    } else {
+        format!("${usd:.2}")
+    }
+}
+
+/// What `/cost` needs from the TUI. Kept as a plain snapshot so `console` does
+/// not depend on the screen's private state, and so the report is testable
+/// without a terminal.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CostContext {
+    /// USD accumulated by finished tasks in this run.
+    pub session_usd: f64,
+    /// True once at least one finished task was actually priced.
+    pub session_priced: bool,
+    pub tasks_done: u32,
+    pub session_in: u64,
+    pub session_out: u64,
+    /// USD so far in the running task (`None` = unpriced or not started).
+    pub task_usd: Option<f64>,
+}
+
+/// `/cost`: this task, this run, cache share, and where the numbers came
+/// from. An unpriced model prints tokens — kazi never invents a price.
+pub fn cost_report(agent: &Agent, ctx: CostContext) -> String {
+    let u = agent.usage();
+    let (input, output, cache_read, cache_write) = u.totals();
+    let mut out = String::from("cost\n");
+    match agent.cost_usd() {
+        Some(task) => out.push_str(&format!(
+            "  this task   {} (in {input} · out {output} · cache read {cache_read} / write {cache_write})\n",
+            money(task)
+        )),
+        None => out.push_str(&format!(
+            "  this task   unpriced — in {input} · out {output} · cache read {cache_read} / write {cache_write}\n"
+        )),
+    }
+    if ctx.session_priced {
+        out.push_str(&format!(
+            "  this run    {} over {} finished task(s)\n",
+            money(ctx.session_usd),
+            ctx.tasks_done
+        ));
+    } else {
+        out.push_str(&format!(
+            "  this run    unpriced — {} finished task(s), in {} / out {} tokens\n",
+            ctx.tasks_done, ctx.session_in, ctx.session_out
+        ));
+    }
+    if let Some(pct) = u.cache_hit_percent() {
+        out.push_str(&format!(
+            "  cache       {pct}% of this task's prompt came from cache\n"
+        ));
+    }
+    if agent.cost_usd().is_none() {
+        out.push_str(
+            "  (no [usage.prices] entry for this model: kazi shows tokens rather than\n   guessing — add one as [usage.prices.\"<model>\"])\n",
+        );
+    }
+    if let Some(budget) = agent.max_usd_per_task() {
+        out.push_str(&format!(
+            "  budget      {} per task (agent.max_usd_per_task)\n",
+            money(budget)
+        ));
+    }
+    out.trim_end().to_string()
 }
 
 /// Terminal prompt approver: `y` once, `a` always (this session, per
@@ -735,6 +871,16 @@ pub fn render_event(ev: &AgentEvent) {
                 print!("{CYAN}>> {name}{RESET} {DIM}{summary}{RESET}");
             }
             let _ = std::io::stdout().flush();
+        }
+        AgentEvent::ChangesetPending { files } => {
+            // headless builds have no reviewer prompt: say so instead of
+            // pretending the write happened (the agent auto-accepts, and the
+            // per-file tool results follow)
+            println!();
+            println!(
+                "{YELLOW}>> changeset: {} file(s) staged (auto-accepted in this mode){RESET}",
+                files.len()
+            );
         }
         AgentEvent::ToolEnd {
             is_error,
@@ -811,8 +957,10 @@ enum ArgKind {
     Model,
     /// `on | off`; empty toggles
     Toggle,
-    /// permission mode name; TAB lists the three modes
+    /// permission mode name; TAB lists every mode
     Permission,
+    /// effort preset name; TAB lists fast/balanced/deep (+ config presets)
+    Preset,
 }
 
 /// One row of the command table.
@@ -893,7 +1041,7 @@ const COMMANDS: &[CmdSpec] = &[
     },
     CmdSpec {
         name: "/permission",
-        args: "[read-only|edit|yolo]",
+        args: "[read-only|review|edit|yolo]",
         help: "show or set the permission mode",
         arg: ArgKind::Permission,
     },
@@ -998,6 +1146,30 @@ const COMMANDS: &[CmdSpec] = &[
         args: "",
         help: "run the last task again",
         arg: ArgKind::No,
+    },
+    CmdSpec {
+        name: "/effort",
+        args: "[fast|balanced|deep]",
+        help: "swap the request preset (temperature, output budget, reasoning effort)",
+        arg: ArgKind::Preset,
+    },
+    CmdSpec {
+        name: "/cost",
+        args: "[reset]",
+        help: "tokens and money for this task and session (needs [usage.prices])",
+        arg: ArgKind::Flag,
+    },
+    CmdSpec {
+        name: "/pin",
+        args: "[n|off]",
+        help: "keep a message through trimming (bare lists pinned entries)",
+        arg: ArgKind::Flag,
+    },
+    CmdSpec {
+        name: "/find",
+        args: "<text>",
+        help: "search every saved session for a phrase",
+        arg: ArgKind::Topic,
     },
 ];
 
@@ -1124,10 +1296,11 @@ pub fn arg_completions(
         "/provider" => cfg.nicks(),
         "/model" => model_choices_static(cfg, current_provider, current_model),
         "/resume" => session::list(),
-        "/permission" => ["read-only", "edit", "yolo"]
+        "/permission" => crate::tools::PermissionMode::ALL
             .iter()
-            .map(|s| s.to_string())
+            .map(|m| m.as_str().to_string())
             .collect(),
+        "/effort" => cfg.preset_names(),
         "/yolo" | "/details" => ["on", "off"].iter().map(|s| s.to_string()).collect(),
         "/compact" => vec!["force".to_string()],
         _ => return None,
@@ -1182,6 +1355,8 @@ pub fn works_while_busy(verb: &str) -> bool {
             | "/copy"
             | "/diff"
             | "/queue"
+            | "/cost"
+            | "/find"
     )
 }
 
@@ -1387,6 +1562,8 @@ mod tests {
             todos: None,
             permission: crate::tools::Permission::default(),
             subagent: None,
+            staged: None,
+            reviewer: None,
         };
         let mut agent = Agent::new(
             provider,
@@ -1510,9 +1687,16 @@ mod slug_tests {
         )
         .unwrap();
 
+        // `re` forks between read-only and review; `rea` decides
         let (start, rows) = arg_completions(&cfg, "/permission re", None, None).expect("modes");
         assert_eq!(&"/permission re"[start..], "re");
+        assert_eq!(rows, vec!["read-only", "review"]);
+        let (_, rows) = arg_completions(&cfg, "/permission rea", None, None).expect("modes");
         assert_eq!(rows, vec!["read-only"]);
+
+        // effort presets complete from the built-ins
+        let (_, rows) = arg_completions(&cfg, "/effort ", None, None).expect("presets");
+        assert!(rows.contains(&"deep".to_string()) && rows.contains(&"fast".to_string()));
 
         let (_, rows) = arg_completions(&cfg, "/provider ", None, None).expect("nicks");
         assert!(rows.contains(&"deepseek".to_string()) && rows.contains(&"ollama".to_string()));

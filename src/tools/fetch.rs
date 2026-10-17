@@ -48,6 +48,52 @@ fn is_private_host(host: &str) -> bool {
     }
 }
 
+/// Why a URL is refused: `None` = allowed.
+///
+/// Kept separate from the request path because the redirect policy re-runs it
+/// on **every hop**: reqwest follows up to 10 redirects by default, and a
+/// public host that answers `302 Location: http://169.254.169.254/…` used to
+/// walk straight past the check that only looked at the first URL.
+fn blocked_reason(url: &reqwest::Url) -> Option<String> {
+    if url.scheme() != "https" {
+        return Some(format!(
+            "only https:// URLs are accepted (got {})",
+            url.scheme()
+        ));
+    }
+    let host = match url.host_str() {
+        Some(h) => h,
+        None => return Some("URL has no host".to_string()),
+    };
+    if is_private_host(host) {
+        return Some(format!("host {host:?} looks local/private and is blocked"));
+    }
+    None
+}
+
+/// HTTP client whose redirect policy re-validates every hop. A redirect to a
+/// private address (or off https) is a hard error, not a silent follow.
+fn client() -> Result<reqwest::Client, ToolError> {
+    let policy = reqwest::redirect::Policy::custom(|attempt| {
+        match blocked_reason(attempt.url()) {
+            // the error text reaches the model through ToolError
+            Some(reason) => attempt.error(reason),
+            None => {
+                if attempt.previous().len() >= 5 {
+                    attempt.error("too many redirects (max 5)")
+                } else {
+                    attempt.follow()
+                }
+            }
+        }
+    });
+    reqwest::Client::builder()
+        .user_agent(concat!("kazi/", env!("CARGO_PKG_VERSION")))
+        .redirect(policy)
+        .build()
+        .map_err(|e| ToolError::new(format!("http client: {e}")))
+}
+
 fn is_ula_or_linklocal_v6(ip: &std::net::Ipv6Addr) -> bool {
     let seg = ip.octets();
     // fc00::/7 (ULA) or fe80::/10 (link-local)
@@ -101,7 +147,7 @@ impl Tool for FetchUrl {
         "fetch_url"
     }
     fn description(&self) -> &str {
-        "Fetch a public https:// URL and return its plain text (HTML reduced to text). Local/private addresses are blocked. Use for documentation and API lookups."
+        "Fetch a public https:// URL and return its plain text (HTML reduced to text; uncompressed PDFs get their text extracted, with a note when the PDF stores compressed streams). Local/private addresses are blocked. Use for documentation and API lookups."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -115,22 +161,11 @@ impl Tool for FetchUrl {
         let raw = arg_str(args, "url")?;
         let url =
             reqwest::Url::parse(raw).map_err(|e| ToolError::new(format!("invalid url: {e}")))?;
-        if url.scheme() != "https" {
-            return Err(ToolError::new("only https:// URLs are accepted"));
-        }
-        let host = url
-            .host_str()
-            .ok_or_else(|| ToolError::new("URL has no host"))?;
-        if is_private_host(host) {
-            return Err(ToolError::new(format!(
-                "host {host:?} looks local/private and is blocked"
-            )));
+        if let Some(reason) = blocked_reason(&url) {
+            return Err(ToolError::new(reason));
         }
 
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("kazi/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|e| ToolError::new(format!("http client: {e}")))?;
+        let http = client()?;
         let resp = http
             .get(url)
             .header(
@@ -143,12 +178,14 @@ impl Tool for FetchUrl {
         if !resp.status().is_success() {
             return Err(ToolError::new(format!("HTTP {}", resp.status().as_u16())));
         }
-        let is_html = resp
+        let content_type = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .map(|v| v.contains("html"))
-            .unwrap_or(false);
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let is_html = content_type.contains("html");
+        let is_pdf = content_type.contains("application/pdf");
 
         // Cap bytes AND wall time: read the stream until 1 MiB or 30 s,
         // whichever comes first, regardless of claimed Content-Length.
@@ -178,7 +215,21 @@ impl Tool for FetchUrl {
             }
         }
         let body = String::from_utf8_lossy(&bytes).into_owned();
-        let text = if is_html { html_to_text(&body) } else { body };
+        let text = if is_pdf {
+            // Binary PDFs are useless as text; extract what we honestly can.
+            let (text, note) = super::pdf::extract_text(&bytes);
+            match note {
+                Some(note) if text.trim().is_empty() => {
+                    return Ok(format!("(PDF: {note})"));
+                }
+                Some(note) => format!("{text}\n\n[PDF note: {note}]"),
+                None => text,
+            }
+        } else if is_html {
+            html_to_text(&body)
+        } else {
+            body
+        };
         if text.chars().count() <= RETURN_CAP {
             Ok(text)
         } else {
@@ -217,5 +268,23 @@ mod tests {
         assert!(is_private_host("fd00::1"));
         assert!(!is_private_host("crates.io"));
         assert!(!is_private_host("8.8.8.8"));
+    }
+
+    #[test]
+    fn every_hop_is_validated_not_just_the_first_url() {
+        // The 0.18 hole: only the typed URL was checked, then reqwest followed
+        // up to 10 redirects — so a public host could bounce the agent into
+        // link-local metadata or a plain-http LAN service.
+        let hop = |u: &str| blocked_reason(&reqwest::Url::parse(u).unwrap());
+
+        assert!(hop("https://example.com/docs").is_none());
+        // the *second* hop is exactly what the old code never looked at
+        assert!(hop("http://169.254.169.254/latest/meta-data").is_some());
+        assert!(hop("https://127.0.0.1:8080/admin").is_some());
+        assert!(hop("https://[::1]/").is_some());
+        assert!(hop("https://10.0.0.2/internal").is_some());
+        // an https→http downgrade is refused even for a public host
+        let reason = hop("http://example.com/").unwrap();
+        assert!(reason.contains("https"), "{reason}");
     }
 }

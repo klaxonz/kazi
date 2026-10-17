@@ -15,6 +15,20 @@ use serde_json::{json, Value};
 
 use super::{optional_str, Tool, ToolCtx, ToolError};
 
+/// Label put on a sub-agent's approval summary, so a nested prompt can never be
+/// mistaken for the user's own task.
+pub const SUBAGENT_MARK: &str = "[sub-agent] ";
+
+/// Give a sub-agent an approver that reports its origin. Approvers that cannot
+/// be scoped (test doubles) are shared unchanged.
+pub fn scope_approver(
+    approver: &std::sync::Arc<dyn super::Approver>,
+) -> std::sync::Arc<dyn super::Approver> {
+    approver
+        .scoped("sub-agent")
+        .unwrap_or_else(|| approver.clone())
+}
+
 /// What a sub-agent run produces for the calling tool.
 #[async_trait]
 pub trait SubAgentRunner: Send + Sync {
@@ -22,6 +36,7 @@ pub trait SubAgentRunner: Send + Sync {
 }
 
 pub struct Delegate;
+// probe
 
 #[async_trait]
 impl Tool for Delegate {

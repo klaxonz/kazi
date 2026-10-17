@@ -38,6 +38,7 @@ pub struct AnthropicProvider {
     base: String,
     model: String,
     api_key: String,
+    tuning: super::Tuning,
 }
 
 impl AnthropicProvider {
@@ -52,6 +53,7 @@ impl AnthropicProvider {
                 .to_string(),
             model: settings.model.clone(),
             api_key: settings.api_key.clone().unwrap_or_default(),
+            tuning: settings.tuning.clone(),
         }
     }
 
@@ -165,19 +167,45 @@ impl AnthropicProvider {
         (system_parts.join("\n\n"), out)
     }
 
+    /// System prompt → content blocks with one cache breakpoint.
+    ///
+    /// `[Context summary of dropped conversation turns]` marks the volatile
+    /// tail that compaction appends; everything before it is byte-stable for
+    /// the life of the session and is what the cache breakpoint covers. Public
+    /// so the wire shape is testable without a network round trip.
+    pub fn system_blocks_parts(system: &str) -> Vec<Value> {
+        system_blocks(system)
+    }
+
     fn wire_request(&self, req: &LlmRequest, stream: bool) -> Value {
         let (system, messages) = Self::wire(&req.messages);
         let mut body = json!({
             "model": self.model,
-            "max_tokens": MAX_TOKENS,
+            // `/effort` sets this; without a preset the old constant applies so
+            // every endpoint keeps getting a valid, conservative budget.
+            "max_tokens": self.tuning.max_tokens.unwrap_or(MAX_TOKENS),
             "stream": stream,
             "messages": messages,
         });
+        if let Some(t) = self.tuning.temperature {
+            body["temperature"] = json!(t);
+        }
         if !system.is_empty() {
-            body["system"] = json!(system);
+            // Prompt caching: mark the STABLE part of the system prompt. The
+            // compaction summary is appended to it after a /compact, and a
+            // single block would change on every compaction, invalidating the
+            // whole cached prefix. Splitting keeps the base prompt cached
+            // across compactions; only the summary block is re-billed.
+            body["system"] = json!(system_blocks(&system));
         }
         if !req.tools.is_empty() {
-            body["tools"] = Self::tools_wire(&req.tools);
+            let mut tools = Self::tools_wire(&req.tools);
+            // cache the whole catalog: mark the LAST tool, which caches every
+            // schema before it in one breakpoint (max 4 are allowed per call)
+            if let Some(last) = tools.as_array_mut().and_then(|a| a.last_mut()) {
+                last["cache_control"] = json!({"type": "ephemeral"});
+            }
+            body["tools"] = tools;
             body["tool_choice"] = json!({"type": "auto"});
         }
         body
@@ -211,6 +239,10 @@ impl AnthropicProvider {
             usage: Usage {
                 input_tokens: v["usage"]["input_tokens"].as_u64(),
                 output_tokens: v["usage"]["output_tokens"].as_u64(),
+                // Anthropic reports cache traffic next to the token counts;
+                // without these two numbers a cached round looks free.
+                cache_read_tokens: v["usage"]["cache_read_input_tokens"].as_u64(),
+                cache_write_tokens: v["usage"]["cache_creation_input_tokens"].as_u64(),
             },
         })
     }
@@ -381,10 +413,82 @@ impl Provider for AnthropicProvider {
     }
 }
 
+/// Split the system prompt at the compaction-summary marker: the base prompt
+/// is cached, the summary tail rides along uncached.
+fn system_blocks(system: &str) -> Vec<Value> {
+    const MARK: &str = "[Context summary of dropped conversation turns]";
+    match system.split_once(MARK) {
+        Some((base, tail)) if !base.trim().is_empty() => vec![
+            json!({
+                "type": "text",
+                "text": base.trim_end(),
+                "cache_control": {"type": "ephemeral"},
+            }),
+            json!({"type": "text", "text": format!("{MARK}{tail}")}),
+        ],
+        _ => vec![json!({
+            "type": "text",
+            "text": system,
+            "cache_control": {"type": "ephemeral"},
+        })],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn provider(tuning: super::super::Tuning) -> AnthropicProvider {
+        AnthropicProvider {
+            http: reqwest::Client::new(),
+            base: DEFAULT_BASE_URL.into(),
+            model: "m".into(),
+            api_key: "k".into(),
+            tuning,
+        }
+    }
+
+    #[test]
+    fn cache_breakpoints_are_byte_stable() {
+        // The cache only pays off if the marked prefix does not change. Two
+        // compaction summaries appended at different times must leave the
+        // base block byte-identical.
+        let base = "You are kazi.\nWorking directory: D:/Code/init/kazi.";
+        let with_a = format!("{base}\n\n[Context summary of dropped conversation turns]\n- did A");
+        let with_b =
+            format!("{base}\n\n[Context summary of dropped conversation turns]\n- did A\n- did B");
+        let a = AnthropicProvider::system_blocks_parts(&with_a);
+        let b = AnthropicProvider::system_blocks_parts(&with_b);
+        assert_eq!(a.len(), 2, "base + summary tail");
+        assert_eq!(a[0], b[0], "the cached block must not move");
+        assert_ne!(a[1], b[1], "the tail is the volatile part");
+        assert_eq!(a[0]["cache_control"]["type"], "ephemeral");
+
+        // without a summary the whole prompt is the cached block
+        let solo = AnthropicProvider::system_blocks_parts(base);
+        assert_eq!(solo.len(), 1);
+        assert_eq!(solo[0]["text"], base);
+    }
+
+    #[test]
+    fn preset_reaches_the_wire() {
+        let tuning = super::super::Tuning {
+            temperature: Some(0.2),
+            max_tokens: Some(8192),
+            reasoning_effort: None,
+        };
+        let req = LlmRequest {
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+        };
+        let body = provider(tuning).wire_request(&req, false);
+        assert_eq!(body["temperature"], 0.2);
+        assert_eq!(
+            body["max_tokens"], 8192,
+            "a preset overrides the 4096 default"
+        );
+    }
 
     #[test]
     fn consecutive_tool_results_merge_into_one_user_message() {
@@ -430,16 +534,15 @@ mod tests {
                 parameters: json!({"type": "object", "properties": {}}),
             }],
         };
-        let body = AnthropicProvider {
-            http: reqwest::Client::new(),
-            base: DEFAULT_BASE_URL.into(),
-            model: "m".into(),
-            api_key: "k".into(),
-        }
-        .wire_request(&req, false);
-        assert_eq!(body["system"], "sit in one place");
+        let body = provider(super::super::Tuning::default()).wire_request(&req, false);
+        // the system prompt is now a cache-marked block, not a bare string
+        assert_eq!(body["system"][0]["text"], "sit in one place");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(body["system"].as_array().map(|a| a.len()) == Some(1));
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+        // the LAST tool carries the breakpoint, which caches the whole catalog
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["tool_choice"]["type"], "auto");
         assert!(body["max_tokens"].is_u64());
         assert_eq!(body["stream"], false, "complete() must not stream");
@@ -451,13 +554,7 @@ mod tests {
             messages: vec![Message::user("hi")],
             tools: vec![],
         };
-        let body = AnthropicProvider {
-            http: reqwest::Client::new(),
-            base: DEFAULT_BASE_URL.into(),
-            model: "m".into(),
-            api_key: "k".into(),
-        }
-        .wire_request(&req, true);
+        let body = provider(super::super::Tuning::default()).wire_request(&req, true);
         assert_eq!(
             body["stream"], true,
             "complete_stream() must ask for SSE, else the decoder sees one JSON object"

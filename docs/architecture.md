@@ -304,7 +304,57 @@ ToolEnd   { id, name, is_error, preview,
 `src/diff.rs`(去公共前后缀 + LCS,失败退化为整块替换)输出带 `@@` 的 hunk。
 TUI 只负责上色;`kazi run --output json` 也顺带得到全部信息。
 
-## 12. 为什么不用框架
+## 12. 0.19 的三处结构性改动
+
+这一版没有新增协议,但改了三件事的**所有权**,值得单独说明。
+
+### 12.1 权限单元:clone 不等于共享
+
+`ToolCtx` 是 `Clone`,但里面的 `permission` 是 `Arc<AtomicU8>`。0.18 之前,
+`delegate` 克隆上下文后直接把副本设为只读——因为共享同一个原子量,**父会话也被
+静默切成只读**。修法是 `ToolCtx::derive(mode)`:`/delegate`、子代理这类
+"另一个作用域"必须走它,副本拿到新的权限单元;其余字段仍共享(审批器、检查点、
+待办本来就应该共享)。回归测试 `derived_ctx_does_not_touch_the_parent_permission`
+锁死这条。
+
+### 12.2 审批的身份:队列,而不是最后一个
+
+审批请求 `ApprovalAsk` 带 `id` / `task` / `origin`(主任务或 `[sub-agent]`)。
+TUI 端从"一个槽位"改成 `VecDeque`:先到的先答,弹窗上写清是哪条任务、哪个来源、
+还有几条在等。任务结束时,仍然挂着的审批统一 `Deny("task already finished")`,
+不会留下一个没人回答的 oneshot。
+
+### 12.3 审阅模式:写工具只"登记",引擎统一落盘
+
+`review` 权限下,`write_file` / `apply_patch` 不碰磁盘:它们把
+`StagedChange { path, before, after }` 放进 `ctx.staged`(`Staging`,同一路径后写覆盖
+前写,后续 patch 基于**已登记的内容**而不是旧盘面),然后返回 "staged"。
+
+一轮工具结束后,引擎(`run_task`)取走整批:
+
+```text
+staging.take() → Reviewer::review(cwd, changes)
+                   ├─ TUI: 弹 changeset 浮层,逐文件取舍
+                   └─ 无 UI: AutoReviewer 全接受(headless)
+→ apply_reviewed():接受的文件先 checkpoint 再写;拒绝的文件根本不写
+→ 每个 staged call 的工具结果被改写成「reviewed + written」或「NOT written: 原因」
+```
+
+被拒绝的路径以 `is_error` 回传,模型因此知道"这部分没发生",而不是以为自己写成功了。
+提交后才计算 `wrote`,所以 `feedback_command` 不会为一次被拒绝的改动白跑一遍。
+
+### 12.4 成本与缓存:数字必须可核对
+
+- `ProviderSettings.tuning` 携带 `/effort` 档位(temperature / max_tokens /
+  reasoning_effort),两个 wire 只发送 `Some` 的字段。
+- `Usage` 增加 `cache_read_tokens` / `cache_write_tokens`;Anthropic 的
+  `cache_control` 打在**稳定的 system 块**和**工具目录的最后一项**上,压缩摘要单独
+  成块、不进缓存前缀,所以一次 `/compact` 不会让整段前缀失效。
+- 价格来自用户配置的 `[usage.prices]`;没配置就只显示 token。`/cost`、页脚、
+  `kazi run` 和 `--output json` 用同一份数字,`agent.max_usd_per_task` 在轮与轮
+  之间中断(`AgentError::BudgetExceeded`,历史保留)。
+
+## 13. 为什么不用框架
 
 现有的 agent 框架 (LangChain/rig/Swarm…) 提供的是**包装**,购买的是接入速度,
 付出的代价是:层数深了以后,你不知道一次 422 是哪里产生的、流式碎片在哪里被拼坏、

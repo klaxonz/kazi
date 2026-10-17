@@ -14,6 +14,11 @@ pub struct History {
     pub system: Option<String>,
     /// Conversation in append order (system excluded).
     pub msgs: Vec<Message>,
+    /// Message indexes the user pinned (`/pin`): trimming steps over the whole
+    /// turn containing a pinned message, so a constraint survives the budget.
+    /// Indexes shift when older turns are dropped, so they are stored as
+    /// relative positions and rebased on every drain.
+    pub pinned: std::collections::BTreeSet<usize>,
 }
 
 impl History {
@@ -21,6 +26,7 @@ impl History {
         Self {
             system,
             msgs: Vec::new(),
+            pinned: std::collections::BTreeSet::new(),
         }
     }
 
@@ -30,6 +36,63 @@ impl History {
 
     pub fn reset_msgs(&mut self) {
         self.msgs.clear();
+        self.pinned.clear();
+    }
+
+    /// Pin one message index (1-based in the transcript's display order is the
+    /// UI's business; this takes the raw `msgs` index).
+    pub fn pin(&mut self, idx: usize) -> bool {
+        if idx >= self.msgs.len() {
+            return false;
+        }
+        self.pinned.insert(idx);
+        true
+    }
+
+    pub fn unpin(&mut self, idx: usize) -> bool {
+        self.pinned.remove(&idx)
+    }
+
+    pub fn clear_pins(&mut self) {
+        self.pinned.clear();
+    }
+
+    pub fn is_pinned(&self, idx: usize) -> bool {
+        self.pinned.contains(&idx)
+    }
+
+    pub fn pins_len(&self) -> usize {
+        self.pinned.len()
+    }
+
+    /// `(index, text)` for every pinned message, in order.
+    pub fn pins_list(&self) -> Vec<(usize, String)> {
+        self.pinned
+            .iter()
+            .filter_map(|i| self.msgs.get(*i).map(|m| (*i, m.text().to_string())))
+            .collect()
+    }
+
+    /// Rebase pin indexes after `dropped` messages were removed from the head.
+    fn rebase_pins(&mut self, dropped: usize) {
+        if self.pinned.is_empty() {
+            return;
+        }
+        self.pinned = self
+            .pinned
+            .iter()
+            .filter_map(|i| i.checked_sub(dropped))
+            .collect();
+    }
+
+    /// The turn containing a pinned message starts at this index (the nearest
+    /// user message at or before it): pining one line keeps its whole task.
+    fn pin_floor(&self) -> Option<usize> {
+        let first = *self.pinned.iter().next()?;
+        let start = (0..=first.min(self.msgs.len().saturating_sub(1)))
+            .rev()
+            .find(|i| self.msgs[*i].role == Role::User)?;
+        Some(start)
     }
 
     pub fn msgs_len(&self) -> usize {
@@ -70,9 +133,16 @@ impl History {
     /// turn is never dropped — even if that means overshooting.
     pub fn trim_to_tokens(&mut self, budget: u64) {
         while self.estimate_tokens() > budget {
-            match self.turn_cut() {
-                Some(i) => self.msgs.drain(0..i),
-                None => break,
+            let mut cut = self.turn_cut();
+            if let (Some(c), Some(floor)) = (cut, self.pin_floor()) {
+                cut = (c <= floor).then_some(c);
+            }
+            match cut {
+                Some(i) if i > 0 => {
+                    self.msgs.drain(0..i);
+                    self.rebase_pins(i);
+                }
+                _ => break,
             };
         }
     }
@@ -117,14 +187,20 @@ impl History {
             // turns first, then rounds of the one remaining task. `cut > 0`
             // guards the mid-task case where the newest round *starts* at the
             // head: nothing older is left to drop, so stop instead of spinning.
-            let Some(cut) = self
+            let mut cut = self
                 .turn_cut()
                 .or_else(|| self.last_round_cut())
-                .filter(|cut| *cut > 0)
-            else {
+                .filter(|cut| *cut > 0);
+            // never cut into (or past) a pinned turn: trimming stops at its
+            // start, so the pinned constraint stays in the window
+            if let (Some(c), Some(floor)) = (cut, self.pin_floor()) {
+                cut = (c <= floor).then_some(c);
+            }
+            let Some(cut) = cut.filter(|cut| *cut > 0) else {
                 break;
             };
             dropped.extend(self.msgs.drain(0..cut));
+            self.rebase_pins(cut);
         }
         if dropped.is_empty() {
             None
@@ -297,6 +373,84 @@ mod tests {
             "the newest turn must survive: {dropped}"
         );
         assert_eq!(h.msgs_len(), 4, "only the newest turn is left");
+    }
+
+    #[test]
+    fn pins_can_be_listed_and_cleared() {
+        let mut h = History::new(None);
+        h.push(Message::user("first"));
+        h.push(Message::assistant("answer"));
+        assert!(h.pin(1));
+        let list = h.pins_list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].0, 1);
+        assert_eq!(list[0].1, "answer");
+        assert_eq!(h.pins_len(), 1);
+        h.clear_pins();
+        assert!(h.pins_list().is_empty());
+        // pinning out of range is refused, not silently accepted
+        assert!(!h.pin(99));
+        // /clear drops the pins with the messages
+        h.pin(0);
+        h.reset_msgs();
+        assert_eq!(h.pins_len(), 0);
+    }
+
+    #[test]
+    fn pinned_message_survives_trimming() {
+        let big = "x".repeat(400);
+        let mut h = History::new(Some("S".into()));
+        // turn 1 carries a constraint the user pins
+        h.push(Message::user(format!("task 0 {big}")));
+        h.push(Message::assistant("constraint: always use tabs"));
+        // turns 2..4 are filler
+        for i in 1..4 {
+            h.push(Message::user(format!("task {i} {big}")));
+            h.push(Message::assistant(big.clone()));
+        }
+        assert!(h.pin(1), "pin the constraint line");
+        h.trim_to_tokens(300);
+        let texts: Vec<&str> = h.msgs.iter().map(|m| m.text()).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("always use tabs")),
+            "the pinned turn must survive: {texts:?}"
+        );
+        // the pin index followed the remaining messages
+        assert!(
+            h.is_pinned(1) || h.is_pinned(0),
+            "pin rebased: {:?}",
+            h.pinned
+        );
+
+        // unpinned, the same history is trimmed away entirely
+        let mut h2 = History::new(Some("S".into()));
+        h2.push(Message::user(format!("task 0 {big}")));
+        h2.push(Message::assistant("constraint: always use tabs"));
+        for i in 1..4 {
+            h2.push(Message::user(format!("task {i} {big}")));
+            h2.push(Message::assistant(big.clone()));
+        }
+        h2.trim_to_tokens(300);
+        assert!(!h2.msgs.iter().any(|m| m.text().contains("always use tabs")));
+    }
+
+    #[test]
+    fn pinned_turn_is_never_cut_by_take_beyond_text() {
+        let big = "x".repeat(400);
+        let mut h = History::new(Some("S".into()));
+        h.push(Message::user("keep me"));
+        h.push(Message::assistant("ok"));
+        for i in 0..4 {
+            h.push(Message::user(format!("task {i} {big}")));
+            h.push(Message::assistant(big.clone()));
+        }
+        h.pin(0);
+        let dropped = h.take_beyond_text(10).unwrap_or_default();
+        assert!(
+            !dropped.contains("keep me"),
+            "compaction must stop before the pinned turn: {dropped}"
+        );
+        assert!(h.msgs.iter().any(|m| m.text() == "keep me"));
     }
 
     #[test]

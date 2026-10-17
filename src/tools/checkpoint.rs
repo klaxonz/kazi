@@ -250,6 +250,118 @@ impl Checkpointing {
     }
 }
 
+/// Read a file as text for staging: refuses binaries and oversized files the
+/// same way the edit tools do, and treats "missing" as an empty base.
+pub fn read_text_lossy(path: &Path) -> Option<String> {
+    const READ_CAP: u64 = 4 * 1024 * 1024;
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > READ_CAP {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.iter().take(8192).any(|b| *b == 0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// One planned file change parked in review mode.
+#[derive(Debug, Clone)]
+pub struct StagedChange {
+    /// Tool that planned the change (`write_file` / `apply_patch`).
+    pub tool: String,
+    /// Absolute path the change targets.
+    pub path: PathBuf,
+    /// Content before the change (`None` = the file does not exist yet).
+    pub before: Option<String>,
+    /// Content as it will be written when accepted.
+    pub after: String,
+}
+
+impl StagedChange {
+    /// Displayed path: relative to `cwd` when it lives underneath it.
+    pub fn display_path(&self, cwd: &Path) -> String {
+        self.path
+            .strip_prefix(cwd)
+            .unwrap_or(&self.path)
+            .display()
+            .to_string()
+    }
+
+    /// Unified diff of the planned change (no change → `None`).
+    pub fn diff(&self, cwd: &Path) -> Option<crate::diff::UnifiedDiff> {
+        crate::diff::unified(
+            self.before.as_deref().unwrap_or(""),
+            &self.after,
+            &self.display_path(cwd),
+            3,
+        )
+    }
+
+    /// `+added` / `-removed` counts, computed from the diff.
+    pub fn counts(&self, cwd: &Path) -> (usize, usize) {
+        self.diff(cwd)
+            .map(|d| (d.added, d.removed))
+            .unwrap_or((0, 0))
+    }
+}
+
+/// Review-mode staging area: write tools park their planned content here
+/// instead of touching the disk, and the engine turns the batch into a
+/// changeset the user accepts or rejects file by file.
+///
+/// One entry per path (a later change to the same file replaces the earlier
+/// one and `apply_patch` patches the *staged* text, not the stale disk copy),
+/// in first-touch order so the review list matches the model's plan.
+#[derive(Default)]
+pub struct Staging {
+    pending: Mutex<Vec<StagedChange>>,
+}
+
+impl Staging {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Current staged content for `path`, if any — what a follow-up patch in
+    /// the same round must edit against.
+    pub fn pending_text(&self, path: &Path) -> Option<String> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|c| c.path == path)
+            .map(|c| c.after.clone())
+    }
+
+    /// Park one change; replaces an earlier pending change for the same path
+    /// while keeping the original position.
+    pub fn stage(&self, change: StagedChange) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        match pending.iter_mut().find(|c| c.path == change.path) {
+            Some(existing) => {
+                // keep the ORIGINAL `before` so the diff stays truthful
+                existing.tool = change.tool;
+                existing.after = change.after;
+            }
+            None => pending.push(change),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Drain everything staged so far (the engine owns the verdict).
+    pub fn take(&self) -> Vec<StagedChange> {
+        std::mem::take(&mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

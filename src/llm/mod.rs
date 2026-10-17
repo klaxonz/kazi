@@ -45,6 +45,33 @@ pub struct ProviderSettings {
     /// Bearer key for OpenAI-compat / `x-api-key` for Anthropic.
     /// `None` is only valid for Ollama-style local endpoints.
     pub api_key: Option<String>,
+    /// Request-level tuning from `[agent] preset` (`/effort`). Provider
+    /// entries are never modified by it.
+    pub tuning: Tuning,
+}
+
+/// Request knobs a preset can set. Wire encoders only send what is `Some`, so
+/// an unset preset keeps every endpoint's own default.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Tuning {
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<u32>,
+    /// `"low"` | `"medium"` | `"high"` — forwarded where understood.
+    pub reasoning_effort: Option<String>,
+}
+
+impl Tuning {
+    /// Merge a preset on top of explicit settings (explicit wins).
+    pub fn overlay(&self, other: &Tuning) -> Tuning {
+        Tuning {
+            temperature: other.temperature.or(self.temperature),
+            max_tokens: other.max_tokens.or(self.max_tokens),
+            reasoning_effort: other
+                .reasoning_effort
+                .clone()
+                .or_else(|| self.reasoning_effort.clone()),
+        }
+    }
 }
 
 #[derive(Debug, Error)]

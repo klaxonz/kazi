@@ -55,10 +55,117 @@ use transcript::{Level, SearchHit, Transcript};
 
 /// Approval request travelling from the agent task to the UI loop.
 pub struct ApprovalAsk {
+    /// Monotonic id: the prompt answers *this* request, not "whatever arrived
+    /// last" (two sources can queue up while the screen is busy).
+    pub id: u64,
+    /// 1-based task number it belongs to, shown to the user.
+    pub task: u64,
+    pub origin: AskOrigin,
     /// Tool that wants to run (`run_command`, ...).
     pub tool: String,
     pub summary: String,
     pub reply: tokio::sync::oneshot::Sender<Decision>,
+}
+
+/// Where an approval request came from. The main task and a `delegate`
+/// sub-task used to be indistinguishable in the prompt — and a provider switch
+/// could interleave their questions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AskOrigin {
+    /// The conversation the user is looking at.
+    Main,
+    /// A nested `delegate` run.
+    SubAgent,
+}
+
+impl AskOrigin {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Main => "task",
+            Self::SubAgent => "sub-agent",
+        }
+    }
+}
+
+/// Ids handed out to [`ApprovalAsk`]s (one counter per process is enough).
+static NEXT_ASK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Same for task numbers, so "task #7" is stable across prompts.
+static NEXT_TASK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub fn next_ask_id() -> u64 {
+    NEXT_ASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn next_task_id() -> u64 {
+    NEXT_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Review-mode request travelling from the agent task to the UI loop.
+pub struct ChangesetAsk {
+    /// Absolute paths, index-aligned with `files`, so the verdict can be
+    /// mapped back without re-deriving anything from display strings.
+    pub paths: Vec<std::path::PathBuf>,
+    pub files: Vec<overlay::ChangesetFile>,
+    pub reply: tokio::sync::oneshot::Sender<crate::tools::ReviewOutcome>,
+}
+
+/// Channel-based [`Reviewer`](crate::tools::Reviewer): the agent asks, the
+/// changeset overlay answers, and a dismissed prompt writes nothing.
+pub struct TuiReviewer {
+    tx: tokio::sync::mpsc::UnboundedSender<ChangesetAsk>,
+}
+
+impl TuiReviewer {
+    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<ChangesetAsk>) -> Self {
+        Self { tx }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::tools::Reviewer for TuiReviewer {
+    async fn review(
+        &self,
+        cwd: &std::path::Path,
+        changes: &[crate::tools::checkpoint::StagedChange],
+    ) -> crate::tools::ReviewOutcome {
+        let files: Vec<overlay::ChangesetFile> = changes
+            .iter()
+            .map(|c| {
+                let (added, removed) = c.counts(cwd);
+                overlay::ChangesetFile {
+                    path: c.display_path(cwd),
+                    added,
+                    removed,
+                    diff: c.diff(cwd).map(|d| d.text).unwrap_or_default(),
+                    // default to accepting: "yes, do what you planned" is the
+                    // common case, and rejecting one file is one keystroke
+                    accepted: true,
+                }
+            })
+            .collect();
+        let (rtx, rrx) = tokio::sync::oneshot::channel();
+        if self
+            .tx
+            .send(ChangesetAsk {
+                paths: changes.iter().map(|c| c.path.clone()).collect(),
+                files,
+                reply: rtx,
+            })
+            .is_err()
+        {
+            // UI gone: fail closed, nothing is written
+            return crate::tools::ReviewOutcome::reject_all(
+                changes,
+                "the review prompt could not be shown; no files were written",
+            );
+        }
+        rrx.await.unwrap_or_else(|_| {
+            crate::tools::ReviewOutcome::reject_all(
+                changes,
+                "the review prompt was dismissed; no files were written",
+            )
+        })
+    }
 }
 
 /// Session-scoped "always allow" memory. Shared by every approver instance so
@@ -72,6 +179,10 @@ pub type SessionAllows = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 pub struct TuiApprover {
     tx: tokio::sync::mpsc::UnboundedSender<ApprovalAsk>,
     session_allows: SessionAllows,
+    /// Task this approver belongs to (one per agent, so a rebuild gets a new
+    /// one and a prompt always names its task).
+    task: u64,
+    origin: AskOrigin,
 }
 
 impl TuiApprover {
@@ -83,12 +194,39 @@ impl TuiApprover {
         tx: tokio::sync::mpsc::UnboundedSender<ApprovalAsk>,
         session_allows: SessionAllows,
     ) -> Self {
-        Self { tx, session_allows }
+        Self {
+            tx,
+            session_allows,
+            task: next_task_id(),
+            origin: AskOrigin::Main,
+        }
+    }
+
+    pub fn origin(mut self, origin: AskOrigin) -> Self {
+        self.origin = origin;
+        self
     }
 }
 
 #[async_trait::async_trait]
 impl Approver for TuiApprover {
+    fn origin(&self) -> Option<String> {
+        (self.origin == AskOrigin::SubAgent).then(|| "sub-agent".to_string())
+    }
+
+    fn scoped(&self, label: &str) -> Option<Arc<dyn Approver>> {
+        let origin = match label {
+            "sub-agent" => AskOrigin::SubAgent,
+            _ => AskOrigin::Main,
+        };
+        Some(Arc::new(Self {
+            tx: self.tx.clone(),
+            session_allows: self.session_allows.clone(),
+            task: self.task,
+            origin,
+        }))
+    }
+
     async fn decide(&self, tool: &str, summary: &str) -> Decision {
         let key = crate::tools::approval_key(summary);
         if !key.is_empty()
@@ -105,6 +243,9 @@ impl Approver for TuiApprover {
         if self
             .tx
             .send(ApprovalAsk {
+                id: next_ask_id(),
+                task: self.task,
+                origin: self.origin.clone(),
                 tool: tool.to_string(),
                 summary: summary.to_string(),
                 reply: rtx,
@@ -720,7 +861,33 @@ struct Screen {
     queued: VecDeque<String>,
     /// The last submitted task (`/retry`).
     last_task: Option<String>,
-    pending_approval: Option<PendingApproval>,
+    /// Approval prompts waiting for a keystroke, oldest first. A single slot
+    /// used to be enough only because two sources never asked at once; a
+    /// provider rebuild or a `delegate` sub-task made that false, and the
+    /// overwritten request was denied silently with nothing on screen.
+    approvals: VecDeque<PendingApproval>,
+    /// Task the newest `launch_task` started (labels prompts `task #N`).
+    current_task: u64,
+    /// Cached prompt tokens of the current task's last round.
+    cache_read: u64,
+    /// Active effort preset, shown as a badge in the header.
+    preset: String,
+    /// How many turns are pinned (`/pin`); the footer warns when a long task
+    /// can lose its oldest instructions.
+    pin_count: usize,
+    /// A staged changeset waiting for the user's per-file verdict: the paths
+    /// (index-aligned with the overlay's rows) and the reply channel back to
+    /// the agent task.
+    changeset_reply: Option<(
+        Vec<std::path::PathBuf>,
+        tokio::sync::oneshot::Sender<crate::tools::ReviewOutcome>,
+    )>,
+    /// USD so far in the current task (`None` = the model has no price entry).
+    task_cost: Option<f64>,
+    /// Session-wide USD, accumulated as tasks finish.
+    session_cost: f64,
+    /// Whether any round this session was actually priced.
+    cost_known: bool,
     overlay: Option<Overlay>,
     /// Clickable list area of the open overlay (mouse hit-testing).
     overlay_hit: std::cell::Cell<Option<overlay::Hit>>,
@@ -784,7 +951,15 @@ impl Screen {
             busy: false,
             queued: VecDeque::new(),
             last_task: None,
-            pending_approval: None,
+            approvals: VecDeque::new(),
+            current_task: 0,
+            cache_read: 0,
+            preset: "balanced".to_string(),
+            pin_count: 0,
+            changeset_reply: None,
+            task_cost: None,
+            session_cost: 0.0,
+            cost_known: false,
             overlay: None,
             overlay_hit: std::cell::Cell::new(None),
             overlay_body: std::cell::Cell::new(20),
@@ -795,10 +970,76 @@ impl Screen {
         }
     }
 
+    /// Snapshot of the cost counters `/cost` reports on (console owns the
+    /// formatting, the screen owns the state).
+    fn cost_context(&self) -> super::console::CostContext {
+        super::console::CostContext {
+            session_usd: self.session_cost,
+            session_priced: self.cost_known,
+            tasks_done: self.tasks_done,
+            session_in: self.total_in,
+            session_out: self.total_out,
+            task_usd: self.task_cost,
+        }
+    }
+
+    /// The prompt the keyboard is answering right now.
+    fn front_approval(&self) -> Option<&PendingApproval> {
+        self.approvals.front()
+    }
+
+    fn front_approval_mut(&mut self) -> Option<&mut PendingApproval> {
+        self.approvals.front_mut()
+    }
+
+    fn has_approval(&self) -> bool {
+        !self.approvals.is_empty()
+    }
+
+    /// Queue a prompt, telling the user when one was already on screen: two
+    /// requests used to overwrite each other, and the overwritten one was
+    /// denied without a word.
+    fn push_approval(&mut self, approval: PendingApproval) {
+        let queued_behind = self.approvals.len();
+        let label = approval.ask.origin.label().to_string();
+        let task = approval.ask.task;
+        self.approvals.push_back(approval);
+        if queued_behind > 0 {
+            self.push_notice(
+                Level::Info,
+                format!("+1 approval queued ({label}, task #{task}, {queued_behind} pending)"),
+            );
+        }
+    }
+
+    /// Deny every pending prompt — used when the screen is tearing down, so no
+    /// agent task is left waiting on a oneshot nobody will answer.
+    fn deny_pending_approvals(&mut self, reason: &str) {
+        while let Some(p) = self.approvals.pop_front() {
+            let _ = p.ask.reply.send(Decision::Deny(Some(reason.to_string())));
+        }
+    }
+
     /// Render one agent event into the screen state.
     fn consume(&mut self, ev: AgentEvent) {
         match ev {
             AgentEvent::TextDelta { text } => self.transcript.append_delta(&text),
+            AgentEvent::ChangesetPending { files } => {
+                self.flush_streaming();
+                let shown = files
+                    .iter()
+                    .take(6)
+                    .map(|(path, added, removed)| format!("  {path} (+{added} −{removed})"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.push_notice(
+                    Level::Info,
+                    format!(
+                        "changeset: {} file(s) staged for review\n{shown}",
+                        files.len()
+                    ),
+                );
+            }
             AgentEvent::ToolStart { id, name, summary } => {
                 self.flush_streaming();
                 self.transcript.start_tool(id, name, summary);
@@ -845,11 +1086,14 @@ impl Screen {
                 round,
                 usage,
                 est_tokens,
+                cost_usd,
             } => {
                 self.rounds = round;
                 self.tokens_in = usage.input_tokens.unwrap_or(0);
                 self.tokens_out = usage.output_tokens.unwrap_or(0);
+                self.cache_read = usage.cache_read_tokens.unwrap_or(0);
                 self.est_tokens = est_tokens;
+                self.task_cost = cost_usd;
             }
         }
     }
@@ -888,8 +1132,13 @@ impl Screen {
         self.total_in = self.total_in.saturating_add(self.tokens_in);
         self.total_out = self.total_out.saturating_add(self.tokens_out);
         self.tasks_done = self.tasks_done.saturating_add(1);
+        if let Some(cost) = self.task_cost.take() {
+            self.session_cost += cost;
+            self.cost_known = true;
+        }
         self.tokens_in = 0;
         self.tokens_out = 0;
+        self.cache_read = 0;
     }
 
     /// `/usage` report: this run's totals plus the running task when busy.
@@ -1091,6 +1340,10 @@ impl Screen {
                 s.refresh_preview();
             }
             Overlay::Search(s) => s.cursor = idx,
+            Overlay::Changeset(c) => {
+                c.cursor = idx;
+                c.scroll = 0;
+            }
             Overlay::Help(_) | Overlay::Diff(_) => return false,
         }
         true
@@ -1109,6 +1362,9 @@ impl Screen {
                 s.move_cursor(delta);
             }
             Overlay::Search(s) => s.move_cursor(delta),
+            Overlay::Changeset(c) => {
+                c.move_cursor(delta);
+            }
             Overlay::Help(h) => {
                 let max = overlay::help_lines(self.theme)
                     .len()
@@ -1130,7 +1386,7 @@ impl Screen {
     fn ghost_completion(&self) -> Option<String> {
         if self.busy
             || self.overlay.is_some()
-            || self.pending_approval.is_some()
+            || self.has_approval()
             || self.input.cursor != self.input.chars_len()
         {
             return None;
@@ -1186,16 +1442,21 @@ impl Screen {
             self.draw_footer(f, footer);
         }
 
-        if let Some(pending) = &self.pending_approval {
+        if let Some(pending) = self.front_approval() {
             overlay::draw_approval(
                 f,
                 area,
                 self.theme,
-                &pending.ask.tool,
-                &pending.ask.summary,
-                pending.reason_mode,
-                &pending.reason,
-                pending.scroll,
+                overlay::ApprovalView {
+                    tool: &pending.ask.tool,
+                    summary: &pending.ask.summary,
+                    origin: pending.ask.origin.label(),
+                    task: pending.ask.task,
+                    queue: self.approvals.len(),
+                    reason_mode: pending.reason_mode,
+                    reason: &pending.reason,
+                    scroll: pending.scroll,
+                },
             );
             self.overlay_hit.set(None);
         } else if let Some(ov) = &self.overlay {
@@ -1234,6 +1495,7 @@ impl Screen {
         };
         let mode_style = match self.mode {
             PermissionMode::ReadOnly => Style::default().fg(theme.warn),
+            PermissionMode::Review => Style::default().fg(theme.accent),
             PermissionMode::Edit => Style::default().fg(theme.dim),
             PermissionMode::Yolo => Style::default().fg(theme.err).add_modifier(Modifier::BOLD),
         };
@@ -1245,11 +1507,19 @@ impl Screen {
             Span::styled(" kazi ", badge),
             Span::styled(format!(" [{}]", self.mode.as_str()), mode_style),
             Span::styled(format!("  {prov}"), Style::default().fg(theme.dim)),
-            Span::styled(
-                format!("  {}", clip(&self.session_name, 24)),
-                Style::default().fg(theme.accent),
-            ),
         ];
+        // effort badge: without it the same model can answer very differently
+        // after a /effort and nothing on screen says so
+        if !self.preset.is_empty() && self.preset != "balanced" {
+            spans.push(Span::styled(
+                format!("· {}", clip(&self.preset, 12)),
+                Style::default().fg(theme.warn),
+            ));
+        }
+        spans.push(Span::styled(
+            format!("  {}", clip(&self.session_name, 24)),
+            Style::default().fg(theme.accent),
+        ));
         if left_area.width > 100 {
             spans.push(Span::styled(
                 format!("  {}", clip(&self.cwd, 30)),
@@ -1326,6 +1596,12 @@ impl Screen {
                 format!("↑{} ↓{} ", self.tokens_in, self.tokens_out),
                 Style::default().fg(theme.faint),
             ));
+            if let Some(cost) = self.task_cost {
+                spans.push(Span::styled(
+                    format!("{} ", super::console::money(cost)),
+                    Style::default().fg(theme.faint),
+                ));
+            }
         }
         spans
     }
@@ -1501,7 +1777,7 @@ impl Screen {
                 ])),
                 inner,
             );
-            if self.pending_approval.is_none() && self.overlay.is_none() {
+            if !self.has_approval() && self.overlay.is_none() {
                 f.set_cursor_position(ratatui::layout::Position {
                     x: inner.x + prompt_w as u16,
                     y: inner.y,
@@ -1543,7 +1819,7 @@ impl Screen {
             Paragraph::new(lines).style(Style::default().fg(theme.text)),
             inner,
         );
-        if self.pending_approval.is_none() && self.overlay.is_none() {
+        if !self.has_approval() && self.overlay.is_none() {
             let x = (inner.x as usize + prompt_w + caret_col) as u16;
             let y = inner.y + (caret_row - first) as u16;
             f.set_cursor_position(ratatui::layout::Position {
@@ -1555,7 +1831,7 @@ impl Screen {
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         let theme = self.theme;
-        let hints: Vec<Span> = if self.pending_approval.is_some() {
+        let hints: Vec<Span> = if self.has_approval() {
             vec![Span::styled(
                 " approval pending — y run · a always · n deny · r deny with reason · Esc deny ",
                 Style::default().fg(theme.warn),
@@ -1888,6 +2164,7 @@ async fn launch_task(
         screen.push_notice(Level::Warn, BUSY_TEXT);
         return None;
     };
+    screen.current_task = next_task_id();
     screen.begin_task(&task);
     let refs = super::file_ref_names(&task);
     if !refs.is_empty() {
@@ -1965,6 +2242,8 @@ pub async fn chat_loop_with_config(
     };
     let (ask_tx, ask_rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalAsk>();
     let ask_tx_rebuild = ask_tx.clone();
+    let (review_tx, review_rx) = tokio::sync::mpsc::unbounded_channel::<ChangesetAsk>();
+    let review_tx_rebuild = review_tx.clone();
     let session_allows = SessionAllows::default();
     let approver: Arc<dyn Approver> = if mode == PermissionMode::Yolo {
         Arc::new(crate::tools::AutoApprover)
@@ -1983,6 +2262,8 @@ pub async fn chat_loop_with_config(
         Ok(a) => a,
         Err(e) => anyhow::bail!("{e}"),
     };
+    // review mode: the changeset modal answers the engine's reviewer
+    agent.ctx.reviewer = Some(Arc::new(TuiReviewer::new(review_tx)));
 
     if let Some(name) = &resume {
         match super::session::resolve(name) {
@@ -2029,6 +2310,8 @@ pub async fn chat_loop_with_config(
         &mut sess,
         ask_tx_rebuild,
         session_allows,
+        review_rx,
+        review_tx_rebuild,
     )
     .await
     {
@@ -2070,6 +2353,7 @@ fn persist_note(sess: &SessionState, key: &str, value: &str) -> String {
 
 /// Run the TUI chat loop. `chat_loop_tui` owns its terminal; stdout is
 /// restored on every return path.
+#[allow(clippy::too_many_arguments)]
 pub async fn chat_loop_tui(
     agent: Agent,
     session_name: String,
@@ -2078,6 +2362,8 @@ pub async fn chat_loop_tui(
     sess: &mut SessionState,
     ask_tx: tokio::sync::mpsc::UnboundedSender<ApprovalAsk>,
     session_allows: SessionAllows,
+    mut review_rx: tokio::sync::mpsc::UnboundedReceiver<ChangesetAsk>,
+    review_tx: tokio::sync::mpsc::UnboundedSender<ChangesetAsk>,
 ) -> anyhow::Result<u8> {
     let provider_desc = agent.provider().describe();
     let max_rounds = agent.max_rounds();
@@ -2109,6 +2395,7 @@ pub async fn chat_loop_tui(
         &cwd,
     );
     screen.mode = permission.get();
+    screen.preset = agent.preset().to_string();
     screen.bell = sess.cfg.ui.bell.unwrap_or(false);
     screen.transcript.push_rule(format!(
         "kazi · {} · {}",
@@ -2136,6 +2423,8 @@ pub async fn chat_loop_tui(
         &session_allows,
         &mut background,
         &bg_tx,
+        &mut review_rx,
+        &review_tx,
     )
     .await;
 
@@ -2201,6 +2490,7 @@ const BUSY_TEXT: &str = "the agent is busy — try again when the task finishes"
 fn mode_note(mode: PermissionMode) -> &'static str {
     match mode {
         PermissionMode::ReadOnly => "inspect only",
+        PermissionMode::Review => "writes staged for your review",
         PermissionMode::Edit => "writes allowed, commands gated",
         PermissionMode::Yolo => "no prompts",
     }
@@ -2249,6 +2539,127 @@ async fn run_command(
                     }
                 }
             }
+        }
+        "find" => {
+            if arg.is_empty() {
+                screen.show_text(console::usage_for("/find"));
+                return None;
+            }
+            let hits = super::session::search(arg, 3, 20);
+            if hits.is_empty() {
+                screen.show_text(format!(
+                    "no stored session mentions {arg:?} (user/assistant text only)"
+                ));
+            } else {
+                let mut out = format!("{} hit(s) for {arg:?}:", hits.len());
+                for h in &hits {
+                    out.push_str(&format!(
+                        "\n  {}  ·  {} line {}  ·  {}",
+                        h.session, h.role, h.line, h.snippet
+                    ));
+                }
+                out.push_str("\n  (/resume <session> opens one)");
+                screen.show_text(out);
+            }
+        }
+        "pin" => {
+            let mut guard = slot.lock().await;
+            let Some(a) = guard.as_mut() else {
+                drop(guard);
+                screen.show_text(BUSY_TEXT);
+                return None;
+            };
+            let (text, pins) = pin_report(a, arg);
+            drop(guard);
+            screen.show_text(text);
+            if let Some(pins) = pins {
+                screen.pin_count = pins;
+            }
+        }
+        "cost" => {
+            if arg.eq_ignore_ascii_case("reset") {
+                screen.session_cost = 0.0;
+                screen.cost_known = false;
+                screen.total_in = 0;
+                screen.total_out = 0;
+                screen.tasks_done = 0;
+                screen.push_notice(Level::Info, "cost/usage totals reset for this run");
+                return None;
+            }
+            let ctx = screen.cost_context();
+            let text = match slot.lock().await.as_ref() {
+                Some(a) => console::cost_report(a, ctx),
+                None => {
+                    // a running task holds the agent: report from the screen
+                    let mut out = String::from("cost (a task is running)\n");
+                    match ctx.task_usd {
+                        Some(cost) => out.push_str(&format!(
+                            "  this task   {} so far\n",
+                            console::money(cost)
+                        )),
+                        None => out.push_str(
+                            "  this task   unpriced so far (no price entry, or no finished round)\n",
+                        ),
+                    }
+                    if ctx.session_priced {
+                        out.push_str(&format!(
+                            "  this run    {} before this task\n",
+                            console::money(ctx.session_usd)
+                        ));
+                    }
+                    out.trim_end().to_string()
+                }
+            };
+            screen.show_text(text);
+        }
+        "effort" => {
+            let (current, _) = sess.cfg.active_preset();
+            let name = if arg.is_empty() {
+                // bare /effort cycles, so one keystroke is enough during a task
+                let names = sess.cfg.preset_names();
+                let pos = names.iter().position(|n| n == &current).unwrap_or(0);
+                names[(pos + 1) % names.len().max(1)].clone()
+            } else {
+                arg.to_string()
+            };
+            if !sess.cfg.preset_names().iter().any(|n| n == &name) {
+                screen.show_text(format!(
+                    "usage: /effort [{}]",
+                    sess.cfg.preset_names().join("|")
+                ));
+                return None;
+            }
+            // persist first, then rebuild the provider so the wire carries it
+            sess.cfg.agent.preset = Some(name.clone());
+            let note = match sess.config_file.as_ref() {
+                Some(path) => match crate::config::set_table_setting(
+                    path,
+                    "[agent]",
+                    "preset",
+                    &format!("\"{name}\""),
+                ) {
+                    Ok(()) => " · saved",
+                    Err(_) => " · not saved",
+                },
+                None => "",
+            };
+            start_switch(
+                screen,
+                slot,
+                sess,
+                ask_tx,
+                session_allows,
+                permission,
+                sess.provider.clone(),
+                sess.model.clone(),
+                false,
+                bg_tx,
+            )
+            .await;
+            screen.push_notice(
+                Level::Info,
+                format!("effort -> {name}{note} (request settings applied on the switch)"),
+            );
         }
         "theme" => {
             let next = if arg.is_empty() {
@@ -2524,8 +2935,9 @@ async fn run_command(
                     format!("permission mode -> {} ({})", mode.as_str(), mode_note(mode)),
                 );
             } else {
-                screen
-                    .show_text("usage: /permission [read-only|edit|yolo] — or Shift+Tab to cycle");
+                screen.show_text(
+                    "usage: /permission [read-only|review|edit|yolo] — or Shift+Tab to cycle",
+                );
             }
         }
         "allow" | "allows" => {
@@ -2625,7 +3037,7 @@ async fn run_command(
             let text = match slot.lock().await.as_ref() {
                 Some(a) => format!(
                     "{}\n{}\nrounds: {} · ctx ≈ {} tokens · budget {}\n{}",
-                    console::status_text(a),
+                    console::status_text_with_cost(a),
                     console::context_report(a),
                     screen.rounds,
                     screen.est_tokens,
@@ -2865,6 +3277,58 @@ async fn apply_selection(
     }
 }
 
+/// `/pin` argument handling: `[n]` pins, `off` clears, bare lists.
+/// Returns the report text plus the new pin count so the screen can show the
+/// state without holding the agent lock again.
+fn pin_report(agent: &mut Agent, arg: &str) -> (String, Option<usize>) {
+    let arg = arg.trim();
+    if arg.eq_ignore_ascii_case("off") || arg.eq_ignore_ascii_case("clear") {
+        agent.history.clear_pins();
+        return (
+            "pins cleared — trimming may drop any turn again".to_string(),
+            Some(0),
+        );
+    }
+    if arg.is_empty() {
+        let pins = agent.history.pins_list();
+        if pins.is_empty() {
+            return (
+                "nothing pinned. /pin <n> keeps the turn around message n through trimming                  (n = the number shown by /last, /plan or an error)"
+                    .to_string(),
+                Some(0),
+            );
+        }
+        let body = pins
+            .iter()
+            .map(|(i, text)| format!("  #{i}  {}", first_lines(text, 2).replace('\n', " / ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return (
+            format!("pinned turns (kept through trimming):\n{body}"),
+            Some(pins.len()),
+        );
+    }
+    match arg.parse::<usize>() {
+        Ok(n) if n < agent.history.msgs_len() => {
+            agent.history.pin(n);
+            (
+                format!(
+                    "pinned message #{n} — its whole turn now survives trimming (/pin off clears)"
+                ),
+                Some(agent.history.pins_len()),
+            )
+        }
+        _ => (
+            format!(
+                "no message {arg} in this session ({} messages); /pin <n> with 0..{}",
+                agent.history.msgs_len(),
+                agent.history.msgs_len().saturating_sub(1)
+            ),
+            None,
+        ),
+    }
+}
+
 /// Start a provider/model switch in the background; the rebuilt agent arrives
 /// over `bg_tx` with the conversation carried along.
 #[allow(clippy::too_many_arguments)]
@@ -2908,6 +3372,8 @@ async fn start_switch(
             .await
         {
             Ok(mut agent) => {
+                // the preset is part of the request, not of the provider
+                agent.set_preset(cfg.active_preset().0);
                 if probe {
                     if let Err(e) = agent.probe().await {
                         let note = format!(
@@ -3118,6 +3584,8 @@ async fn tui_inner(
     session_allows: &SessionAllows,
     background: &mut tokio::sync::mpsc::UnboundedReceiver<BackgroundEvent>,
     bg_tx: &tokio::sync::mpsc::UnboundedSender<BackgroundEvent>,
+    reviews: &mut tokio::sync::mpsc::UnboundedReceiver<ChangesetAsk>,
+    _review_tx: &tokio::sync::mpsc::UnboundedSender<ChangesetAsk>,
 ) -> anyhow::Result<Option<Agent>> {
     let shared_agent: Arc<tokio::sync::Mutex<Option<Agent>>> =
         Arc::new(tokio::sync::Mutex::new(Some(agent)));
@@ -3143,6 +3611,7 @@ async fn tui_inner(
                     BackgroundEvent::Switched { agent, provider, model, desc } => {
                         screen.busy = false;
                         screen.started.set(None);
+                        screen.preset = agent.preset().to_string();
                         *shared_agent.lock().await = Some(*agent);
                         sess.provider = provider;
                         sess.model = model;
@@ -3176,9 +3645,17 @@ async fn tui_inner(
                 }
             }
 
+            review = reviews.recv() => {
+                if let Some(ask) = review {
+                    // one changeset at a time: the engine is blocked on it
+                    screen.changeset_reply = Some((ask.paths, ask.reply));
+                    screen.overlay = Some(Overlay::Changeset(overlay::Changeset::new(ask.files)));
+                }
+            }
+
             ask = approvals.recv() => {
                 if let Some(ask) = ask {
-                    screen.pending_approval = Some(PendingApproval {
+                    screen.push_approval(PendingApproval {
                         ask,
                         reason_mode: false,
                         reason: String::new(),
@@ -3220,6 +3697,10 @@ async fn tui_inner(
                     screen.cancelling = false;
                     runner = None;
                     current_cancel = None;
+                    // A prompt left behind by this task can never be acted on
+                    // any more: answer it explicitly instead of leaving an
+                    // agent waiting on a oneshot and a modal on screen.
+                    screen.deny_pending_approvals("task already finished");
                     if let Some(agent) = shared_agent.lock().await.as_ref() {
                         on_session_save(&sess.session_name, agent);
                     }
@@ -3259,7 +3740,7 @@ async fn tui_inner(
                     }
 
                     // 1) the approval prompt is modal
-                    if screen.pending_approval.is_some() {
+                    if screen.has_approval() {
                         handle_approval(screen, &key);
                         continue;
                     }
@@ -3272,6 +3753,7 @@ async fn tui_inner(
                         let mut resume: Option<String> = None;
                         let mut copy_text: Option<String> = None;
                         let mut search_snapshot: Option<(Vec<SearchHit>, usize)> = None;
+                        let mut changeset_done: Option<(Vec<overlay::ChangesetFile>, bool)> = None;
                         let mut notices: Vec<(Level, String)> = Vec::new();
                         let body_h = screen.overlay_body.get() as usize;
                         {
@@ -3370,6 +3852,25 @@ async fn tui_inner(
                                         notices.push((Level::Warn, note));
                                     }
                                 }
+                                Overlay::Changeset(c) => match key.code {
+                                    KeyCode::Up => c.move_cursor(-1),
+                                    KeyCode::Down => c.move_cursor(1),
+                                    KeyCode::PageUp => c.scroll = c.scroll.saturating_sub(12),
+                                    KeyCode::PageDown => c.scroll += 12,
+                                    KeyCode::Char(' ') => c.toggle(),
+                                    KeyCode::Char('a') | KeyCode::Char('A') => c.accept_all(),
+                                    KeyCode::Char('n') | KeyCode::Char('N') => c.reject_all(),
+                                    KeyCode::Esc => {
+                                        c.reject_all();
+                                        changeset_done = Some((c.files.clone(), true));
+                                        close = true;
+                                    }
+                                    KeyCode::Enter => {
+                                        changeset_done = Some((c.files.clone(), false));
+                                        close = true;
+                                    }
+                                    _ => {}
+                                },
                                 Overlay::Search(s) => {
                                     match key.code {
                                         KeyCode::Up => s.move_cursor(-1),
@@ -3430,6 +3931,57 @@ async fn tui_inner(
                         }
                         if let Some((hits, pos)) = search_snapshot {
                             screen.remember_search(hits, pos);
+                        }
+                        if let Some((files, cancelled)) = changeset_done {
+                            // hand the per-file verdict back to the agent task
+                            if let Some((paths, reply)) = screen.changeset_reply.take() {
+                                let outcome = if cancelled {
+                                    crate::tools::ReviewOutcome {
+                                        files: paths
+                                            .iter()
+                                            .map(|p| crate::tools::ReviewedFile {
+                                                path: p.clone(),
+                                                accepted: false,
+                                            })
+                                            .collect(),
+                                        note: Some(
+                                            "the user cancelled the changeset review; no files were written"
+                                                .to_string(),
+                                        ),
+                                    }
+                                } else {
+                                    crate::tools::ReviewOutcome {
+                                        files: paths
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(i, p)| crate::tools::ReviewedFile {
+                                                path: p.clone(),
+                                                accepted: files
+                                                    .get(i)
+                                                    .map(|f| f.accepted)
+                                                    .unwrap_or(false),
+                                            })
+                                            .collect(),
+                                        note: None,
+                                    }
+                                };
+                                let (accepted, total) = outcome
+                                    .files
+                                    .iter()
+                                    .fold((0, 0), |(a, t), f| (a + usize::from(f.accepted), t + 1));
+                                let _ = reply.send(outcome);
+                                screen.push_notice(
+                                    Level::Info,
+                                    format!(
+                                        "changeset: {accepted}/{total} file(s) accepted{}",
+                                        if cancelled {
+                                            " — the task was told nothing was written"
+                                        } else {
+                                            ""
+                                        }
+                                    ),
+                                );
+                            }
                         }
                         if let Some(entry) = jump {
                             screen.scroll_to_entry(entry);
@@ -3751,7 +4303,7 @@ async fn tui_inner(
                     }
                 }
                 Some(Ok(CtEvent::Mouse(me))) => {
-                    if screen.pending_approval.is_some() {
+                    if screen.has_approval() {
                         continue;
                     }
                     if screen.overlay.is_some() {
@@ -3837,7 +4389,7 @@ async fn tui_inner(
                     }
                 }
                 Some(Ok(CtEvent::Paste(text))) => {
-                    if screen.pending_approval.is_none() && screen.overlay.is_none() {
+                    if !screen.has_approval() && screen.overlay.is_none() {
                         screen.input.insert_str(&text);
                     }
                 }
@@ -3864,7 +4416,10 @@ async fn tui_inner(
 fn handle_approval(screen: &mut Screen, key: &ratatui::crossterm::event::KeyEvent) {
     let mut decision: Option<Decision> = None;
     {
-        let Some(p) = screen.pending_approval.as_mut() else {
+        // Always answer the OLDEST pending prompt: the queue order is the
+        // order the agents asked in, so "y" can only ever approve the command
+        // printed on screen.
+        let Some(p) = screen.front_approval_mut() else {
             return;
         };
         match key.code {
@@ -3922,7 +4477,7 @@ fn handle_approval(screen: &mut Screen, key: &ratatui::crossterm::event::KeyEven
         }
     }
     if let Some(decision) = decision {
-        let Some(p) = screen.pending_approval.take() else {
+        let Some(p) = screen.approvals.pop_front() else {
             return;
         };
         let verdict = match &decision {
@@ -3932,13 +4487,23 @@ fn handle_approval(screen: &mut Screen, key: &ratatui::crossterm::event::KeyEven
             Decision::Deny(Some(_)) => "denied with a reason",
         };
         let _ = p.ask.reply.send(decision);
+        let more = screen.approvals.len();
         screen.push_notice(
             if verdict.starts_with("denied") {
                 Level::Warn
             } else {
                 Level::Info
             },
-            format!("approval: {verbatim}", verbatim = verdict),
+            format!(
+                "approval: {verdict} ({}, task #{}){}",
+                p.ask.origin.label(),
+                p.ask.task,
+                if more > 0 {
+                    format!(" — {more} more waiting")
+                } else {
+                    String::new()
+                }
+            ),
         );
     }
 }
@@ -4251,9 +4816,24 @@ mod tests {
             toml::from_str("[providers.deepseek]\ntype = \"openai\"\nmodel = \"deepseek-chat\"")
                 .unwrap();
         let mut s = test_screen();
+        // `re` is ambiguous now (read-only | review): Tab offers the choices
         s.input.set_text("/permission re".into());
+        let note = s
+            .complete_argument(&cfg, None, None)
+            .expect("two modes share the prefix");
+        assert!(
+            note.contains("read-only") && note.contains("review"),
+            "{note}"
+        );
+        assert_eq!(s.input.text, "/permission re");
+        // one more letter decides
+        s.input.set_text("/permission rea".into());
         assert!(s.complete_argument(&cfg, None, None).is_none());
         assert_eq!(s.input.text, "/permission read-only ");
+
+        s.input.set_text("/effort de".into());
+        assert!(s.complete_argument(&cfg, None, None).is_none());
+        assert_eq!(s.input.text, "/effort deep ");
 
         s.input.set_text("/theme so".into());
         assert!(s.complete_argument(&cfg, None, None).is_none());
@@ -4673,8 +5253,11 @@ mod tests {
             }
             s.overlay = None;
             let (tx, _rx) = tokio::sync::oneshot::channel();
-            s.pending_approval = Some(PendingApproval {
+            s.push_approval(PendingApproval {
                 ask: ApprovalAsk {
+                    id: next_ask_id(),
+                    task: 1,
+                    origin: AskOrigin::Main,
                     tool: "run_command".into(),
                     summary: "$ git push --force\n  cwd: /tmp\nsecond".into(),
                     reply: tx,
@@ -4684,7 +5267,7 @@ mod tests {
                 scroll: 0,
             });
             term.draw(|f| s.draw(f)).unwrap();
-            s.pending_approval = None;
+            s.approvals.clear();
             s.scroll_to_top();
             term.draw(|f| s.draw(f)).unwrap();
         }
@@ -4694,8 +5277,11 @@ mod tests {
     fn approval_keys_answer_the_agent() {
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         let mut s = test_screen();
-        s.pending_approval = Some(PendingApproval {
+        s.push_approval(PendingApproval {
             ask: ApprovalAsk {
+                id: next_ask_id(),
+                task: 1,
+                origin: AskOrigin::Main,
                 tool: "run_command".into(),
                 summary: "$ rm -rf build".into(),
                 reply: tx,
@@ -4707,17 +5293,17 @@ mod tests {
         let key = |code| ratatui::crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
         // long commands scroll instead of being clipped
         handle_approval(&mut s, &key(KeyCode::PageDown));
-        assert_eq!(s.pending_approval.as_ref().unwrap().scroll, 8);
+        assert_eq!(s.front_approval().unwrap().scroll, 8);
         handle_approval(&mut s, &key(KeyCode::Up));
-        assert_eq!(s.pending_approval.as_ref().unwrap().scroll, 7);
+        assert_eq!(s.front_approval().unwrap().scroll, 7);
         // `r` opens the reason line; typing + Enter denies with the reason
         handle_approval(&mut s, &key(KeyCode::Char('r')));
-        assert!(s.pending_approval.as_ref().unwrap().reason_mode);
+        assert!(s.front_approval().unwrap().reason_mode);
         for c in "use --dry-run".chars() {
             handle_approval(&mut s, &key(KeyCode::Char(c)));
         }
         handle_approval(&mut s, &key(KeyCode::Enter));
-        assert!(s.pending_approval.is_none());
+        assert!(!s.has_approval());
         assert_eq!(
             rx.try_recv().unwrap(),
             Decision::Deny(Some("use --dry-run".into()))
@@ -4725,8 +5311,11 @@ mod tests {
 
         // plain `y` allows once
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        s.pending_approval = Some(PendingApproval {
+        s.push_approval(PendingApproval {
             ask: ApprovalAsk {
+                id: next_ask_id(),
+                task: 1,
+                origin: AskOrigin::Main,
                 tool: "run_command".into(),
                 summary: "$ ls".into(),
                 reply: tx,
@@ -4737,6 +5326,73 @@ mod tests {
         });
         handle_approval(&mut s, &key(KeyCode::Char('y')));
         assert_eq!(rx.try_recv().unwrap(), Decision::Allow);
+    }
+
+    #[test]
+    fn queued_approvals_are_answered_oldest_first() {
+        // 0.18 kept ONE slot: a prompt arriving while another was on screen
+        // replaced it, and the replaced agent got a silent Deny.
+        let mut s = test_screen();
+        let (tx1, mut rx1) = tokio::sync::oneshot::channel();
+        let (tx2, mut rx2) = tokio::sync::oneshot::channel();
+        for (tx, tool, origin) in [
+            (tx1, "run_command", AskOrigin::Main),
+            (tx2, "run_command", AskOrigin::SubAgent),
+        ] {
+            s.push_approval(PendingApproval {
+                ask: ApprovalAsk {
+                    id: next_ask_id(),
+                    task: 7,
+                    origin,
+                    tool: tool.into(),
+                    summary: "$ cargo test".into(),
+                    reply: tx,
+                },
+                reason_mode: false,
+                reason: String::new(),
+                scroll: 0,
+            });
+        }
+        assert_eq!(s.approvals.len(), 2, "the second ask must not overwrite");
+
+        let key = |code| ratatui::crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
+        handle_approval(&mut s, &key(KeyCode::Char('y')));
+        assert_eq!(
+            rx1.try_recv().unwrap(),
+            Decision::Allow,
+            "oldest answered first"
+        );
+        assert!(rx2.try_recv().is_err(), "the second prompt still waits");
+        assert_eq!(s.approvals.len(), 1);
+
+        handle_approval(&mut s, &key(KeyCode::Char('n')));
+        assert_eq!(rx2.try_recv().unwrap(), Decision::Deny(None));
+        assert!(!s.has_approval());
+    }
+
+    #[test]
+    fn finishing_a_task_answers_its_orphaned_prompts() {
+        let mut s = test_screen();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        s.push_approval(PendingApproval {
+            ask: ApprovalAsk {
+                id: next_ask_id(),
+                task: 9,
+                origin: AskOrigin::Main,
+                tool: "run_command".into(),
+                summary: "$ rm -rf build".into(),
+                reply: tx,
+            },
+            reason_mode: false,
+            reason: String::new(),
+            scroll: 0,
+        });
+        s.deny_pending_approvals("task already finished");
+        assert!(!s.has_approval());
+        match rx.try_recv().unwrap() {
+            Decision::Deny(Some(reason)) => assert!(reason.contains("already finished")),
+            other => panic!("expected a denial with a reason, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -4794,6 +5450,8 @@ mod tests {
             todos: None,
             permission: crate::tools::Permission::default(),
             subagent: None,
+            staged: None,
+            reviewer: None,
         };
         Agent::with_parallel(
             provider,

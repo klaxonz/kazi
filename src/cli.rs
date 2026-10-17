@@ -51,7 +51,7 @@ pub struct EngineArgs {
     /// Auto-approve run_command without asking (dangerous)
     #[arg(long)]
     pub yolo: bool,
-    /// Startup permission mode: read-only | edit (default) | yolo
+    /// Startup permission mode: read-only | review | edit (default) | yolo
     #[arg(
         long = "permission-mode",
         value_name = "MODE",
@@ -98,9 +98,13 @@ pub enum Command {
     /// List built-in tools
     #[command(name = "tools")]
     Tools,
-    /// List saved sessions
+    /// List saved sessions (or search their text with --find)
     #[command(name = "sessions")]
-    Sessions,
+    Sessions {
+        /// Search user/assistant text across every saved session
+        #[arg(long, value_name = "TEXT")]
+        find: Option<String>,
+    },
     /// Delete a saved session by name (exact or unambiguous prefix)
     #[command(name = "rm")]
     Rm {
@@ -169,7 +173,7 @@ pub async fn execute(cli: Cli) -> anyhow::Result<u8> {
         Some(Command::Providers) => providers_cmd(cli.config.as_deref()),
         Some(Command::Auth { cmd }) => auth_cmd(cmd, cli.config.as_deref()),
         Some(Command::Tools) => tools_cmd(),
-        Some(Command::Sessions) => sessions_cmd(),
+        Some(Command::Sessions { find }) => sessions_cmd(find.as_deref()),
         Some(Command::Rm { session }) => rm_cmd(&session),
         Some(Command::Export {
             session,
@@ -373,7 +377,7 @@ fn startup_mode(cfg: &config::Config, args: &EngineArgs) -> crate::tools::Permis
     if let Some(raw) = cfg.agent.permission_mode.as_deref() {
         if crate::tools::PermissionMode::parse(raw).is_none() {
             eprintln!(
-                "{YELLOW}config agent.permission_mode = \"{raw}\" is not a mode (read-only | edit | yolo) — using edit{RESET}"
+                "{YELLOW}config agent.permission_mode = \"{raw}\" is not a mode (read-only | review | edit | yolo) — using edit{RESET}"
             );
         }
     }
@@ -385,7 +389,9 @@ fn startup_mode(cfg: &config::Config, args: &EngineArgs) -> crate::tools::Permis
 fn parse_permission_mode(s: &str) -> Result<String, String> {
     crate::tools::PermissionMode::parse(s)
         .map(|m| m.as_str().to_string())
-        .ok_or_else(|| format!("unknown permission mode `{s}` (allowed: read-only | edit | yolo)"))
+        .ok_or_else(|| {
+            format!("unknown permission mode `{s}` (allowed: read-only | review | edit | yolo)")
+        })
 }
 
 #[derive(Serialize)]
@@ -398,6 +404,9 @@ struct RunReport {
     events: Vec<AgentEvent>,
     /// Provider-reported token usage of this task (zeros if unknown).
     usage: crate::llm::Usage,
+    /// USD for this run, when [usage.prices] covers the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -416,6 +425,11 @@ async fn run_once(
         .resolve(args.provider.as_deref(), args.model.as_deref())?
         .nick;
     cfg.api_key_for(&nick)?;
+    if mode == crate::tools::PermissionMode::Review && fmt == OutputFmt::Text {
+        eprintln!(
+            "{DIM}note: review mode has no prompt in 'kazi run' — staged changes are accepted automatically (use the TUI for per-file review){RESET}"
+        );
+    }
     let agent =
         Agent::default_cli_mode(&cfg, args.provider.as_deref(), args.model.as_deref(), mode)
             .await?;
@@ -473,13 +487,18 @@ async fn run_once(
                     answer,
                     events,
                     usage,
+                    cost_usd: agent.cost_usd(),
                     error: None,
                 };
                 println!("{}", serde_json::to_string(&report).unwrap_or_default());
             } else {
                 println!();
+                let cost = agent
+                    .cost_usd()
+                    .map(|c| format!(" · {}", console::money(c)))
+                    .unwrap_or_default();
                 eprintln!(
-                    "{DIM}done in {:.1}s · tokens in {} / out {}{RESET}",
+                    "{DIM}done in {:.1}s · tokens in {} / out {}{cost}{RESET}",
                     elapsed.as_secs_f64(),
                     usage.input_tokens.unwrap_or(0),
                     usage.output_tokens.unwrap_or(0)
@@ -500,6 +519,7 @@ async fn run_once(
                     answer: String::new(),
                     events,
                     usage,
+                    cost_usd: agent.cost_usd(),
                     error: Some(e.to_string()),
                 };
                 println!("{}", serde_json::to_string(&report).unwrap_or_default());
@@ -934,7 +954,23 @@ fn tools_cmd() -> anyhow::Result<u8> {
     Ok(0)
 }
 
-fn sessions_cmd() -> anyhow::Result<u8> {
+fn sessions_cmd(find: Option<&str>) -> anyhow::Result<u8> {
+    if let Some(text) = find {
+        let hits = crate::agent::session::search(text, 3, 40);
+        if hits.is_empty() {
+            println!("no saved session mentions {text:?} (user/assistant text only)");
+            return Ok(0);
+        }
+        println!("{} hit(s) for {text:?}:", hits.len());
+        for h in hits {
+            println!(
+                "{CYAN}{}{RESET}  {DIM}{} line {}{RESET}  {}",
+                h.session, h.role, h.line, h.snippet
+            );
+        }
+        println!("{DIM}resume one with: kazi chat --resume <session>{RESET}");
+        return Ok(0);
+    }
     let summaries = crate::agent::session::list_summaries();
     if summaries.is_empty() {
         println!("no saved sessions yet — chat sessions save automatically after each task");

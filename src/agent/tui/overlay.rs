@@ -6,7 +6,7 @@
 //! Every list shares one renderer, so filtering/scrolling/selection behave the
 //! same everywhere.
 
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
@@ -39,6 +39,10 @@ pub const KEY_BINDINGS: &[(&str, &str)] = &[
     (
         "Mouse",
         "wheel scrolls · click a card/list row · right-click copies",
+    ),
+    (
+        "space / a / n",
+        "review: toggle file · accept all · reject all",
     ),
     ("Esc", "close overlay · interrupt a run · quit when idle"),
     ("Ctrl+C", "quit"),
@@ -244,6 +248,70 @@ pub fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
     }
     // prefer short haystacks when the score ties
     Some(score * 10 - haystack.chars().count() as i32)
+}
+
+/// One file in a review-mode changeset: what will be written, and whether the
+/// user has accepted it so far.
+#[derive(Debug, Clone)]
+pub struct ChangesetFile {
+    pub path: String,
+    pub added: usize,
+    pub removed: usize,
+    /// Unified diff of the staged change (same renderer as `/diff`).
+    pub diff: String,
+    pub accepted: bool,
+}
+
+/// The review-mode modal: every staged file with its diff, one toggle each.
+/// Written files never land until `Enter` submits, so a mis-click is free.
+#[derive(Debug, Clone, Default)]
+pub struct Changeset {
+    pub files: Vec<ChangesetFile>,
+    pub cursor: usize,
+    pub scroll: usize,
+}
+
+impl Changeset {
+    pub fn new(files: Vec<ChangesetFile>) -> Self {
+        Self {
+            files,
+            cursor: 0,
+            scroll: 0,
+        }
+    }
+
+    pub fn toggle(&mut self) {
+        if let Some(f) = self.files.get_mut(self.cursor) {
+            f.accepted = !f.accepted;
+        }
+    }
+
+    pub fn accept_all(&mut self) {
+        for f in &mut self.files {
+            f.accepted = true;
+        }
+    }
+
+    pub fn reject_all(&mut self) {
+        for f in &mut self.files {
+            f.accepted = false;
+        }
+    }
+
+    pub fn move_cursor(&mut self, delta: isize) {
+        if self.files.is_empty() {
+            return;
+        }
+        let max = self.files.len() as isize - 1;
+        self.cursor = (self.cursor as isize + delta).clamp(0, max) as usize;
+        self.scroll = 0;
+    }
+
+    /// `(accepted, rejected)` counts for the footer.
+    pub fn tally(&self) -> (usize, usize) {
+        let accepted = self.files.iter().filter(|f| f.accepted).count();
+        (accepted, self.files.len() - accepted)
+    }
 }
 
 /// Full-screen scrollable help.
@@ -464,7 +532,88 @@ impl Search {
     }
 }
 
-/// The open modal, if any. Keyboard routing checks this before the editor.
+/// Review-mode changeset: a file list on top, the selected file's diff below,
+/// and the accept/deny counts in the footer. Deliberately not a plain list —
+/// the user must be able to READ what is about to be written.
+fn draw_changeset(f: &mut Frame, screen: Rect, theme: Theme, cs: &Changeset) {
+    let rect = centred(screen, 120, screen.height.saturating_sub(2).max(6));
+    clear_block(f, rect, theme, " review changes ");
+    let inner = Rect {
+        x: rect.x + 1,
+        y: rect.y + 1,
+        width: rect.width.saturating_sub(2),
+        height: rect.height.saturating_sub(2),
+    };
+    if inner.height < 4 || inner.width < 10 {
+        return;
+    }
+    let list_h = (cs.files.len() as u16).clamp(1, (inner.height / 3).max(1));
+    let [list_area, diff_area, foot_area] = Layout::vertical([
+        Constraint::Length(list_h),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let start = cs.cursor.saturating_sub(list_h.saturating_sub(1) as usize);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    for (i, file) in cs
+        .files
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(list_h as usize)
+    {
+        let mark = if file.accepted { "[x]" } else { "[ ]" };
+        let selected = i == cs.cursor;
+        rows.push(Line::from(vec![
+            Span::styled(
+                format!(" {mark} "),
+                Style::default().fg(if file.accepted { theme.ok } else { theme.dim }),
+            ),
+            Span::styled(
+                clip(&file.path, (list_area.width as usize).saturating_sub(24)),
+                if selected {
+                    theme.selection()
+                } else {
+                    Style::default().fg(theme.text)
+                },
+            ),
+            Span::styled(
+                format!(" +{} −{}", file.added, file.removed),
+                Style::default().fg(theme.dim),
+            ),
+        ]));
+    }
+    f.render_widget(Paragraph::new(rows), list_area);
+
+    // the selected file's diff, scrolled independently
+    if let Some(file) = cs.files.get(cs.cursor) {
+        let body_h = diff_area.height as usize;
+        let lines: Vec<&str> = file.diff.lines().collect();
+        let max = lines.len().saturating_sub(body_h);
+        let off = cs.scroll.min(max);
+        let rendered: Vec<Line<'static>> = lines
+            .iter()
+            .skip(off)
+            .take(body_h)
+            .map(|l| Line::styled(clip(l, diff_area.width as usize), theme.diff_style(l)))
+            .collect();
+        f.render_widget(Paragraph::new(rendered), diff_area);
+    }
+
+    let (accepted, rejected) = cs.tally();
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            format!(
+                " ↑/↓ pick · space accept/deny · a all · n none · Enter write {accepted} · Esc cancel   ({accepted} accepted, {rejected} rejected)"
+            ),
+            Style::default().fg(theme.warn),
+        )),
+        foot_area,
+    );
+}
+
 #[derive(Debug, Clone)]
 pub enum Overlay {
     Palette(Palette),
@@ -473,6 +622,7 @@ pub enum Overlay {
     Diff(DiffView),
     Sessions(Sessions),
     Search(Search),
+    Changeset(Changeset),
 }
 
 /// Draw the open overlay centred over `screen`. Returns the clickable list
@@ -571,6 +721,10 @@ pub fn draw(f: &mut Frame, screen: Rect, theme: Theme, overlay: &Overlay) -> Opt
             } else {
                 draw_list(f, screen, theme, " sessions ", &rows, s.cursor, &footer)
             }
+        }
+        Overlay::Changeset(c) => {
+            draw_changeset(f, screen, theme, c);
+            None
         }
         Overlay::Search(s) => {
             let rows: Vec<(String, String)> = s
@@ -973,18 +1127,35 @@ pub fn risk_note(summary: &str) -> Option<&'static str> {
     None
 }
 
+/// Everything the approval prompt shows. Grouping it keeps the call site
+/// readable and makes the "which task am I answering" fields impossible to
+/// forget when a field is added.
+pub struct ApprovalView<'a> {
+    pub tool: &'a str,
+    pub summary: &'a str,
+    /// `task` or `sub-agent`.
+    pub origin: &'a str,
+    /// 1-based task number.
+    pub task: u64,
+    /// How many prompts are waiting (1 = this is the only one).
+    pub queue: usize,
+    pub reason_mode: bool,
+    pub reason: &'a str,
+    pub scroll: usize,
+}
+
 /// Approval prompt. Returns nothing; the caller answers by keystroke.
-#[allow(clippy::too_many_arguments)]
-pub fn draw_approval(
-    f: &mut Frame,
-    screen: Rect,
-    theme: Theme,
-    tool: &str,
-    summary: &str,
-    reason_mode: bool,
-    reason: &str,
-    scroll: usize,
-) {
+pub fn draw_approval(f: &mut Frame, screen: Rect, theme: Theme, view: ApprovalView<'_>) {
+    let ApprovalView {
+        tool,
+        summary,
+        origin,
+        task,
+        queue,
+        reason_mode,
+        reason,
+        scroll,
+    } = view;
     let cap = screen.width.max(1);
     let width = screen
         .width
@@ -1013,7 +1184,14 @@ pub fn draw_approval(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.warn))
         .title(Span::styled(
-            format!(" approval required · {tool} "),
+            format!(
+                " approval required · {tool} · {origin} #{task}{} ",
+                if queue > 1 {
+                    format!("  ({queue} waiting)")
+                } else {
+                    String::new()
+                }
+            ),
             Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(rect);
@@ -1366,11 +1544,16 @@ mod tests {
                 f,
                 area,
                 theme,
-                "run_command",
-                "$ git push --force\n  cwd: D:/Code/init/kazi",
-                false,
-                "",
-                0,
+                ApprovalView {
+                    tool: "run_command",
+                    summary: "$ git push --force\n  cwd: D:/Code/init/kazi",
+                    origin: "sub-agent",
+                    task: 3,
+                    queue: 2,
+                    reason_mode: false,
+                    reason: "",
+                    scroll: 0,
+                },
             );
         })
         .unwrap();
@@ -1383,6 +1566,10 @@ mod tests {
             .collect();
         assert!(text.contains("approval required"));
         assert!(text.contains("git push --force"));
+        // the prompt says WHICH nested run and how many are waiting
+        assert!(text.contains("sub-agent"), "{text}");
+        assert!(text.contains("#3"), "{text}");
+        assert!(text.contains("2 waiting"), "{text}");
         assert!(text.contains("[y] run once"));
     }
 }

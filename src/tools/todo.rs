@@ -149,6 +149,8 @@ mod tests {
             todos: Some(list),
             permission: super::super::Permission::default(),
             subagent: None,
+            staged: None,
+            reviewer: None,
         }
     }
 

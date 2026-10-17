@@ -242,13 +242,21 @@ impl SubAgentRunnerImpl {
 impl crate::tools::subagent::SubAgentRunner for SubAgentRunnerImpl {
     async fn run_sub(&self, prompt: &str, read_only: bool) -> Result<String, String> {
         const REPORT_CAP: usize = 4_000;
-        let mut ctx = self.base_ctx.clone();
+        // `derive` gives the sub-agent its OWN permission cell: a read-only
+        // sub-task must not rewrite the parent session's mode (it used to).
+        let mode = if read_only {
+            crate::tools::PermissionMode::ReadOnly
+        } else {
+            self.base_ctx.permission.get()
+        };
+        let mut ctx = self.base_ctx.derive(mode);
         ctx.subagent = None; // delegation cannot nest
         ctx.checkpointing = None; // sub-agent edits are not a /undo epoch
         ctx.todos = None; // its plan is its own
-        if read_only {
-            ctx.permission.set(crate::tools::PermissionMode::ReadOnly);
-        }
+        ctx.staged = None; // staging belongs to the main conversation's review
+                           // Its prompts are labelled so the human never confuses a nested
+                           // approval with their own task.
+        ctx.approver = crate::tools::subagent::scope_approver(&ctx.approver);
         let mut sub = Agent::with_parallel(
             self.provider.clone(),
             crate::tools::ToolRegistry::builtin(),
@@ -283,7 +291,8 @@ fn system_prompt(cwd: &std::path::Path) -> String {
          Working directory: {}.\n\n\
          Ground rules:\n\
          - Be concrete: real paths, counts, exit codes. Never invent facts.\n\
-         - Call tools one at a time and read each result before deciding the next step.\n\
+         - Independent tool calls belong in the SAME round (they run in parallel);\n\
+         only sequence a call when it really needs an earlier result.\n\
          - Read files before modifying them. Prefer the file tools over running\n\
            commands for pure inspection.\n\
          - If a tool fails, adjust its inputs or take another approach — never\n\
@@ -304,6 +313,12 @@ pub enum AgentError {
     /// Stopped on request (Esc in the TUI / cancel token). History is kept.
     #[error("task cancelled")]
     Cancelled,
+    /// The per-task USD budget was reached between rounds. History is kept,
+    /// so raising the budget and asking again resumes where it stopped.
+    #[error(
+        "task stopped: spent ${spent:.4} of the ${budget:.2} per-task budget (agent.max_usd_per_task)"
+    )]
+    BudgetExceeded { spent: f64, budget: f64 },
 }
 
 /// What the UI wants to know while a task runs.
@@ -355,7 +370,14 @@ pub enum AgentEvent {
         round: u32,
         usage: crate::llm::Usage,
         est_tokens: u64,
+        /// Task cost so far, absent when the model has no price entry.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
     },
+    /// Review mode: a round staged its writes and the changeset is waiting for
+    /// a verdict. `files` are display paths with their `+added/-removed`
+    /// counts, so a UI can render the summary without holding the agent.
+    ChangesetPending { files: Vec<(String, usize, usize)> },
 }
 
 pub struct Agent {
@@ -382,6 +404,18 @@ pub struct Agent {
     /// Set when the provider has no usable credential: an actionable line the
     /// UI shows at startup and appends to auth-ish provider errors.
     auth_hint: Option<String>,
+    /// Active effort preset name (`fast` | `balanced` | `deep` | custom),
+    /// shown in the header and carried across provider rebuilds.
+    preset: String,
+    /// USD budget for one task (`agent.max_usd_per_task`); `None` = no guard.
+    max_usd_per_task: Option<f64>,
+    /// Price entry for the active model (`[usage.prices]`), if configured.
+    /// Absent = the UI shows tokens and never invents money.
+    price: Option<crate::config::PriceCfg>,
+    /// USD spent by the CURRENT task (0 when the model has no price entry).
+    cost_usd: f64,
+    /// Whether `cost_usd` means anything (a priced round happened).
+    priced: bool,
 }
 
 impl Agent {
@@ -429,6 +463,11 @@ impl Agent {
             feedback: None,
             nick: String::new(),
             auth_hint: None,
+            preset: "balanced".to_string(),
+            max_usd_per_task: None,
+            price: None,
+            cost_usd: 0.0,
+            priced: false,
         }
     }
 
@@ -483,6 +522,44 @@ impl Agent {
 
     pub fn max_rounds(&self) -> u32 {
         self.max_rounds
+    }
+
+    /// Active effort preset (`/effort`, header badge).
+    pub fn preset(&self) -> &str {
+        &self.preset
+    }
+
+    /// Repoint the preset label (the provider already carries the tuning it
+    /// was built with; this keeps the header and `/status` honest).
+    pub fn set_preset(&mut self, name: String) {
+        self.preset = name;
+    }
+
+    /// Per-task USD budget, when configured.
+    pub fn max_usd_per_task(&self) -> Option<f64> {
+        self.max_usd_per_task
+    }
+
+    /// Model id the provider was built for (pricing key).
+    pub fn provider_model(&self) -> String {
+        self.provider
+            .describe()
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// USD spent by the current task, when the model has a price entry.
+    pub fn cost_usd(&self) -> Option<f64> {
+        self.priced.then_some(self.cost_usd)
+    }
+
+    /// Replace the price entry (a rebuilt agent keeps its own model).
+    pub fn set_price(&mut self, price: Option<crate::config::PriceCfg>) {
+        self.price = price;
+        self.cost_usd = 0.0;
+        self.priced = false;
     }
 
     /// Context budget in estimated tokens (`/context` display).
@@ -624,6 +701,9 @@ impl Agent {
             cfg.agent.max_parallel_tools.unwrap_or(DEFAULT_MAX_PARALLEL),
         )
         .with_feedback(cfg.agent.feedback_command.clone());
+        agent.preset = cfg.active_preset().0;
+        agent.max_usd_per_task = cfg.agent.max_usd_per_task;
+        agent.price = cfg.price_for(&agent.provider_model()).cloned();
         agent.nick = nick;
         agent.auth_hint = auth_hint;
         agent
@@ -763,7 +843,14 @@ impl Agent {
         on_event(AgentEvent::AutoCompactStarted);
         let note: String = match self.summarize_dropped(&dropped).await {
             Ok(summary) if !summary.is_empty() => {
-                self.history.insert_summary(summary);
+                let labelled = if summary.contains("FILES:") {
+                    summary
+                } else {
+                    // a model that ignored the shape still gets a label, so the
+                    // UI can say the summary is unstructured
+                    format!("[unstructured summary]\n{summary}")
+                };
+                self.history.insert_summary(labelled);
                 "auto-compacted: older turns replaced by a summary".into()
             }
             _ => {
@@ -780,7 +867,10 @@ impl Agent {
         Some(note)
     }
 
-    const SUMMARY_PROMPT: &'static str = "Compress the following agent conversation transcript for a compacted context window. Keep, as terse bullets: the user's goal, decisions taken, important file paths and messages, open questions, and pending steps. Max 30 lines. No prose introductions.";
+    /// Fixed-shape summarizer prompt: a free-form summary is hard to trust and
+    /// impossible to scan; four named sections keep the facts the next round
+    /// actually needs (paths, decisions, open work, next step).
+    const SUMMARY_PROMPT: &'static str = "Compress the following agent conversation transcript for a compacted context window. Reply in EXACTLY this shape, terse bullets, no prose:\nGOAL: one line\nFILES: every path touched or discussed, with what happened to it\nDECISIONS: choices made and why (one line each)\nOPEN: unfinished work or unanswered questions\nNEXT: the single next step";
 
     async fn summarize_dropped(&self, transcript: &str) -> Result<String, AgentError> {
         let req = LlmRequest {
@@ -802,6 +892,8 @@ impl Agent {
     ) -> Result<String, AgentError> {
         self.history.push(Message::user(task.to_string()));
         self.usage = Usage::default();
+        self.cost_usd = 0.0;
+        self.priced = false;
         self.clear_cancel();
         // every task run gets a fresh checkpoint epoch: `/undo` restores it
         if let Some(cp) = &self.ctx.checkpointing {
@@ -820,11 +912,25 @@ impl Agent {
             };
             let resp = self.stream_round(&req, &mut on_event).await?;
             self.usage.add(&resp.usage);
+            if let Some(price) = &self.price {
+                if let Some(cost) = price.cost(&resp.usage) {
+                    self.cost_usd += cost;
+                    self.priced = true;
+                }
+            }
             on_event(AgentEvent::RoundDone {
                 round: round + 1,
                 usage: self.usage.clone(),
                 est_tokens: self.history.estimate_tokens(),
+                cost_usd: self.cost_usd(),
             });
+            // agent.max_usd_per_task: stop between rounds, keeping the history
+            // (the work so far is still usable) instead of blowing a budget.
+            if let (Some(budget), Some(spent)) = (self.max_usd_per_task, self.cost_usd()) {
+                if spent >= budget {
+                    return Err(AgentError::BudgetExceeded { spent, budget });
+                }
+            }
 
             if !resp.has_tool_calls() {
                 let text = resp.text_or_empty().to_string();
@@ -945,7 +1051,82 @@ impl Agent {
                 }
             }
 
-            // did this round change files? (before outcomes are taken)
+            // ---- review mode ------------------------------------------
+            // Write tools parked their content instead of touching the disk.
+            // Show the changeset, take a per-file verdict, write only what was
+            // accepted, then rewrite each staged call's tool result so the
+            // model learns which of its writes actually happened.
+            if let (Some(staging), Some(reviewer)) =
+                (self.ctx.staged.as_ref(), self.ctx.reviewer.as_ref())
+            {
+                if !staging.is_empty() && self.ctx.reviewing() {
+                    let changes = staging.take();
+                    let summary: Vec<(String, usize, usize)> = changes
+                        .iter()
+                        .map(|c| {
+                            let (added, removed) = c.counts(&self.ctx.cwd);
+                            (c.display_path(&self.ctx.cwd), added, removed)
+                        })
+                        .collect();
+                    on_event(AgentEvent::ChangesetPending { files: summary });
+                    let outcome = reviewer.review(&self.ctx.cwd, &changes).await;
+                    let results = crate::tools::apply_reviewed(
+                        &changes,
+                        &outcome,
+                        self.ctx.checkpointing.as_ref().map(|c| c.as_ref()),
+                    );
+                    // The note (if any) rides inside each rejected tool result:
+                    // a user message inserted here would sit between the
+                    // assistant's tool_calls and their results, which the
+                    // Anthropic wire rejects outright.
+                    let note_suffix = outcome
+                        .note
+                        .as_deref()
+                        .map(|n| format!(" ({n})"))
+                        .unwrap_or_default();
+                    // map path -> verdict text, then attach to the calls that
+                    // produced each staged change (last write wins per path)
+                    for (change, result) in changes.iter().zip(results) {
+                        let is_error = result.is_err();
+                        let text = match result {
+                            Ok(()) => format!(
+                                "reviewed + written: {} ({} bytes)",
+                                change.display_path(&self.ctx.cwd),
+                                change.after.len()
+                            ),
+                            Err(reason) => format!(
+                                "NOT written: {} — {reason}{note_suffix}. Keep the rest of the plan; do not retry this file unless the user asks.",
+                                change.display_path(&self.ctx.cwd)
+                            ),
+                        };
+                        let targets: Vec<usize> = calls
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, c)| {
+                                crate::tools::edited_path(c)
+                                    .map(|p| self.ctx.cwd.join(p) == change.path)
+                                    .unwrap_or(false)
+                            })
+                            .map(|(i, _)| i)
+                            .collect();
+                        for i in targets {
+                            let (outcome_text, _) =
+                                std::mem::take(&mut verdicts[i]).expect("outcome exists");
+                            let _ = outcome_text;
+                            verdicts[i] = Some((
+                                crate::tools::ToolOutcome {
+                                    text: text.clone(),
+                                    is_error,
+                                },
+                                0,
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // did this round really change files? Computed AFTER review, so a
+            // rejected changeset does not trigger the post-edit feedback run.
             let wrote = calls.iter().enumerate().any(|(i, c)| {
                 crate::tools::is_edit_tool(&c.name)
                     && verdicts[i]
@@ -1076,6 +1257,8 @@ mod tests {
             todos: None,
             permission: crate::tools::Permission::default(),
             subagent: None,
+            staged: None,
+            reviewer: None,
         }
     }
 
@@ -1747,6 +1930,7 @@ mod tests {
                 usage: Usage {
                     input_tokens: Some(11),
                     output_tokens: Some(22),
+                    ..Default::default()
                 },
                 tool_calls: vec![ToolCall {
                     id: "a".into(),
@@ -1759,6 +1943,7 @@ mod tests {
                 usage: Usage {
                     input_tokens: Some(10),
                     output_tokens: Some(5),
+                    ..Default::default()
                 },
                 content: Some("done".into()),
                 ..Default::default()
@@ -1829,6 +2014,8 @@ mod tests {
             todos: None,
             permission: crate::tools::Permission::default(),
             subagent: None,
+            staged: None,
+            reviewer: None,
         };
         let script = vec![
             LlmResponse {
@@ -1981,5 +2168,199 @@ mod tests {
         let mut a = agent_with(calls);
         let err = a.run_task("spinning", |_| {}).await.unwrap_err();
         assert!(matches!(err, AgentError::RoundsExceeded(_)));
+    }
+
+    #[tokio::test]
+    async fn priced_rounds_accumulate_and_the_budget_stops_the_task() {
+        let script = vec![
+            LlmResponse {
+                usage: Usage {
+                    input_tokens: Some(1_000_000),
+                    output_tokens: Some(0),
+                    ..Default::default()
+                },
+                tool_calls: vec![ToolCall {
+                    id: "a".into(),
+                    name: "list_dir".into(),
+                    arguments: json!({}),
+                }],
+                ..Default::default()
+            },
+            LlmResponse {
+                usage: Usage {
+                    input_tokens: Some(1_000_000),
+                    output_tokens: Some(0),
+                    ..Default::default()
+                },
+                content: Some("done".into()),
+                ..Default::default()
+            },
+        ];
+        let mut a = agent_with(script);
+        a.set_price(Some(crate::config::PriceCfg {
+            input: Some(1.0), // $1 / 1M tokens
+            output: Some(0.0),
+            cache_read: None,
+            cache_write: None,
+        }));
+        // $1 per round, $1.5 budget: the first round fits, the second does not
+        a.max_usd_per_task = Some(1.5);
+        let err = a.run_task("go", |_| {}).await.unwrap_err();
+        match err {
+            AgentError::BudgetExceeded { spent, budget } => {
+                assert!((spent - 2.0).abs() < 1e-9, "{spent}");
+                assert_eq!(budget, 1.5);
+            }
+            other => panic!("expected the budget error, got {other}"),
+        }
+        // no price -> no guard, no invented money
+        let mut b = agent_with(vec![LlmResponse {
+            content: Some("free".into()),
+            ..Default::default()
+        }]);
+        b.max_usd_per_task = Some(0.0);
+        assert!(b.run_task("go", |_| {}).await.is_ok());
+        assert_eq!(b.cost_usd(), None);
+    }
+
+    #[tokio::test]
+    async fn review_mode_stages_instead_of_writing() {
+        use crate::tools::{ReviewOutcome, ReviewedFile, Reviewer};
+        use std::sync::Mutex;
+
+        // a reviewer that rejects exactly one path and keeps a copy of what it
+        // was shown, so the test can assert the model sees a real diff
+        struct Picky {
+            reject: std::path::PathBuf,
+            seen: Arc<Mutex<Vec<(String, String)>>>,
+        }
+        #[async_trait::async_trait]
+        impl Reviewer for Picky {
+            async fn review(
+                &self,
+                cwd: &std::path::Path,
+                changes: &[crate::tools::checkpoint::StagedChange],
+            ) -> ReviewOutcome {
+                let mut seen = self.seen.lock().unwrap();
+                for c in changes {
+                    let diff = c.diff(cwd).map(|d| d.text).unwrap_or_default();
+                    seen.push((c.display_path(cwd), diff));
+                }
+                ReviewOutcome {
+                    files: changes
+                        .iter()
+                        .map(|c| ReviewedFile {
+                            path: c.path.clone(),
+                            accepted: c.path != self.reject,
+                        })
+                        .collect(),
+                    note: None,
+                }
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("kazi-review-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let kept = dir.join("keep.txt");
+        let dropped = dir.join("drop.txt");
+
+        let calls = vec![
+            LlmResponse {
+                tool_calls: vec![
+                    ToolCall {
+                        id: "w1".into(),
+                        name: "write_file".into(),
+                        arguments: json!({"path": "keep.txt", "content": "kept content"}),
+                    },
+                    ToolCall {
+                        id: "w2".into(),
+                        name: "write_file".into(),
+                        arguments: json!({"path": "drop.txt", "content": "dropped content"}),
+                    },
+                ],
+                ..Default::default()
+            },
+            LlmResponse {
+                content: Some("done".into()),
+                ..Default::default()
+            },
+        ];
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(calls));
+        let mut ctx = test_ctx();
+        ctx.cwd = dir.clone();
+        ctx.permission.set(crate::tools::PermissionMode::Review);
+        ctx.staged = Some(Arc::new(crate::tools::checkpoint::Staging::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        ctx.reviewer = Some(Arc::new(Picky {
+            reject: dropped.clone(),
+            seen: seen.clone(),
+        }));
+        let mut agent = Agent::with_parallel(
+            provider,
+            ToolRegistry::builtin(),
+            ctx,
+            Some("sys".into()),
+            4,
+            10_000,
+            2,
+        );
+        agent.run_task("write two files", |_| {}).await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&kept).unwrap(),
+            "kept content",
+            "the accepted file is written"
+        );
+        assert!(
+            !dropped.exists(),
+            "the rejected file must never touch the disk"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "the reviewer saw both staged files");
+        assert!(
+            seen.iter()
+                .any(|(p, d)| p == "drop.txt" && d.contains("+dropped content")),
+            "the review shows a real diff: {seen:?}"
+        );
+        // the model is told which write did not happen
+        let tool_text: Vec<String> = agent
+            .history
+            .msgs
+            .iter()
+            .filter(|m| m.role == crate::llm::Role::Tool)
+            .map(|m| m.text().to_string())
+            .collect();
+        assert!(
+            tool_text
+                .iter()
+                .any(|t| t.contains("NOT written: drop.txt")),
+            "{tool_text:?}"
+        );
+        assert!(
+            tool_text
+                .iter()
+                .any(|t| t.contains("reviewed + written: keep.txt")),
+            "{tool_text:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn derived_ctx_does_not_touch_the_parent_permission() {
+        // The 0.18 bug: `delegate` cloned ToolCtx (which shares the permission
+        // atom) and flipped the copy to read-only for a sub-task — silently
+        // turning the whole session read-only.
+        let parent = test_ctx();
+        parent.permission.set(crate::tools::PermissionMode::Edit);
+        let sub = parent.derive(crate::tools::PermissionMode::ReadOnly);
+        assert_eq!(
+            parent.permission.get(),
+            crate::tools::PermissionMode::Edit,
+            "a derived context must not rewrite its parent's mode"
+        );
+        assert_eq!(sub.permission.get(), crate::tools::PermissionMode::ReadOnly);
+        // the parent keeps every other shared handle (they are meant to be shared)
+        assert_eq!(sub.output_limit, parent.output_limit);
     }
 }

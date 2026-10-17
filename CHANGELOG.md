@@ -6,6 +6,85 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: MINOR = feature batch, PATCH = fixes only — see docs/VERSIONING.md).
 
+## [0.19.0] - 2026-10-17
+
+A session you can control: approval prompts are identified and queued, writes can
+be staged for review, the request preset is one keystroke, costs and cache hits
+are real numbers, and context trimming says what it keeps.
+
+### Added
+
+- **Review mode** (`/permission review`, `Shift+Tab`, `--permission-mode review`):
+  `write_file` / `apply_patch` park their planned content instead of touching the
+  disk. A changeset modal lists every file with its diff (`space` toggle, `a` all,
+  `n` none, `Enter` write); rejected files are reported to the model as errors with
+  a reason, accepted files are checkpointed (so `/undo` still covers them) and
+  written in one pass.
+- **Effort presets** (`/effort [fast|balanced|deep]`, `[agent] preset`, custom
+  `[agent.presets.*]`): temperature, output budget and reasoning effort per request;
+  written back to `config.toml` in place (comments survive) and shown as a badge
+  next to the model name. `max_tokens` is no longer hard-coded for Anthropic.
+- **Cost ledger** (`/cost`, `[usage.prices.*]`, `agent.max_usd_per_task`): USD per
+  1M tokens from the user's own table — kazi ships no prices, so an unpriced model
+  prints tokens and never a guessed number. The header shows the running task cost,
+  `/status` and `kazi run` (text and `--output json`) report it, and the budget guard
+  stops a task between rounds (`AgentError::BudgetExceeded`, history kept).
+- **Prompt caching**: Anthropic requests get `cache_control` breakpoints on the
+  stable system block and the tool catalog; the compaction summary is appended as a
+  separate uncached block so a `/compact` does not invalidate the whole prefix.
+  `Usage` now carries `cache_read_tokens` / `cache_write_tokens` (Anthropic cache
+  fields, OpenAI `prompt_tokens_details.cached_tokens`, DeepSeek
+  `prompt_cache_hit_tokens`) and `/cost` prints the cache-hit share.
+- **`/pin [n|off]`**: pinned turns are never dropped by trimming or compaction;
+  bare `/pin` lists them. Pins rebase when older turns go.
+- **Honest `/context`**: history is reported in the three bands the trimmer really
+  keeps — newest turn, droppable middle, pinned turns — with token estimates each.
+- **`delete_file` and `move_file` tools**: checkpointed (so `/undo` restores them),
+  sandbox-checked, `delete_file` refuses directories and has a `dry_run`, and both
+  appear in the tool cards with their summaries. `move_file` refuses to clobber
+  without `overwrite = true`.
+- **`/find <text>`** and **`kazi sessions --find <text>`**: search user/assistant
+  text across every saved session, reporting session, role, line and a snippet
+  (tool output is deliberately excluded).
+- **PDF text in `fetch_url`**: `application/pdf` responses get an honest
+  zero-dependency extraction of uncompressed text blocks; compressed (FlateDecode),
+  encrypted and scanned PDFs say so instead of returning binary noise.
+- **Approval identity**: every prompt carries an id, its task number and its origin
+  (`task` or `[sub-agent]`), is queued instead of overwriting the previous one, and
+  shows `2/3 waiting`. Prompts left behind by a finished task are answered with an
+  explicit `Deny("task already finished")`.
+
+### Changed
+
+- `PermissionMode` gained `Review`; `Shift+Tab` cycles edit → review → read-only →
+  yolo, and `PermissionMode::ALL` / `writes_allowed()` are the single source for
+  completion and gating.
+- The system prompt now tells the model to batch independent tool calls in one
+  round (the engine has run four in parallel since 0.12; the prompt said the
+  opposite).
+- `History::insert_summary` still appends to the system prompt, but the Anthropic
+  wire splits it into an uncached block (see prompt caching).
+- `kazi run` warns that review mode has no prompt there and accepts staged changes.
+
+### Fixed
+
+- **A read-only `delegate` sub-task silently turned the whole session read-only**:
+  `ToolCtx` was cloned and its shared permission atom flipped, so the parent
+  session refused every write while the header still said `edit`. Derived contexts
+  now get their own permission cell (`ToolCtx::derive`), with a regression test.
+- **`fetch_url` could be walked into a private network**: only the first URL was
+  checked and reqwest followed up to 10 redirects by default, so a public host
+  could 302 to link-local metadata or a LAN service. The client now re-validates
+  every hop (https only, private hosts refused, max 5 redirects).
+- Approval prompts could overwrite each other (single slot, silent `Deny` for the
+  one that lost); they are queued and answered oldest-first.
+- The post-edit `feedback_command` no longer runs for a changeset the user rejected.
+
+### Tests
+
+`cargo test` — 269 passing (was 249). `cargo clippy --all-targets -- -D warnings`
+and `cargo fmt --check` are clean.
+
 ## [0.18.0] - 2026-10-17
 
 The workspace becomes comfortable to drive: a real composer, mouse support
