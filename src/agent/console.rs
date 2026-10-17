@@ -1088,6 +1088,12 @@ const COMMANDS: &[CmdSpec] = &[
         arg: ArgKind::No,
     },
     CmdSpec {
+        name: "/skills",
+        args: "[name]",
+        help: "list project skills, or print one's procedure",
+        arg: ArgKind::Flag,
+    },
+    CmdSpec {
         name: "/status",
         args: "",
         help: "provider, model, rounds, usage",

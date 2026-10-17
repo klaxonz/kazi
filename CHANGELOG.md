@@ -6,6 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: MINOR = feature batch, PATCH = fixes only — see docs/VERSIONING.md).
 
+## [0.24.0] - 2026-10-17
+
+Skills: the repository's procedures, loaded on demand instead of carried in
+every prompt.
+
+### Added
+
+- **Skills**: `.kazi/skills/<name>/SKILL.md` (and `<config>/kazi/skills/`) with
+  optional front matter (`description`) and a procedure body. Only the name and
+  description ride in the system prompt (a catalog under "Available skills");
+  the body is fetched with the new `use_skill` tool when the task matches.
+  Bodies cap at 32 KiB, a nearer skill overrides a farther one, the directory
+  name is the identity, and the first content line stands in for a missing
+  description.
+- `use_skill { name }`: read-only, lists the available names on a miss instead
+  of guessing. Registered only when skills exist, so a repo without them keeps
+  the tool count it had.
+- `/skills` lists name, scope, description and source file; `/skills <name>`
+  prints the full procedure for the human.
+
+### Changed
+
+- The system prompt's extra-context block is now assembled from project
+  instructions **and** the skill catalog, in that order.
+- `ToolRegistry::with_skills` is idempotent: a provider rebuild does not
+  register `use_skill` twice.
+
+### Tests
+
+`cargo test` — 298 passing (was 292): front matter and the description
+fallback, nearest-wins overriding, bad directory names and empty skills being
+skipped, the body cap, the catalog shape, and `use_skill` by name (including
+the unknown-name message listing what exists).
+
 ## [0.23.0] - 2026-10-17
 
 kazi learns the repository: its guidance files shape the system prompt, and its

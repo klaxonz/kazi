@@ -18,7 +18,9 @@
 > **0.23 实际交付**:§6(0.21 主题)的**项目约定**(§5 里 `KAZI.md`/`AGENTS.md` 的发现、
 > 预算、来源标注与 `/instructions`)与**自定义命令**(`.kazi/commands/*.md`、
 > front-matter、`$ARGUMENTS`/`$1..$9`、进补全与 `/help`、`kazi run` 同步展开)。
-> 剩下的 0.21 主题项:**技能**(`use_skill`)、**hook**、**profile**、**`kazi::prelude` 冻结**。
+> **0.24 实际交付**:0.21 主题的**技能**(§6：目录只放 name + description,正文由
+> `use_skill` 按需加载,/skills 查看,32 KiB 上限、近者优先)。
+> 剩下的 0.21 主题项:**hook**、**profile**、**`kazi::prelude` 冻结**。
 
 ## 1. 现状:0.18 的 kazi 是什么
 

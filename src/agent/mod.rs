@@ -18,6 +18,7 @@ pub mod context;
 pub mod custom;
 pub mod instructions;
 pub mod session;
+pub mod skills;
 pub mod tui;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -497,6 +498,8 @@ pub struct Agent {
     vision: Option<bool>,
     /// Project instruction files loaded for this session (`/instructions`).
     instructions: instructions::Instructions,
+    /// Skills found on disk (`/skills`, and the `use_skill` tool behind them).
+    skills: Arc<Vec<skills::Skill>>,
 }
 
 impl Agent {
@@ -551,6 +554,7 @@ impl Agent {
             priced: false,
             vision: None,
             instructions: instructions::Instructions::default(),
+            skills: Arc::new(Vec::new()),
         }
     }
 
@@ -606,6 +610,11 @@ impl Agent {
     /// Project instruction files that shaped this session's system prompt.
     pub fn instructions(&self) -> &instructions::Instructions {
         &self.instructions
+    }
+
+    /// Skills discovered for this session (the catalog behind `use_skill`).
+    pub fn skills(&self) -> &[skills::Skill] {
+        &self.skills
     }
 
     pub fn max_rounds(&self) -> u32 {
@@ -777,7 +786,15 @@ impl Agent {
         } else {
             instructions::Instructions::default()
         };
-        let system = system_prompt_with(&ctx.cwd, instructions.render().as_deref());
+        let skills = Arc::new(skills::discover(&ctx.cwd));
+        let registry = registry.with_skills(skills.clone());
+        // instructions first, then the skill catalog: both are system context,
+        // but only the catalog's bodies are lazy
+        let mut extra = instructions.render().unwrap_or_default();
+        if let Some(cat) = skills::catalog(&skills) {
+            extra.push_str(&cat);
+        }
+        let system = system_prompt_with(&ctx.cwd, (!extra.is_empty()).then_some(extra.as_str()));
         let runner = Arc::new(SubAgentRunnerImpl::new(
             wrapped.clone(),
             ctx.clone(),
@@ -801,6 +818,7 @@ impl Agent {
         agent.price = cfg.price_for(&agent.provider_model()).cloned();
         agent.vision = cfg.providers.get(&agent.nick).and_then(|e| e.vision);
         agent.instructions = instructions;
+        agent.skills = skills;
         agent.nick = nick;
         agent.auth_hint = auth_hint;
         agent

@@ -15,6 +15,7 @@ pub mod patch;
 pub mod pdf;
 pub mod search;
 pub mod shell;
+pub mod skill;
 pub mod subagent;
 pub mod todo;
 
@@ -606,7 +607,7 @@ fn one_line(s: &str) -> String {
 }
 
 /// Clip to `n` display characters, appending `…` when shortened.
-fn clip_line(s: &str, n: usize) -> String {
+pub(crate) fn clip_line(s: &str, n: usize) -> String {
     let s = s.trim();
     let count = s.chars().count();
     if count <= n {
@@ -650,6 +651,15 @@ impl ToolRegistry {
             .register(Arc::new(fetch::FetchUrl))
             .register(Arc::new(jobs::JobOutput))
             .register(Arc::new(jobs::JobKill))
+    }
+
+    /// Built-ins plus `use_skill` for the skills found on disk. Idempotent:
+    /// a provider rebuild must not register the tool twice.
+    pub fn with_skills(self, skills: std::sync::Arc<Vec<crate::agent::skills::Skill>>) -> Self {
+        if skills.is_empty() || self.names().iter().any(|n| n == "use_skill") {
+            return self;
+        }
+        self.register(Arc::new(skill::UseSkill { skills }))
     }
 
     pub fn names(&self) -> Vec<String> {

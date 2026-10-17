@@ -3321,6 +3321,62 @@ async fn run_command(
             };
             screen.show_text(text);
         }
+        "skills" => {
+            let text = match slot.lock().await.as_ref() {
+                Some(a) => {
+                    let skills = a.skills();
+                    if let Some(want) = arg.split_whitespace().next() {
+                        match skills.iter().find(|s| s.name == want.to_ascii_lowercase()) {
+                            Some(s) => format!(
+                                "# skill: {}\n{}\nsource: {}{}\n\n{}",
+                                s.name,
+                                if s.description.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("{}\n", s.description)
+                                },
+                                s.path.display(),
+                                if s.truncated { " (truncated)" } else { "" },
+                                s.body
+                            ),
+                            None => format!(
+                                "no skill named {want:?}; available: {}",
+                                if skills.is_empty() {
+                                    "none".to_string()
+                                } else {
+                                    skills
+                                        .iter()
+                                        .map(|s| s.name.clone())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                }
+                            ),
+                        }
+                    } else if skills.is_empty() {
+                        "no skills — add .kazi/skills/<name>/SKILL.md (name and description go in the system prompt; the model loads the body with use_skill)"
+                            .to_string()
+                    } else {
+                        let mut out = format!("skills ({}):\n", skills.len());
+                        for s in skills {
+                            out.push_str(&format!(
+                                "  {:<16} {}{}\n    {}\n",
+                                s.name,
+                                match s.scope {
+                                    super::skills::Scope::Global => "(global) ",
+                                    super::skills::Scope::Project => "",
+                                },
+                                s.description,
+                                s.path.display()
+                            ));
+                        }
+                        out.push_str("  (/skills <name> prints one's procedure)");
+                        out
+                    }
+                }
+                None => BUSY_TEXT.to_string(),
+            };
+            screen.show_text(text);
+        }
         "instructions" => {
             let text = match slot.lock().await.as_ref() {
                 Some(a) => {

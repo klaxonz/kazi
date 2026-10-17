@@ -160,7 +160,7 @@ Slash commands: `/help [command]` (overlay, or one command's usage), `/new`,
 `/diff [n]`, `/queue [clear|drop <n>]`, `/auth`, `/theme`, `/details`,
 `/export [path]`, `/copy [all|tool [n]|diff [n]|code [n]]`, `/retry`,
 `/effort [fast|balanced|deep]`, `/cost [reset]`, `/pin [n|off]`, `/find <text>`,
-`/jobs [id|kill <id>]`, `/mcp`, `/exit`.
+`/jobs [id|kill <id>]`, `/mcp`, `/skills [name]`, `/instructions`, `/exit`.
 Every finished task autosaves, so quitting mid-task never costs you the session;
 `/undo` restores the files the last task changed; `/rename` repoints autosave
 and keeps the old file. While a task runs, the commands that only read the
@@ -305,6 +305,29 @@ name that would shadow a built-in is labelled, never silently unreachable.
 `kazi run "/review src/agent/mod.rs"` expands it too, so scripts get the same
 verbs.
 
+## Skills
+
+A skill is a procedure you want the model to follow — how this repo cuts a
+release, what a code review must check, how the team writes migrations. Put it
+in `.kazi/skills/<name>/SKILL.md` (or `<config>/kazi/skills/` for every
+project):
+
+```markdown
+---
+description: Cut a release — version bump, changelog, tag, push
+---
+1. cargo fmt / clippy --all-targets / test --all-targets must be clean
+2. bump Cargo.toml, write the CHANGELOG section, commit "vX.Y.Z: …"
+3. tag vX.Y.Z, push main, then push the tag
+```
+
+Only the **name and description** go into the system prompt (a catalog), so a
+repository with thirty skills does not spend thirty pages of context on every
+task; the model loads the body with `use_skill` when the task actually
+matches, and `/skills` (`/skills release` prints the procedure) is the same
+list for you. Bodies are capped at 32 KiB, a nearer skill overrides a farther
+one with the same name, and the directory name is the skill's identity.
+
 ## Built-in tools
 
 | tool         | effect                                                  |
@@ -323,6 +346,7 @@ verbs.
 | `fetch_url`  | https GET → text; uncompressed PDF text extracted       |
 | `mcp_resources` | list/read an MCP server's resources (when configured) |
 | `mcp_prompts`   | list/render an MCP server's prompt templates          |
+| `use_skill`  | load a project skill's procedure (when skills exist)    |
 
 Agents fail lucidly on purpose: every error text is fed back to the model (`is_error`),
 which usually corrects its next call — that's how the loop learns.
