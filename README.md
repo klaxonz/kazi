@@ -272,6 +272,13 @@ kazi config      # show config path / current contents
 Override anything per call: `--provider <nick>` `--model <name>`
 `--resume <session>` / `--yolo` (see Safety).
 
+**Profiles** switch a whole configuration layer without editing the file:
+`config.toml` stays the "home" setup, and `profiles/work.toml` next to it
+overrides any key (`--profile work`, or `KAZI_PROFILE=work` for scripts and
+CI). Tables merge key by key — the profile can change `provider` and add one
+`[providers.*]` entry without restating your theme, tools or prices. A missing
+profile is an error, never a silent fallback.
+
 ## Project instructions and your own commands
 
 kazi reads the repository's own guidance before it starts:
@@ -462,6 +469,12 @@ kazi export fix-kproxy-delay notes.md
   `run_command` approvals are your last human checkpoint.
 
 ## Library
+
+The stable surface for embedders is `kazi::prelude`: `Agent`, `Provider`,
+`Tool`/`ToolCtx`/`ToolRegistry`, `Approver`/`Reviewer`, the message types, `Config`,
+plus the skill and hook types. A MINOR release may add names there but does not
+break them; the TUI internals, the on-disk session/checkpoint formats and
+everything else are free to move (see [docs/VERSIONING.md](docs/VERSIONING.md)).
 
 Everything the CLI does is library API (crate docs: `cargo doc --open`):
 

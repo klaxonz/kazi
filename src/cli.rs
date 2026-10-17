@@ -28,6 +28,9 @@ pub struct Cli {
     /// Path to the config file (default: platform config dir)
     #[arg(long, global = true, help_heading = "Config")]
     pub config: Option<PathBuf>,
+    /// Overlay \`profiles/<name>.toml\` from the config dir (same as KAZI_PROFILE)
+    #[arg(long, global = true, help_heading = "Config")]
+    pub profile: Option<String>,
     /// Flags for the bare invocation (`kazi` == `kazi chat`), so `kazi --yolo`
     /// works without naming the subcommand.
     #[command(flatten)]
@@ -157,6 +160,12 @@ pub enum OutputFmt {
 
 /// Dispatch; returns the process exit code.
 pub async fn execute(cli: Cli) -> anyhow::Result<u8> {
+    // one place sets the profile, and `Config::load` reads it: every
+    // subcommand (config/providers/auth/...) honours it without threading the
+    // flag through seven signatures
+    if let Some(profile) = &cli.profile {
+        std::env::set_var("KAZI_PROFILE", profile);
+    }
     match cli.command {
         None => chat(&cli.engine, None, cli.config.as_deref()).await,
         Some(Command::Chat { topic, args }) => chat(&args, topic, cli.config.as_deref()).await,

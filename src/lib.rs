@@ -56,5 +56,37 @@ pub mod llm;
 pub mod mcp;
 pub mod tools;
 
+/// The stable surface for embedders: everything here is covered by the
+/// compatibility promise in `docs/VERSIONING.md` — a MINOR release may add,
+/// but not break these names or their signatures.
+///
+/// ```no_run
+/// use kazi::prelude::*;
+///
+/// # async fn demo(cfg: &kazi::config::Config) -> anyhow::Result<()> {
+/// let agent = Agent::default_cli(cfg, None, None, false).await?;
+/// # let _ = agent;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// What is deliberately *not* frozen: the TUI internals (`agent::tui`), the
+/// on-disk session/checkpoint formats (they carry their own versioning), and
+/// anything under `config::…` that is not listed here.
+pub mod prelude {
+    pub use crate::agent::hooks::{Hook, HookRun, Hooks};
+    pub use crate::agent::skills::Skill;
+    pub use crate::agent::{Agent, AgentError, AgentEvent};
+    pub use crate::config::{Config, ConfigError};
+    pub use crate::llm::{
+        ImagePart, LlmError, LlmRequest, LlmResponse, Message, Provider, Role, StreamEvent,
+        ToolCall, ToolSpec, Usage,
+    };
+    pub use crate::tools::{
+        Approver, Decision, Permission, PermissionMode, Reviewer, Tool, ToolCtx, ToolError,
+        ToolOutcome, ToolRegistry,
+    };
+}
+
 /// Crate version (matches `CARGO_PKG_VERSION`), handy for embedders.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -22,7 +22,10 @@
 > `use_skill` 按需加载,/skills 查看,32 KiB 上限、近者优先)。
 > **0.25 实际交付**:0.21 主题的 **hook**(`[[hooks]]` 的 pre_tool 拒绝 / post_tool /
 > post_task 报告,stdin JSON + 退出码,超时算失败,/hooks 查看)。
-> 剩下的 0.21 主题项:**profile**、**`kazi::prelude` 冻结**。
+> **0.26 实际交付**:0.21 主题的 **profile**(`--profile` / `KAZI_PROFILE`,叠一层
+> `profiles/<name>.toml`)与 **`kazi::prelude` 冻结**(公开 Agent / Provider / Tool /
+> Approver / Reviewer / 消息类型 / 配置 + 技能与 hook 类型)。
+> 0.21 主题至此全部落地;§6 的尾巴(fetch_url 附件、全文索引 + 正则 /find)仍是待办。
 
 ## 1. 现状:0.18 的 kazi 是什么
 

@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: MINOR = feature batch, PATCH = fixes only — see docs/VERSIONING.md).
 
+## [0.26.0] - 2026-10-17
+
+Profiles and the library surface: one config, many setups — and a promise for
+embedders.
+
+### Added
+
+- **`--profile <name>`** (or `KAZI_PROFILE`) overlays
+  `profiles/<name>.toml` from the config directory on top of `config.toml`.
+  Tables merge key by key, scalars and arrays are replaced, so a profile can
+  switch `provider` and add one `[providers.*]` entry without restating
+  the rest of the file. A missing profile is a hard error, never a silent
+  fallback; every subcommand honours it.
+- **`kazi::prelude`**: `Agent`, `Provider`, `Tool` / `ToolCtx` /
+  `ToolRegistry`, `Approver` / `Reviewer`, the message types, `Config`,
+  and the skill/hook types — documented as the stable surface (a MINOR may add,
+  not break). The TUI internals, session/checkpoint formats and unlisted config
+  helpers stay free to move.
+
+### Tests
+
+`cargo test` — 303 passing (was 302): profile layering (base keys survive,
+profile keys arrive, missing profile errors) alongside the existing suite.
+
 ## [0.25.0] - 2026-10-17
 
 Hooks: the project can gate and observe the agent from its own scripts.

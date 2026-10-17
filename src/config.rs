@@ -326,6 +326,57 @@ pub struct ProviderEntry {
 
 /// (config, its path) so the CLI can tell users where things came from.
 pub fn load(explicit: Option<&Path>) -> Result<(Config, PathBuf), ConfigError> {
+    // KAZI_PROFILE (set by --profile) turns on the overlay for every caller
+    let profile = std::env::var("KAZI_PROFILE").ok();
+    load_profiled(explicit, profile.as_deref())
+}
+
+/// Like `load`, plus one overlay: `profiles/<name>.toml` next to config.toml.
+/// The profile wins key by key, so `--profile work` can change the provider
+/// without restating the rest of the file.
+pub fn load_profiled(
+    explicit: Option<&Path>,
+    profile: Option<&str>,
+) -> Result<(Config, PathBuf), ConfigError> {
+    let (text, path) = load_text(explicit)?;
+    let Some(name) = profile else {
+        let cfg: Config = toml::from_str(&text).map_err(|e| ConfigError::Parse {
+            path: path.clone(),
+            msg: e.to_string(),
+        })?;
+        return Ok((cfg, path));
+    };
+    let file = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("profiles")
+        .join(format!("{name}.toml"));
+    if !file.exists() {
+        return Err(ConfigError::Missing { path: file });
+    }
+    let over = std::fs::read_to_string(&file).map_err(|e| ConfigError::Parse {
+        path: file.clone(),
+        msg: e.to_string(),
+    })?;
+    let base: toml::Value = toml::from_str(&text).map_err(|e| ConfigError::Parse {
+        path: path.clone(),
+        msg: e.to_string(),
+    })?;
+    let over: toml::Value = toml::from_str(&over).map_err(|e| ConfigError::Parse {
+        path: file.clone(),
+        msg: e.to_string(),
+    })?;
+    let merged = merge_toml(base, over);
+    let cfg: Config = merged
+        .try_into()
+        .map_err(|e: toml::de::Error| ConfigError::Parse {
+            path: file.clone(),
+            msg: e.to_string(),
+        })?;
+    Ok((cfg, path))
+}
+
+fn load_text(explicit: Option<&Path>) -> Result<(String, PathBuf), ConfigError> {
     let path = explicit.map(Path::to_path_buf).unwrap_or_else(config_path);
     if !path.exists() {
         return Err(ConfigError::Missing { path });
@@ -334,11 +385,25 @@ pub fn load(explicit: Option<&Path>) -> Result<(Config, PathBuf), ConfigError> {
         path: path.clone(),
         msg: e.to_string(),
     })?;
-    let cfg: Config = toml::from_str(&text).map_err(|e| ConfigError::Parse {
-        path: path.clone(),
-        msg: e.to_string(),
-    })?;
-    Ok((cfg, path))
+    Ok((text, path))
+}
+
+/// Deep-merge two TOML values: `over` wins, tables merge key by key, arrays and
+/// scalars are replaced wholesale.
+fn merge_toml(base: toml::Value, over: toml::Value) -> toml::Value {
+    match (base, over) {
+        (toml::Value::Table(mut b), toml::Value::Table(o)) => {
+            for (k, v) in o {
+                let merged = match b.remove(&k) {
+                    Some(existing) => merge_toml(existing, v),
+                    None => v,
+                };
+                b.insert(k, merged);
+            }
+            toml::Value::Table(b)
+        }
+        (_, over) => over,
+    }
 }
 
 #[derive(Debug)]
@@ -959,6 +1024,48 @@ model = "m2"
         // the table header must match exactly: [agent.presets.x] is not [agent]
         assert!(!text.contains("[agent.preset]"), "{text}");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profiles_layer_over_the_base_config() {
+        let dir = std::env::temp_dir().join(format!("kazi-profile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        let base = dir.join("config.toml");
+        std::fs::write(
+            &base,
+            "provider = \"home\"\n[providers.home]\ntype = \"ollama\"\nmodel = \"llama\"\n[ui]\ntheme = \"dark\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("profiles/work.toml"),
+            "provider = \"work\"\n[providers.work]\ntype = \"openai\"\nbase_url = \"https://gw.example/v1\"\nmodel = \"gpt-4o\"\n[ui]\nbell = true\n",
+        )
+        .unwrap();
+
+        let (cfg, path) = load_profiled(Some(&base), Some("work")).unwrap();
+        assert_eq!(path, base);
+        assert_eq!(
+            cfg.provider.as_deref(),
+            Some("work"),
+            "the profile switches provider"
+        );
+        assert!(cfg.providers.contains_key("home"), "base entries stay");
+        assert!(cfg.providers.contains_key("work"));
+        assert_eq!(cfg.ui.bell, Some(true), "the profile's [ui] key arrives");
+        assert_eq!(
+            cfg.ui.theme.as_deref(),
+            Some("dark"),
+            "the base [ui] survives"
+        );
+
+        // without a profile the file loads exactly as before
+        let (plain, _) = load_profiled(Some(&base), None).unwrap();
+        assert_eq!(plain.provider.as_deref(), Some("home"));
+        // a missing profile is an error, not a silent no-op
+        let err = load_profiled(Some(&base), Some("nope")).unwrap_err();
+        assert!(err.to_string().contains("nope"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
