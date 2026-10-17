@@ -50,10 +50,22 @@ pub struct Config {
     pub provider: Option<String>,
     pub agent: AgentCfg,
     pub tools: ToolsCfg,
+    /// Terminal appearance (`[ui] theme = "dark"`, `details = false`).
+    pub ui: UiCfg,
     /// MCP stdio servers to bridge as tools (`[mcp.servers.<nick>]`).
     pub mcp: McpCfg,
     /// nickname → entry; BTreeMap keeps stable ordering for errors and `first`.
     pub providers: BTreeMap<String, ProviderEntry>,
+}
+
+/// `[ui]`: look and default verbosity of the full-screen TUI.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default)]
+pub struct UiCfg {
+    /// Colour theme: `dark` (default), `light`, `mono`.
+    pub theme: Option<String>,
+    /// Start with full tool output expanded (`Ctrl+O` toggles at runtime).
+    pub details: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -505,6 +517,17 @@ model = "m2"
     fn example_toml_itself_parses() {
         let c: Config = toml::from_str(EXAMPLE_TOML).unwrap();
         assert!(c.providers.len() >= 3);
+    }
+
+    #[test]
+    fn ui_section_parses_and_defaults() {
+        let c = cfg("[ui]\ntheme = \"light\"\ndetails = true\n");
+        assert_eq!(c.ui.theme.as_deref(), Some("light"));
+        assert_eq!(c.ui.details, Some(true));
+        let default: Config = toml::from_str("").unwrap();
+        assert!(default.ui.theme.is_none());
+        assert!(default.ui.details.is_none());
+        assert!(EXAMPLE_TOML.contains("[ui]"));
     }
 
     #[test]

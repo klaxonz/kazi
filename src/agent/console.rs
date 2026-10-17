@@ -1,9 +1,11 @@
-//! Interactive chat (`kazi chat`): streaming output, slash commands, session
-//! auto-save, live provider/model switching.
+//! Shared chat front-end support: the slash-command table, the plain-stdout
+//! event renderer (`kazi run`'s progress output), the terminal stdin approver,
+//! persisted input history, `@path` completion, and provider/model catalogs.
 //!
 //! Slash commands are TABLE-DRIVEN: the single `COMMANDS` list feeds the help
 //! text, TAB completion, ghost-text hints, and usage errors alike. Adding a
-//! command = one table row + one match arm; nothing else to keep in sync.
+//! command = one table row + the one TUI match arm that acts on it; nothing
+//! else to keep in sync.
 //!
 //! Design invariants:
 //! - writing is ALWAYS autosave (`/new`, `/clear`, `/resume` only choose *where*);
@@ -14,19 +16,11 @@
 //! Printing is ASCII (+ VT colors where harmless) so output stays readable
 //! even on legacy Windows codepages (GBK/CMD).
 
-use std::borrow::Cow;
 use std::io::Write;
 
 use async_trait::async_trait;
-use rustyline::completion::{Completer, Pair};
-use rustyline::error::ReadlineError;
-use rustyline::highlight::{CmdKind, Highlighter};
-use rustyline::hint::Hinter;
-use rustyline::history::DefaultHistory;
-use rustyline::validate::Validator;
-use rustyline::{CompletionType, Config as RlConfig, Context, Editor, Helper, Result as RlResult};
 
-use crate::agent::{context::History, session, Agent, AgentError, AgentEvent};
+use crate::agent::{context::History, session, Agent, AgentEvent};
 use crate::config::Config;
 use crate::tools::{checkpoint, Approver, Decision};
 
@@ -38,7 +32,7 @@ const YELLOW: &str = "\x1b[33m";
 const RESET: &str = "\x1b[0m";
 
 /// Undo the last task's file changes via the agent's checkpoint store.
-/// Shared by the REPL and the TUI.
+/// Executed by the TUI's `/undo`.
 pub fn undo_last_task(agent: &Agent) -> std::io::Result<checkpoint::UndoOutcome> {
     match &agent.ctx.checkpointing {
         Some(cp) => cp.undo_latest(),
@@ -49,7 +43,7 @@ pub fn undo_last_task(agent: &Agent) -> std::io::Result<checkpoint::UndoOutcome>
 /// Listing cap for the undo report — a big refactor can touch many files.
 const UNDO_LIST_CAP: usize = 25;
 
-/// `/undo` — text both front-ends print.
+/// `/undo` — the report the TUI prints into its transcript.
 pub fn undo_text(agent: &Agent) -> String {
     let done = match undo_last_task(agent) {
         Ok(checkpoint::UndoOutcome::Nothing) => {
@@ -356,15 +350,28 @@ pub async fn all_model_choices(
     merge_choice_rows(cfg, current_nick, current_model, &live)
 }
 
-/// The single command a partial name (`/mod`) refers to, if unambiguous — so
-/// Enter on a half-typed command runs the one the user meant.
-pub fn unique_prefix_command(token: &str) -> Option<String> {
-    let mut hits = COMMANDS.iter().filter(|c| c.name.starts_with(token));
-    let first = hits.next()?;
-    if hits.next().is_some() {
-        return None; // ambiguous: let the caller list the candidates
-    }
-    Some(first.name.to_string())
+/// Full candidate set for the picker: config `models` ∪ a best-effort live
+/// `/models` fetch (≤3s) ∪ the built-in fallback, deduped, current first.
+/// Never fails — an unreachable endpoint just yields fewer candidates.
+pub async fn model_catalog(cfg: &Config, nick: &str, current: Option<&str>) -> Vec<String> {
+    let config_models = cfg.configured_models(nick);
+    let kind = cfg
+        .kind_of_nick(nick)
+        .unwrap_or(crate::llm::ProviderKind::OpenAiCompat);
+    let live = match cfg
+        .settings_for_nick(nick)
+        .ok()
+        .and_then(|s| crate::llm::build_provider(&s).ok())
+    {
+        Some(p) => {
+            match tokio::time::timeout(std::time::Duration::from_secs(3), p.list_models()).await {
+                Ok(Ok(m)) => m,
+                _ => Vec::new(),
+            }
+        }
+        None => Vec::new(),
+    };
+    crate::llm::merge_catalog(&config_models, &live, kind, current)
 }
 
 /// Session names matching a (possibly partial) prefix, newest first.
@@ -377,7 +384,7 @@ fn matching_sessions(prefix: &str) -> Vec<String> {
 
 /// `/resume <prefix>`: load a stored session into the agent. Returns the
 /// resolved session name (so the caller repoints auto-save at it) plus the
-/// text both front-ends print.
+/// text the TUI prints.
 pub async fn resume_text(agent: &mut Agent, prefix: &str) -> (Option<String>, String) {
     match session::resolve(prefix) {
         Some(name) => match super::session::load(&name) {
@@ -418,7 +425,7 @@ pub async fn compact_text(agent: &mut Agent, force: bool) -> String {
     }
 }
 
-/// Usage hint for a command name (`/resume <prefix>` style), for both UIs.
+/// Usage hint for a command name (`/resume <prefix>` style), for the TUI.
 pub fn usage_for(verb: &str) -> String {
     match spec_of(verb) {
         Some(spec) => usage_line(spec),
@@ -426,8 +433,8 @@ pub fn usage_for(verb: &str) -> String {
     }
 }
 
-/// Path of the shared input-history file (used by BOTH front-ends).
-pub fn history_path() -> Option<std::path::PathBuf> {
+/// Path of the persisted input-history file.
+fn history_path() -> Option<std::path::PathBuf> {
     dirs::data_dir().map(|d| d.join("kazi").join("history.txt"))
 }
 
@@ -596,82 +603,6 @@ pub fn resolve_model_arg(arg: &str, models: &[String]) -> Result<String, String>
     }
 }
 
-/// Numbered model list for `/model` with no argument (the header names what the
-/// rows are — `provider/model` for the combined list).
-pub fn models_text(header: &str, models: &[String], current: Option<&str>) -> String {
-    if models.is_empty() {
-        return format!(
-            "no model candidates — type a name instead ({})",
-            usage_for("/model")
-        );
-    }
-    let mut out = format!("{header}:\n");
-    for (i, m) in models.iter().enumerate() {
-        let mark = if Some(m.as_str()) == current {
-            "  <- current"
-        } else {
-            ""
-        };
-        out.push_str(&format!("  {}) {m}{mark}\n", i + 1));
-    }
-    out.push_str(&usage_for("/model"));
-    out
-}
-
-/// Model candidates from config `models` + the built-in fallback only — no
-/// network, instant and offline-safe (seeds TAB completion at startup).
-pub fn model_catalog_static(cfg: &Config, nick: &str, current: Option<&str>) -> Vec<String> {
-    let kind = cfg
-        .kind_of_nick(nick)
-        .unwrap_or(crate::llm::ProviderKind::OpenAiCompat);
-    crate::llm::merge_catalog(&cfg.configured_models(nick), &[], kind, current)
-}
-
-/// Full candidate set for the picker: config `models` ∪ a best-effort live
-/// `/models` fetch (≤3s) ∪ the built-in fallback, deduped, current first.
-/// Never fails — an unreachable endpoint just yields fewer candidates.
-pub async fn model_catalog(cfg: &Config, nick: &str, current: Option<&str>) -> Vec<String> {
-    let config_models = cfg.configured_models(nick);
-    let kind = cfg
-        .kind_of_nick(nick)
-        .unwrap_or(crate::llm::ProviderKind::OpenAiCompat);
-    let live = match cfg
-        .settings_for_nick(nick)
-        .ok()
-        .and_then(|s| crate::llm::build_provider(&s).ok())
-    {
-        Some(p) => {
-            match tokio::time::timeout(std::time::Duration::from_secs(3), p.list_models()).await {
-                Ok(Ok(m)) => m,
-                _ => Vec::new(),
-            }
-        }
-        None => Vec::new(),
-    };
-    crate::llm::merge_catalog(&config_models, &live, kind, current)
-}
-
-/// The effective provider nick for the current selection (flag > env > config).
-fn effective_nick(
-    cfg: &Config,
-    provider: &Option<String>,
-    model: &Option<String>,
-) -> Option<String> {
-    cfg.resolve(provider.as_deref(), model.as_deref())
-        .ok()
-        .map(|r| r.nick)
-}
-
-/// Resolve a `/model` or `/provider` argument that may be a 1-based index into
-/// the list a bare command printed: `Some(i)` selects that item; `None` means
-/// "treat the argument as a literal name".
-fn listed_index(arg: &str, len: usize) -> Option<usize> {
-    match arg.parse::<usize>() {
-        Ok(n) if n >= 1 && n <= len => Some(n - 1),
-        _ => None,
-    }
-}
-
 /// `/new` and `/clear`: reset the history and pick a fresh autosave target.
 /// Returns `(session name, note)` — callers store the name themselves.
 pub fn start_new_session(agent: &mut Agent, topic: Option<&str>) -> (String, String) {
@@ -783,23 +714,44 @@ impl Approver for StdinApprover {
     }
 }
 
-/// Render one agent event to stdout; shared by `chat` and `run`.
+/// Render one agent event to plain stdout — `kazi run`'s streaming output
+/// (headless progress; the TUI renders its own events).
 pub fn render_event(ev: &AgentEvent) {
     match ev {
         AgentEvent::TextDelta { text } => {
             print!("{text}");
             let _ = std::io::stdout().flush();
         }
-        AgentEvent::ToolStart { name } => {
+        AgentEvent::ToolStart { name, summary, .. } => {
             println!();
-            print!("{CYAN}>> {name}{RESET}");
+            if summary.is_empty() {
+                print!("{CYAN}>> {name}{RESET}");
+            } else {
+                print!("{CYAN}>> {name}{RESET} {DIM}{summary}{RESET}");
+            }
             let _ = std::io::stdout().flush();
         }
         AgentEvent::ToolEnd {
-            is_error, preview, ..
+            is_error,
+            preview,
+            diff,
+            ..
         } => {
             let (sym, col) = if *is_error { ("x", RED) } else { ("ok", GREEN) };
             println!(" {col}[{sym}]{RESET} {DIM}{preview}{RESET}");
+            if let Some(d) = diff {
+                // headless runs stay terse: one coloured line per changed row
+                for line in d.lines().take(40) {
+                    let colour = if line.starts_with('+') {
+                        GREEN
+                    } else if line.starts_with('-') {
+                        RED
+                    } else {
+                        DIM
+                    };
+                    println!("{colour}{line}{RESET}");
+                }
+            }
         }
         AgentEvent::AutoCompactStarted => {
             println!();
@@ -828,7 +780,7 @@ pub fn render_event(ev: &AgentEvent) {
             let (sym, col) = if *ok { ("ok", GREEN) } else { ("x", RED) };
             println!("\n{col}>> feedback {sym}{RESET} {DIM}`{command}` {preview}{RESET}");
         }
-        AgentEvent::RoundDone { .. } => {} // classic REPL stays quiet
+        AgentEvent::RoundDone { .. } => {} // run stays quiet on round progress
     }
 }
 
@@ -883,7 +835,7 @@ const COMMANDS: &[CmdSpec] = &[
     CmdSpec {
         name: "/exit",
         args: "",
-        help: "save session and leave (Ctrl-D also quits)",
+        help: "save session and leave (Ctrl+C also quits)",
         arg: ArgKind::No,
     },
     CmdSpec {
@@ -913,7 +865,7 @@ const COMMANDS: &[CmdSpec] = &[
     CmdSpec {
         name: "/resume",
         args: "<prefix>",
-        help: "load a stored session (TAB lists them)",
+        help: "load a stored session (bare opens the browser)",
         arg: ArgKind::Session,
     },
     CmdSpec {
@@ -970,14 +922,50 @@ const COMMANDS: &[CmdSpec] = &[
         help: "where the current provider's API key comes from",
         arg: ArgKind::No,
     },
+    CmdSpec {
+        name: "/theme",
+        args: "[name]",
+        help: "switch the colour theme (dark | light | mono)",
+        arg: ArgKind::Flag,
+    },
+    CmdSpec {
+        name: "/details",
+        args: "[on|off]",
+        help: "expand or collapse full tool output",
+        arg: ArgKind::Toggle,
+    },
+    CmdSpec {
+        name: "/sessions",
+        args: "",
+        help: "browse saved sessions (Enter resumes one)",
+        arg: ArgKind::No,
+    },
+    CmdSpec {
+        name: "/export",
+        args: "[path]",
+        help: "write the conversation to a markdown file",
+        arg: ArgKind::Topic,
+    },
+    CmdSpec {
+        name: "/copy",
+        args: "[all]",
+        help: "copy the last answer (or the whole transcript) to the clipboard",
+        arg: ArgKind::Flag,
+    },
+    CmdSpec {
+        name: "/retry",
+        args: "",
+        help: "run the last task again",
+        arg: ArgKind::No,
+    },
 ];
 
 fn spec_of(verb: &str) -> Option<&'static CmdSpec> {
     COMMANDS.iter().find(|c| c.name == verb)
 }
 
-/// Rendered command table (`/help` output, the startup banner and the TUI
-/// share this).
+/// Rendered command table (`/help` output; the startup banner in the TUI
+/// shares this).
 pub fn help_text() -> String {
     let mut out = String::from("commands:\n");
     for c in COMMANDS {
@@ -1099,287 +1087,6 @@ fn did_you_mean(verb: &str) -> Vec<&'static str> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// rustyline helper: TAB completion + ghost-text hints, all driven by COMMANDS.
-// ---------------------------------------------------------------------------
-
-/// Completion + hint support for slash commands.
-struct SlashHelper {
-    /// Configured provider nicks (for `/provider` completion and hints).
-    nicks: Vec<String>,
-    /// Model as last set via `/model` (display in hints).
-    model: Option<String>,
-    /// Known model candidates for the current provider (`/model` completion).
-    models: Vec<String>,
-    yolo: bool,
-}
-
-impl Completer for SlashHelper {
-    type Candidate = Pair;
-
-    fn complete(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> RlResult<(usize, Vec<Pair>)> {
-        if let Some(hit) = self.completions(line, pos) {
-            return Ok(hit);
-        }
-        // `@src/age<TAB>` — attachment paths are a first-class feature, so the
-        // completion must not stop at slash commands
-        if let Some((start, cands)) = at_path_completions(line, pos) {
-            let pairs = cands
-                .into_iter()
-                .map(|c| Pair {
-                    display: c.clone(),
-                    replacement: c,
-                })
-                .collect();
-            return Ok((start, pairs));
-        }
-        Ok((pos, Vec::new()))
-    }
-}
-
-impl SlashHelper {
-    /// `(word_start, candidates)`, or `None` when out of scope (not a slash
-    /// line, cursor mid-word ...). Empty candidates = "nothing to add" (TAB
-    /// with a known arg kind still lists the full option set).
-    fn completions(&self, line: &str, pos: usize) -> Option<(usize, Vec<Pair>)> {
-        let head = &line[..pos];
-        if !head.starts_with('/') {
-            return None;
-        }
-        let word_start = head.rfind(' ').map_or(0, |i| i + 1);
-        let token = &head[word_start..];
-
-        if word_start == 0 {
-            // completing the verb itself
-            let cands = COMMANDS
-                .iter()
-                .filter(|c| c.name.starts_with(token))
-                .map(|c| Pair {
-                    display: format!("{:<11} {}", c.name, c.help),
-                    replacement: c.name.to_string(),
-                })
-                .collect();
-            return Some((0, cands));
-        }
-
-        let verb = line.split_whitespace().next().unwrap_or("");
-        let spec = spec_of(verb)?;
-        let cands = match spec.arg {
-            ArgKind::Session => session::list()
-                .into_iter()
-                .filter(|n| n.starts_with(token))
-                .map(|n| Pair {
-                    display: n.clone(),
-                    replacement: n,
-                })
-                .collect(),
-            ArgKind::Provider => self
-                .nicks
-                .iter()
-                .filter(|n| n.starts_with(token))
-                .map(|n| Pair {
-                    display: n.clone(),
-                    replacement: n.clone(),
-                })
-                .collect(),
-            ArgKind::Model => self
-                .models
-                .iter()
-                .filter(|m| m.starts_with(token))
-                .map(|m| Pair {
-                    display: m.clone(),
-                    replacement: m.clone(),
-                })
-                .collect(),
-            ArgKind::Toggle => ["on", "off"]
-                .into_iter()
-                .filter(|t| t.starts_with(token))
-                .map(|t| Pair {
-                    display: t.to_string(),
-                    replacement: t.to_string(),
-                })
-                .collect(),
-            ArgKind::Permission => ["read-only", "edit", "yolo"]
-                .into_iter()
-                .filter(|t| t.starts_with(token))
-                .map(|t| Pair {
-                    display: t.to_string(),
-                    replacement: t.to_string(),
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
-        Some((word_start, cands))
-    }
-}
-
-impl Hinter for SlashHelper {
-    type Hint = String;
-
-    /// Ghost text right after a completed verb: the argument picture plus the
-    /// options that are knowable in-process (provider nicks, yolo state).
-    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
-        if pos != line.len() || !line.starts_with('/') {
-            return None;
-        }
-        let verb = line.split_whitespace().next()?;
-        let spec = spec_of(verb)?;
-        if line.trim() != verb {
-            return None; // user is already typing the argument
-        }
-        if spec.args.is_empty() {
-            return None;
-        }
-        Some(match spec.arg {
-            ArgKind::Provider if !self.nicks.is_empty() => {
-                format!(" {} — one of: {}", spec.args, self.nicks.join(", "))
-            }
-            ArgKind::Model => match &self.model {
-                Some(m) => format!(" {} — current: {m}", spec.args),
-                None => format!(" {} — overrides the current provider's model", spec.args),
-            },
-            ArgKind::Session => format!(" {} — TAB lists stored sessions", spec.args),
-            ArgKind::Toggle => format!(
-                " {} — now {}",
-                spec.args,
-                if self.yolo { "on" } else { "off" }
-            ),
-            ArgKind::Permission => format!(" {} — one of: read-only, edit, yolo", spec.args),
-            ArgKind::Flag => format!(" {}", spec.args),
-            _ => format!(" {}", spec.args),
-        })
-    }
-}
-
-impl Highlighter for SlashHelper {
-    /// Cyan command word on slash lines; plain text otherwise.
-    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
-        if !line.starts_with('/') {
-            return Cow::Borrowed(line);
-        }
-        let end = line.find(' ').unwrap_or(line.len());
-        Cow::Owned(format!("{CYAN}{}{RESET}{}", &line[..end], &line[end..]))
-    }
-
-    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
-        Cow::Owned(format!("{DIM}{hint}{RESET}"))
-    }
-
-    fn highlight_char(&self, line: &str, _pos: usize, _kind: CmdKind) -> bool {
-        line.starts_with('/')
-    }
-}
-
-impl Validator for SlashHelper {}
-
-// Marker impl: `Helper` is just the Completer+Hinter+Highlighter+Validator
-// bundle and is NOT auto-derived — every custom helper needs this line.
-impl Helper for SlashHelper {}
-
-// ---------------------------------------------------------------------------
-// Loop state
-// ---------------------------------------------------------------------------
-
-/// Everything slash-commands may mutate across agent rebuilds.
-pub struct ChatState {
-    cfg: Config,
-    /// Provider nick; `None` = follow config precedence.
-    provider: Option<String>,
-    model: Option<String>,
-    /// Cached `/model` candidates for the current provider (bare `/model` and
-    /// TAB completion share this).
-    models: Vec<String>,
-    mode: crate::tools::PermissionMode,
-    session_name: String,
-}
-
-impl Clone for ChatState {
-    fn clone(&self) -> Self {
-        Self {
-            cfg: self.cfg.clone(),
-            provider: self.provider.clone(),
-            model: self.model.clone(),
-            models: self.models.clone(),
-            mode: self.mode,
-            session_name: self.session_name.clone(),
-        }
-    }
-}
-
-impl ChatState {
-    pub fn new(
-        cfg: Config,
-        provider: Option<String>,
-        model: Option<String>,
-        mode: crate::tools::PermissionMode,
-        session_name: String,
-    ) -> Self {
-        let models = match cfg
-            .resolve(provider.as_deref(), model.as_deref())
-            .ok()
-            .map(|r| r.nick)
-        {
-            Some(nick) => model_catalog_static(&cfg, &nick, model.as_deref()),
-            None => Vec::new(),
-        };
-        Self {
-            cfg,
-            provider,
-            model,
-            models,
-            mode,
-            session_name,
-        }
-    }
-
-    /// (/new, /clear) points future auto-saves at a different session file.
-    pub fn session_name_mut(&mut self) -> &mut String {
-        &mut self.session_name
-    }
-
-    /// Initial build (once at startup): fresh tool registry + MCP servers.
-    async fn rebuild(&self) -> anyhow::Result<LiveAgent> {
-        Agent::default_cli_mode(
-            &self.cfg,
-            self.provider.as_deref(),
-            self.model.as_deref(),
-            self.mode,
-        )
-        .await
-        .map(|agent| LiveAgent { agent })
-    }
-
-    /// Switch provider/model around the live agent: same tool registry (no MCP
-    /// re-handshake) with the new provider/model/permission.
-    async fn rebuild_from(&self, live: &LiveAgent) -> anyhow::Result<LiveAgent> {
-        let approver = super::approver(self.mode == crate::tools::PermissionMode::Yolo);
-        live.agent
-            .rebuilt_with(
-                &self.cfg,
-                self.provider.as_deref(),
-                self.model.as_deref(),
-                approver,
-                self.mode,
-            )
-            .await
-            .map(|agent| LiveAgent { agent })
-    }
-}
-
-/// A live agent plus the metadata slash-commands display.
-struct LiveAgent {
-    agent: Agent,
-}
-
-impl LiveAgent {
-    fn describe(&self) -> String {
-        self.agent.provider().describe()
-    }
-    fn history(&self) -> &History {
-        &self.agent.history
-    }
-}
-
 /// Turn a user-supplied topic into a safe file/stem name:
 /// keep letters/digits (incl. CJK), spaces→`-`, drops filesystem-hostile
 /// chars, trims to 32 chars, falls back to `""` when nothing survives.
@@ -1417,459 +1124,6 @@ fn pick_session_name(topic: Option<&str>) -> String {
         n += 2;
     }
     name
-}
-
-/// Trailing-backslash continuation: `Some(text_without_backslash)` when the
-/// line ends with `\` (logical-line join request, shell style). A lone `\`
-/// still counts so a purely-continued block can't sneak an empty task in.
-fn strip_continuation(line: &str) -> Option<&str> {
-    let trimmed_end = line.trim_end();
-    let body = trimmed_end.strip_suffix('\\')?;
-    Some(body.trim_end())
-}
-
-/// Load a stored session into the live agent, keeping the current system
-/// prompt when the file has none. Shared by the startup `--resume` path
-/// and the `/resume` command.
-fn load_session(live: &mut LiveAgent, name: &str) -> Result<usize, String> {
-    match session::load(name) {
-        Ok(f) => {
-            let count = f.messages.len();
-            let sys = f.system.or_else(|| live.history().system.clone());
-            live.agent.history = History::new(sys);
-            live.agent.history.msgs = f.messages;
-            Ok(count)
-        }
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-/// Run the interactive loop; returns the process exit code.
-pub async fn chat_loop(
-    cfg: Config,
-    provider: Option<String>,
-    model: Option<String>,
-    mode: crate::tools::PermissionMode,
-    topic: Option<String>,
-    resume: Option<String>,
-) -> anyhow::Result<u8> {
-    // explicit --resume wins; otherwise a fresh named session from the topic
-    let session_name = match resume.as_deref() {
-        Some(name) => session::resolve(name).unwrap_or_else(|| name.to_string()),
-        None => pick_session_name(topic.as_deref()),
-    };
-    let mut state = ChatState::new(cfg, provider, model, mode, session_name.clone());
-    let mut live = state.rebuild().await?;
-
-    if let Some(name) = &resume {
-        match session::resolve(name) {
-            Some(n) => match load_session(&mut live, &n) {
-                Ok(count) => println!("{DIM}resumed `{n}` ({count} messages){RESET}"),
-                Err(e) => println!("{YELLOW}cannot resume `{n}`: {e}{RESET}"),
-            },
-            None => println!(
-                "{YELLOW}no stored session matches `{name}` — starting a NEW session named `{name}`{RESET}"
-            ),
-        }
-    }
-    let banner_provider = live.describe();
-    println!(
-        "{CYAN}kazi{RESET} v{} — {banner_provider}{DIM}\nsession: {}   mode: {} — /permission to change{RESET}\n{DIM}{}{RESET}",
-        env!("CARGO_PKG_VERSION"),
-        state.session_name,
-        state.mode.as_str(),
-        help_text().trim_end()
-    );
-
-    let rl_cfg = RlConfig::builder()
-        .completion_type(CompletionType::List)
-        .build();
-    let mut rl: Editor<SlashHelper, DefaultHistory> = Editor::with_config(rl_cfg)?;
-    // shared, persisted history: ↑ after a restart recalls the last tasks
-    for entry in load_input_history() {
-        let _ = rl.add_history_entry(&entry);
-    }
-    rl.set_helper(Some(SlashHelper {
-        nicks: state.cfg.nicks(),
-        model: state.model.clone(),
-        models: state.models.clone(),
-        yolo: state.mode == crate::tools::PermissionMode::Yolo,
-    }));
-
-    loop {
-        // the mode rides in the prompt: a `--yolo` session must never look
-        // like a prompting one
-        let prompt = match state.mode {
-            crate::tools::PermissionMode::ReadOnly => "kazi[ro]> ",
-            crate::tools::PermissionMode::Yolo => "kazi[yolo]> ",
-            crate::tools::PermissionMode::Edit => "kazi> ",
-        };
-        let line = match rl.readline(prompt) {
-            Ok(l) => l,
-            Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
-            Err(e) => {
-                println!("{YELLOW}input error: {e}{RESET}");
-                break;
-            }
-        };
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-
-        // Continuation lines: a trailing backslash swallows the newline and
-        // keeps reading; history stores the JOINED text so ↑ recalls the
-        // whole logical line.
-        let mut line = line;
-        while let Some(without_escape) = strip_continuation(&line) {
-            let next = match rl.readline("kazi… ") {
-                Ok(l) => l,
-                Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
-                    // abort the entry entirely — nothing half-submitted
-                    println!("{DIM}(input cancelled){RESET}");
-                    line = String::new();
-                    break;
-                }
-                Err(e) => {
-                    println!("{YELLOW}input error: {e}{RESET}");
-                    line = String::new();
-                    break;
-                }
-            };
-            let next = next.trim();
-            if next.is_empty() {
-                line = without_escape.to_string();
-                break;
-            }
-            line = format!("{without_escape}\n{next}");
-        }
-        if line.is_empty() {
-            continue;
-        }
-        let _ = rl.add_history_entry(&line);
-        remember_input(&line);
-
-        if line.starts_with('/') {
-            // pass the full line (with '/') — match arms key on the slash form
-            if handle_command(&line, &mut state, &mut live).await.is_exit() {
-                break;
-            }
-            // keep completion hints honest with whatever the command changed
-            if let Some(h) = rl.helper_mut() {
-                h.yolo = state.mode == crate::tools::PermissionMode::Yolo;
-                h.model = state.model.clone();
-                h.models = state.models.clone();
-                h.nicks = state.cfg.nicks();
-            }
-            continue;
-        }
-
-        // A real task: expand @file references, stream it, then auto-save.
-        println!();
-        let task = crate::agent::expand_file_refs(&line, &live.agent.ctx.cwd);
-        match live.agent.run_task(&task, |e| render_event(&e)).await {
-            Ok(_) => {
-                println!();
-                let _ = session::save(
-                    &state.session_name,
-                    live.history().system.as_deref(),
-                    &live.history().msgs,
-                );
-            }
-            Err(AgentError::RoundsExceeded(r)) => {
-                println!("\n{YELLOW}stopped after {r} rounds — narrow the task or raise agent.max_rounds{RESET}");
-                let _ = session::save(
-                    &state.session_name,
-                    live.history().system.as_deref(),
-                    &live.history().msgs,
-                );
-            }
-            Err(AgentError::Provider(e)) => {
-                let text = live.agent.error_text(&AgentError::Provider(e));
-                println!("\n{RED}{text}{RESET}");
-                let _ = session::save(
-                    &state.session_name,
-                    live.history().system.as_deref(),
-                    &live.history().msgs,
-                );
-            }
-            Err(AgentError::Cancelled) => {
-                println!("\n{DIM}cancelled{RESET}");
-                let _ = session::save(
-                    &state.session_name,
-                    live.history().system.as_deref(),
-                    &live.history().msgs,
-                );
-            }
-        }
-    }
-
-    // empty sessions (no messages) never touch the disk
-    if live.history().msgs_len() == 0 {
-        return Ok(0);
-    }
-    let _ = session::save(
-        &state.session_name,
-        live.history().system.as_deref(),
-        &live.history().msgs,
-    );
-    println!("{DIM}session saved -> {}{RESET}", state.session_name);
-    Ok(0)
-}
-
-enum Flow {
-    Continue,
-    Exit,
-}
-
-impl Flow {
-    fn is_exit(&self) -> bool {
-        matches!(self, Flow::Exit)
-    }
-}
-
-async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) -> Flow {
-    let verb = cmd.split_once(' ').map(|(a, _)| a).unwrap_or(cmd);
-    let arg = cmd
-        .split_once(' ')
-        .map(|(_, b)| b.trim())
-        .unwrap_or("")
-        .to_string();
-    // `/Undo` must behave like `/undo`: the table is lowercase
-    let verb_key = verb.to_ascii_lowercase();
-    // a half-typed command (`/mod`) completes to its unique match: Enter means
-    // "run the one I clearly meant"
-    let verb_key = match spec_of(&verb_key) {
-        Some(_) => verb_key,
-        None => unique_prefix_command(&verb_key).unwrap_or(verb_key),
-    };
-
-    // `/undo 3` and friends: explain instead of silently ignoring the argument
-    if let Some(usage) = no_arg_violation(&verb_key, &arg) {
-        println!("{YELLOW}{usage}{RESET}");
-        return Flow::Continue;
-    }
-
-    match (verb_key.as_str(), arg.as_str()) {
-        ("/help", _) => println!("{}", help_text()),
-        ("/undo", _) => println!("{}", undo_text(&live.agent)),
-        ("/context", _) => println!("{}", context_report(&live.agent)),
-        ("/exit", _) | ("/quit", _) => return Flow::Exit,
-        ("/clear", _) => {
-            let (name, note) = start_new_session(&mut live.agent, None);
-            *state.session_name_mut() = name;
-            println!("{GREEN}history cleared{RESET} — {note}");
-        }
-        ("/new", topic) => {
-            let (name, note) = start_new_session(
-                &mut live.agent,
-                if topic.is_empty() { None } else { Some(topic) },
-            );
-            *state.session_name_mut() = name;
-            println!("{note}");
-        }
-        ("/compact", arg) => {
-            let force = match arg {
-                "" => false,
-                "force" | "--force" | "f" => true,
-                _ => {
-                    println!(
-                        "{YELLOW}{}{RESET}",
-                        usage_line(spec_of("/compact").unwrap())
-                    );
-                    return Flow::Continue;
-                }
-            };
-            println!("{}", compact_text(&mut live.agent, force).await);
-        }
-        ("/status", _) => println!("{}", status_text(&live.agent)),
-        ("/last", arg) => match parse_back(arg) {
-            Some(back) => println!("{}", last_tool_text(&live.agent, back)),
-            None => println!("{YELLOW}{}{RESET}", usage_line(spec_of("/last").unwrap())),
-        },
-        ("/auth", _) => println!("{}", auth_report(&live.agent, &state.cfg)),
-        ("/tools", _) => println!("{}", live.agent.registry().catalog()),
-        ("/resume", prefix) => {
-            if prefix.is_empty() {
-                println!("{}", sessions_text());
-            } else {
-                // resolve before printing: auto-save must follow the session
-                // we just loaded, not the one this chat started in
-                let (name, text) = resume_text(&mut live.agent, prefix).await;
-                if let Some(name) = name {
-                    *state.session_name_mut() = name;
-                }
-                println!("{text}");
-            }
-        }
-        ("/provider", arg) => {
-            if arg.is_empty() {
-                let current = effective_nick(&state.cfg, &state.provider, &state.model);
-                println!("{}", providers_text(&state.cfg, current.as_deref()));
-            } else {
-                let nicks = state.cfg.nicks();
-                let nick = match listed_index(arg, nicks.len()) {
-                    Some(i) => nicks[i].clone(),
-                    None => arg.to_string(),
-                };
-                let mut next = state.clone();
-                next.provider = Some(nick);
-                // a model override from the old provider may not exist on the
-                // new one — drop it and the now-stale candidate cache
-                next.model = None;
-                next.models.clear();
-                match next.rebuild_from(live).await {
-                    Ok(mut new) => {
-                        // a provider switch changes the wire, not the conversation
-                        new.agent.history =
-                            std::mem::replace(&mut live.agent.history, History::new(None));
-                        println!(
-                            "switched -> {}{DIM}\n(/model picks provider and model in one step){RESET}",
-                            new.describe()
-                        );
-                        *state = next;
-                        *live = new;
-                    }
-                    Err(e) => println!("{RED}switch failed: {e}{RESET}"),
-                }
-            }
-        }
-        ("/model", arg) => {
-            if arg.is_empty() {
-                let nick = effective_nick(&state.cfg, &state.provider, &state.model);
-                let current = state.model.clone().or_else(|| {
-                    state
-                        .cfg
-                        .resolve(state.provider.as_deref(), None)
-                        .ok()
-                        .map(|r| r.settings.model)
-                });
-                println!("{DIM}checking the configured providers for their model lists…{RESET}");
-                state.models =
-                    all_model_choices(&state.cfg, nick.as_deref(), current.as_deref()).await;
-                let current_row = match (nick.as_deref(), current.as_deref()) {
-                    (Some(n), Some(m)) => Some(format!("{n}/{m}")),
-                    _ => None,
-                };
-                println!(
-                    "{}",
-                    models_text(
-                        "providers / models (one step: pick a row to switch both)",
-                        &state.models,
-                        current_row.as_deref()
-                    )
-                );
-            } else {
-                // a number indexes the list bare `/model` printed; a bad number
-                // is an error, never a literal model name
-                let chosen = match resolve_model_arg(arg, &state.models) {
-                    Ok(m) => m,
-                    Err(msg) => {
-                        println!("{YELLOW}{msg}{RESET}");
-                        return Flow::Continue;
-                    }
-                };
-                // a combined `nick/model` row switches provider AND model
-                let (provider, model) = match chosen.split_once('/') {
-                    Some((nick, m)) if state.cfg.providers.contains_key(nick) => {
-                        (Some(nick.to_string()), m.to_string())
-                    }
-                    _ => (state.provider.clone(), chosen.clone()),
-                };
-                let mut next = state.clone();
-                next.provider = provider;
-                next.model = Some(model);
-                match next.rebuild_from(live).await {
-                    Ok(mut new) => {
-                        // Dry-run before committing: a wrong model name only
-                        // fails at the next API call otherwise (HTTP 4xx with
-                        // context now gone). One tiny probe round verifies the
-                        // model exists on this provider; failure keeps the
-                        // current live agent untouched.
-                        match new.agent.probe().await {
-                            Ok(()) => {
-                                // keep the conversation: switching the model
-                                // must not silently start from scratch
-                                new.agent.history = std::mem::replace(
-                                    &mut live.agent.history,
-                                    History::new(None),
-                                );
-                                println!("switched -> {}", new.describe());
-                                *state = next;
-                                *live = new;
-                            }
-                            Err(e) => println!(
-                                "{RED}model rejected by provider, staying on {}{RESET}\n{DIM}{e}{RESET}",
-                                live.describe()
-                            ),
-                        }
-                    }
-                    Err(e) => println!("{RED}switch failed: {e}{RESET}"),
-                }
-            }
-        }
-        ("/yolo", on) => {
-            use crate::tools::PermissionMode;
-            let next = match on {
-                "" => {
-                    if state.mode == PermissionMode::Yolo {
-                        PermissionMode::Edit
-                    } else {
-                        PermissionMode::Yolo
-                    }
-                }
-                "on" | "1" | "true" => PermissionMode::Yolo,
-                "off" | "0" | "false" => PermissionMode::Edit,
-                _ => {
-                    println!("{YELLOW}{}{RESET}", usage_line(spec_of("/yolo").unwrap()));
-                    return Flow::Continue;
-                }
-            };
-            state.mode = next;
-            // flip the shared permission cell in place: rebuilding the agent
-            // here used to throw the whole conversation away
-            live.agent.ctx.permission.set(next);
-            println!(
-                "permission mode: {GREEN}{}{RESET} ({})",
-                state.mode.as_str(),
-                if state.mode == PermissionMode::Yolo {
-                    "run_command executes without prompts"
-                } else {
-                    "run_command asks for approval"
-                }
-            );
-        }
-        ("/permission", arg) => {
-            use crate::tools::PermissionMode;
-            let next = if arg.is_empty() {
-                None
-            } else {
-                match PermissionMode::parse(arg) {
-                    Some(m) => Some(m),
-                    None => {
-                        println!(
-                            "{YELLOW}{}{RESET}",
-                            usage_line(spec_of("/permission").unwrap())
-                        );
-                        return Flow::Continue;
-                    }
-                }
-            };
-            match next {
-                None => println!(
-                    "permission mode: {}(read-only = inspect only, edit = writes allowed, yolo = no prompts)",
-                    state.mode.as_str()
-                ),
-                Some(m) => {
-                    state.mode = m;
-                    live.agent.ctx.permission.set(m); // in place: keep the history
-                    println!("permission mode -> {}", state.mode.as_str());
-                }
-            }
-        }
-        _ => println!("{YELLOW}{}{RESET}", unknown_command_text(verb)),
-    }
-    Flow::Continue
 }
 
 #[cfg(test)]
@@ -1924,15 +1178,6 @@ mod tests {
         assert!(complete_at_path("no refs here", 12).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn partial_commands_complete_to_their_unique_match() {
-        assert_eq!(unique_prefix_command("/mod").as_deref(), Some("/model"));
-        assert_eq!(unique_prefix_command("/resu").as_deref(), Some("/resume"));
-        // ambiguous or unknown prefixes stay with the caller to explain
-        assert_eq!(unique_prefix_command("/co"), None);
-        assert_eq!(unique_prefix_command("/zzz"), None);
     }
 
     #[tokio::test]
@@ -2033,23 +1278,6 @@ mod tests {
     }
 
     #[test]
-    fn continuation_backslash_detected() {
-        assert_eq!(
-            strip_continuation("refactor this \\"),
-            Some("refactor this")
-        );
-        assert_eq!(
-            strip_continuation("a\\\\b"),
-            None,
-            "escaped backslash, not EOL"
-        );
-        // terminal backslash with spaces before it still joins
-        assert_eq!(strip_continuation("x  \\  "), Some("x"));
-        assert_eq!(strip_continuation("plain"), None);
-        assert_eq!(strip_continuation("\\"), Some(""));
-    }
-
-    #[test]
     fn table_feeds_complete_help() {
         let h = help_text();
         for c in COMMANDS {
@@ -2075,100 +1303,6 @@ mod tests {
         assert!(near.contains(&"/resume"));
         // far-away typo → no noise
         assert!(did_you_mean("/zzzzzzzzzz").is_empty());
-    }
-
-    #[test]
-    fn completions_cover_verbs_then_args() {
-        let helper = SlashHelper {
-            nicks: vec!["deepseek".into(), "ollama".into()],
-            model: None,
-            models: vec!["deepseek-chat".into(), "deepseek-reasoner".into()],
-            yolo: false,
-        };
-        // verb completion at position 0
-        let (start, cands) = helper.completions("/res", 4).expect("in scope");
-        assert_eq!(start, 0);
-        assert_eq!(cands[0].replacement, "/resume");
-        // arg completion: provider nicks after "/provider "
-        let (start, cands) = helper.completions("/provider de", 12).expect("in scope");
-        assert_eq!(start, 10);
-        assert_eq!(cands[0].replacement, "deepseek");
-        // TAB on a known arg kind lists everything even with empty token
-        let (_, cands) = helper.completions("/provider ", 10).expect("in scope");
-        assert_eq!(cands.len(), 2);
-        // model completion from the cached candidates
-        let (start, cands) = helper
-            .completions("/model deepseek-", 16)
-            .expect("in scope");
-        assert_eq!(start, 7);
-        assert_eq!(cands.len(), 2);
-        // toggle offers on/off
-        let (_, cands) = helper.completions("/yolo o", 7).expect("in scope");
-        assert_eq!(cands.len(), 2);
-        // non-slash line: out of scope
-        assert!(helper.completions("list files", 10).is_none());
-        // no model candidates cached → empty, still in scope
-        let bare = SlashHelper {
-            nicks: vec![],
-            model: None,
-            models: vec![],
-            yolo: false,
-        };
-        let (_, cands) = bare.completions("/model m", 8).expect("in scope");
-        assert!(cands.is_empty());
-    }
-
-    #[test]
-    fn hints_show_argument_picture_and_options() {
-        let helper = SlashHelper {
-            nicks: vec!["a".into()],
-            model: Some("m1".into()),
-            models: vec![],
-            yolo: true,
-        };
-        let history = DefaultHistory::new();
-        let ctx = rustyline::Context::new(&history);
-        let hint = helper.hint("/model", 6, &ctx).expect("hint");
-        assert!(hint.contains("<name|#>") && hint.contains("m1"));
-        let hint = helper
-            .hint("/provider ", 10, &ctx)
-            .expect("hint after space");
-        assert!(hint.contains("one of: a"));
-        // mid-line cursor or past the verb → silent
-        assert!(helper.hint("/model gpt", 10, &ctx).is_none());
-        assert!(helper.hint("plain text", 10, &ctx).is_none());
-    }
-
-    #[test]
-    fn listed_index_selects_by_number_or_name() {
-        assert_eq!(listed_index("2", 3), Some(1));
-        assert_eq!(listed_index("1", 1), Some(0));
-        assert_eq!(listed_index("0", 3), None, "1-based: 0 is not an index");
-        assert_eq!(listed_index("4", 3), None, "out of range → literal name");
-        assert_eq!(listed_index("gpt-4o", 3), None);
-        assert_eq!(listed_index("", 3), None);
-    }
-
-    #[test]
-    fn models_text_marks_current_and_handles_empty() {
-        let models = vec!["a".to_string(), "b".to_string()];
-        let t = models_text("providers / models", &models, Some("b"));
-        assert!(t.contains("providers / models:"), "{t}");
-        assert!(t.contains("1) a"), "{t}");
-        assert!(t.contains("2) b  <- current"), "{t}");
-        assert!(models_text("x", &[], None).contains("no model candidates"));
-    }
-
-    #[test]
-    fn model_catalog_static_merges_config_and_defaults() {
-        let cfg: Config = toml::from_str(
-            "[providers.anthropic]\ntype = \"anthropic\"\nmodel = \"claude-sonnet-4-5\"\nmodels = [\"claude-x\"]",
-        )
-        .unwrap();
-        let c = model_catalog_static(&cfg, "anthropic", Some("claude-sonnet-4-5"));
-        assert_eq!(c[0], "claude-sonnet-4-5", "current first");
-        assert!(c.contains(&"claude-x".to_string()), "config list merged");
-        assert!(c.len() > 2, "built-in fallback merged too: {c:?}");
     }
 
     #[test]

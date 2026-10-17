@@ -13,8 +13,8 @@
 //! the model can self-correct on its next round instead of the loop dying.
 //! Rounds are capped to guarantee termination.
 
+pub mod console;
 pub mod context;
-pub mod repl;
 pub mod session;
 pub mod tui;
 
@@ -34,13 +34,19 @@ pub const DEFAULT_MAX_ROUNDS: u32 = 30;
 pub const DEFAULT_MAX_CONTEXT_TOKENS: u64 = 60_000;
 /// Cap on in-one-round concurrent tool executions.
 pub const DEFAULT_MAX_PARALLEL: usize = 4;
+/// Tool text embedded in `ToolEnd` events. The model still receives the full
+/// (output-limit-capped) result; this only bounds what a UI/JSON stream keeps.
+pub const MAX_EVENT_OUTPUT: usize = 32_000;
+/// Don't try to diff files bigger than this (they are all `output_limit`
+/// guarded anyway; this keeps the event loop from reading a huge file).
+const MAX_DIFF_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Approver selection: terminal prompt by default, blanket yes with `--yolo`.
 fn approver(yolo: bool) -> Arc<dyn crate::tools::Approver> {
     if yolo {
         Arc::new(crate::tools::AutoApprover)
     } else {
-        Arc::new(repl::StdinApprover::default())
+        Arc::new(console::StdinApprover::default())
     }
 }
 
@@ -156,6 +162,39 @@ async fn run_feedback(cmd: &str, ctx: &crate::tools::ToolCtx) -> (bool, String, 
     (ok, preview, body)
 }
 
+/// Read a workspace file for diffing: text only, size-capped, silently absent
+/// when the file does not exist (a new file diffs against "").
+fn read_text_for_diff(cwd: &std::path::Path, rel: &str) -> Option<String> {
+    let path = cwd.join(rel);
+    let meta = std::fs::metadata(&path).ok()?;
+    if meta.len() > MAX_DIFF_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    if bytes.iter().take(8192).any(|b| *b == 0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Unified diff produced by one successful edit call, if the file exists and
+/// its content actually changed.
+fn diff_for(cwd: &std::path::Path, call: &ToolCall, before: Option<&str>) -> Option<String> {
+    let rel = crate::tools::edited_path(call)?;
+    let after = read_text_for_diff(cwd, rel)?;
+    crate::diff::unified(before.unwrap_or(""), &after, rel, 3).map(|d| d.text)
+}
+
+/// Tool text embedded in an event, capped (the model still sees everything).
+fn event_output(text: &str) -> String {
+    if text.chars().count() <= MAX_EVENT_OUTPUT {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(MAX_EVENT_OUTPUT).collect();
+    out.push_str("\n...[event truncated]");
+    out
+}
+
 /// Sub-agent factory backing the `delegate` tool: same provider, a fresh
 /// (short) history, and an isolated tool context.
 pub struct SubAgentRunnerImpl {
@@ -258,16 +297,31 @@ pub enum AgentError {
 pub enum AgentEvent {
     /// Assistant text fragment, in order.
     TextDelta { text: String },
-    /// A tool call is starting.
-    ToolStart { name: String },
+    /// A tool call is starting. `id` matches the wire call id, so parallel
+    /// calls never get their cards crossed; `summary` is a one-line digest of
+    /// the arguments (path, command, query...).
+    ToolStart {
+        id: String,
+        name: String,
+        summary: String,
+    },
     /// The model's plan checklist changed: `(content, status)` pairs, in
     /// order. Emitted after a tool round when `todo_write` ran.
     TodosUpdated { items: Vec<(String, String)> },
-    /// Tool call finished: error flag + one-line preview of its output.
+    /// Tool call finished: error flag, one-line preview, the full (capped)
+    /// output for an expanded UI card, an optional unified diff when the tool
+    /// rewrote a file, and how long it took.
     ToolEnd {
+        id: String,
         name: String,
         is_error: bool,
         preview: String,
+        /// Full tool text, capped at [`MAX_EVENT_OUTPUT`] chars.
+        output: String,
+        /// Unified diff of the file this call rewrote (`write_file`,
+        /// `apply_patch`), absent otherwise or when nothing changed.
+        diff: Option<String>,
+        elapsed_ms: u64,
     },
     /// Auto-compact kicking in between rounds (proactive, at 80% budget).
     AutoCompactStarted,
@@ -775,12 +829,24 @@ impl Agent {
                 calls.clone(),
             ));
 
-            let mut verdicts: Vec<Option<ToolOutcome>> = vec![None; calls.len()];
+            let mut verdicts: Vec<Option<(ToolOutcome, u64)>> = vec![None; calls.len()];
+            // Pre-edit content of every file this round is about to rewrite.
+            // Read before dispatch (and before approval) so the UI can show a
+            // real diff instead of just "wrote N bytes".
+            let before: Vec<Option<String>> = calls
+                .iter()
+                .map(|c| {
+                    crate::tools::edited_path(c)
+                        .and_then(|rel| read_text_for_diff(&self.ctx.cwd, rel))
+                })
+                .collect();
             let mut pending: Vec<(usize, ToolCall)> = Vec::new();
             for (i, call) in calls.iter().enumerate() {
                 if let Some(summary) = self.registry.approval_summary(call, &self.ctx) {
                     on_event(AgentEvent::ToolStart {
+                        id: call.id.clone(),
                         name: call.name.clone(),
+                        summary: crate::tools::call_summary(call),
                     });
                     match self.ctx.approver.decide(&call.name, &summary).await {
                         crate::tools::Decision::Deny(reason) => {
@@ -788,11 +854,15 @@ impl Agent {
                                 reason.as_deref(),
                             ));
                             on_event(AgentEvent::ToolEnd {
+                                id: call.id.clone(),
                                 name: call.name.clone(),
                                 is_error: true,
                                 preview: denied.first_line_preview(160),
+                                output: event_output(&denied.text),
+                                diff: None,
+                                elapsed_ms: 0,
                             });
-                            verdicts[i] = Some(denied);
+                            verdicts[i] = Some((denied, 0));
                         }
                         // Allow / AllowSession (the approver already recorded
                         // session memory) both run the call now.
@@ -800,7 +870,9 @@ impl Agent {
                     }
                 } else {
                     on_event(AgentEvent::ToolStart {
+                        id: call.id.clone(),
                         name: call.name.clone(),
+                        summary: crate::tools::call_summary(call),
                     });
                     pending.push((i, call.clone()));
                 }
@@ -816,8 +888,9 @@ impl Agent {
                 let ctx = ctx.clone();
                 set.spawn(async move {
                     let _permit = permit.acquire_owned().await.expect("semaphore open");
+                    let started = std::time::Instant::now();
                     let outcome = registry.execute(&call, &ctx).await;
-                    (i, outcome)
+                    (i, outcome, started.elapsed().as_millis() as u64)
                 });
             }
             // Esc must bite while a tool runs too: poll the flag and abort the
@@ -827,13 +900,22 @@ impl Agent {
             while remaining > 0 {
                 tokio::select! {
                     joined = set.join_next() => match joined {
-                        Some(Ok((i, outcome))) => {
+                        Some(Ok((i, outcome, elapsed_ms))) => {
+                            let diff = if outcome.is_error {
+                                None
+                            } else {
+                                diff_for(&self.ctx.cwd, &calls[i], before[i].as_deref())
+                            };
                             on_event(AgentEvent::ToolEnd {
+                                id: calls[i].id.clone(),
                                 name: calls[i].name.clone(),
                                 is_error: outcome.is_error,
                                 preview: outcome.first_line_preview(160),
+                                output: event_output(&outcome.text),
+                                diff,
+                                elapsed_ms,
                             });
-                            verdicts[i] = Some(outcome);
+                            verdicts[i] = Some((outcome, elapsed_ms));
                             remaining -= 1;
                         }
                         Some(Err(_)) => remaining -= 1, // panicked tool task
@@ -850,12 +932,16 @@ impl Agent {
 
             // did this round change files? (before outcomes are taken)
             let wrote = calls.iter().enumerate().any(|(i, c)| {
-                matches!(c.name.as_str(), "write_file" | "apply_patch")
-                    && verdicts[i].as_ref().map(|o| !o.is_error).unwrap_or(false)
+                crate::tools::is_edit_tool(&c.name)
+                    && verdicts[i]
+                        .as_ref()
+                        .map(|(o, _)| !o.is_error)
+                        .unwrap_or(false)
             });
 
             for (i, call) in calls.iter().enumerate() {
-                let outcome = std::mem::take(&mut verdicts[i]).expect("every call gets an outcome");
+                let (outcome, _) =
+                    std::mem::take(&mut verdicts[i]).expect("every call gets an outcome");
                 self.history.push(Message::tool_result(
                     &call.id,
                     outcome.text,
@@ -1091,13 +1177,73 @@ mod tests {
         // RoundDone (new progress event) may interleave; match presence, not position
         assert!(evs
             .iter()
-            .any(|e| matches!(e, AgentEvent::ToolStart { ref name } if name == "read_file")));
+            .any(|e| matches!(e, AgentEvent::ToolStart { ref name, .. } if name == "read_file")));
         assert!(evs.iter().any(
             |e| matches!(e, AgentEvent::ToolEnd { is_error: false, ref name, .. } if name == "read_file")
         ));
         assert!(evs
             .iter()
             .any(|e| matches!(e, AgentEvent::TextDelta { text } if text.contains("note says"))));
+    }
+
+    #[tokio::test]
+    async fn edit_events_carry_summary_output_and_diff() {
+        let dir = scratch_named("diff-round");
+        std::fs::write(dir.join("x.txt"), "v1\nkeep\n").unwrap();
+        let script = vec![
+            LlmResponse {
+                tool_calls: vec![ToolCall {
+                    id: "e1".into(),
+                    name: "write_file".into(),
+                    arguments: json!({"path": "x.txt", "content": "v2\nkeep\n"}),
+                }],
+                stop_reason: Some("tool_use".into()),
+                usage: Usage::default(),
+                content: None,
+            },
+            LlmResponse {
+                content: Some("done".into()),
+                ..Default::default()
+            },
+        ];
+        let mut ctx = test_ctx();
+        ctx.cwd = dir.clone();
+        let mut a = agent_with_ctx(script, ctx);
+        let events = Arc::new(std::sync::Mutex::new(Vec::<AgentEvent>::new()));
+        let sink = events.clone();
+        a.run_task("rewrite x.txt", move |e| sink.lock().unwrap().push(e))
+            .await
+            .unwrap();
+        let evs = events.lock().unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolStart { id, name, summary }
+                    if id == "e1" && name == "write_file" && summary.contains("x.txt")
+            )),
+            "start event: {evs:?}"
+        );
+        let end = evs
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolEnd {
+                    id,
+                    output,
+                    diff,
+                    is_error,
+                    elapsed_ms,
+                    ..
+                } if id == "e1" => Some((output, diff, is_error, elapsed_ms)),
+                _ => None,
+            })
+            .expect("tool end event");
+        assert!(!*end.2, "the write succeeded");
+        assert!(end.0.contains("wrote"), "output: {}", end.0);
+        let diff = end.1.as_deref().expect("a diff for the rewritten file");
+        assert!(diff.contains("-v1"), "diff: {diff}");
+        assert!(diff.contains("+v2"), "diff: {diff}");
+        assert!(diff.contains(" keep"), "context line: {diff}");
+        let _ = *end.3; // duration is recorded (may be 0 on a fast disk)
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 # kazi 架构与原理
 
 > 这份文档回答一个的问题:**一个 AI Agent 到底是什么,它是怎么跑起来的**。
-> kazi 的全部实现 (~3k 行 Rust) 都为了把答案讲清楚,不用任何 agent 框架——
+> kazi 的全部实现都为了把答案讲清楚,不用任何 agent 框架——
 > 你读完本文 + 对照源码,应该能自己写一个。
 
 ## 1. Agent 的本质:一个循环
@@ -96,11 +96,11 @@ Ollama 复用前者;`RetryProvider` 直接转发。`/provider`、`/model` 和首
 2. 端点实时返回的模型 id
 3. `llm::default_models(kind)` 的内置回退清单
 
-取候选的入口是 `repl::model_catalog()`(带 ~3s 超时,任何一个来源失败都静默
-退化,离线也能用)。TUI 把列表画成输入框上方的浮层(`tui.rs::draw_picker`,
-方向键移动 + 输入即时过滤 + Enter 选中);行 REPL 打印带编号的列表,用
-`/model 2` 或 `/model <name>` 选择。选择器的候选、编号解析分别是
-`Picker`(纯逻辑,可单测)和 `repl::listed_index()` / `cli::resolve_pick()`。
+取候选的入口是 `console::model_catalog()`(带 ~3s 超时,任何一个来源失败都
+静默退化,离线也能用)。TUI 把列表画成输入框上方的浮层(`tui.rs::draw_picker`,
+方向键移动 + 输入即时过滤 + Enter 选中);`/model <provider>/<model>` 是直接形
+式。候选与参数解析分别是 `Picker`(纯逻辑,可单测)、`console::model_choices_static()`
+/ `console::resolve_model_arg()` / `cli::resolve_pick()`。
 
 ## 3. 流式输出
 
@@ -138,9 +138,9 @@ pub trait Tool: Send + Sync {
 - schema 手写不代码生成——一个工具的自契约只在一个地方
 
 全部注册在 `tools/builtin()`,与模型可见的 catalog 同源:
-`list_dir` / `read_file` (行号分页+二进制拒绝) / `apply_patch` (唯一性
-find-replace) / `write_file` / `run_command` (§5) / `fetch_url` (§8),
-外加由 MCP 服务器注入的工具 (§9)。
+`list_dir` / `glob` (按 `*`/`?`/`**` 找文件) / `read_file` (行号分页+二进制拒绝) /
+`apply_patch` (唯一性 find-replace) / `write_file` / `run_command` (§5) /
+`fetch_url` (§8),外加由 MCP 服务器注入的工具 (§9)。
 
 ## 5. run_command 的安全模型
 
@@ -172,8 +172,8 @@ tool_use 父消息」的历史,单条裁剪会制造幽灵。最新一轮永不�
 ## 7. 会话持久化
 
 `session.rs`: `dirs::data_dir()/kazi/sessions/<name>.json`,
-存 `system + messages`。`--resume <name>` 恢复;REPL 每轮任务后自动保存 (best-effort,
-失败只提示不打断)。
+存 `system + messages`。`--resume <name>` 恢复;TUI chat 每轮任务后自动保存
+(best-effort,失败只提示不打断)。
 
 ## 8. fetch_url 的网络边界
 
@@ -242,7 +242,57 @@ impl Tool for GetWeather {
 
 schema 会自动进入下一轮请求;模型调用它时循环零改动。
 
-## 11. 为什么不用框架
+## 11. TUI:结构化转录 + 渲染管线
+
+旧 TUI 只有 `Vec<(kind, String)>` 的行列表;模型答案里的 markdown、工具输出、
+diff 全被压成一行文本。现在分成**状态**与**渲染**两层:
+
+```text
+AgentEvent ──► Transcript (Entry: User/Assistant/Tool/Notice/Rule)
+                    │  rev++（只有内容变化才失效缓存）
+                    ▼
+   渲染缓存 (rev, width, theme, details) ──► Vec<Line<'static>> + owner[]
+                    │                              │
+        markdown.rs / highlight.rs         鼠标点击命中测试
+                    │                              │
+                    └──────── ratatui Frame ◄──────┘
+```
+
+- **transcript.rs** 是唯一的状态:助手答案是 markdown 原文,工具调用是
+  `ToolCard`(id、参数摘要、状态、完整输出、diff、耗时、是否展开)。流式答案
+  不进缓存(每帧重渲染),冻结部分按 `(rev,width,theme,details)` 缓存,
+  所以滚动/缩放只重排一次。
+- **markdown.rs** 把标题、列表、引用、表格、代码块和内联样式变成带样式的行;
+  换行在这里完成(而不是交给 `Paragraph`),因为滚动位置要按真实屏幕行计算。
+  宽字符按显示宽度处理,未知语法原样保留。
+- **highlight.rs** 是逐行 tokenizer(关键字/字符串/注释/数字/函数/JSON key,
+  含跨行块注释),零依赖。
+- **theme.rs** 把颜色和字形集中管理(`dark`/`light`/`mono`,`KAZI_ASCII`),
+  `Ctrl+T` 或 `[ui] theme` 切换。
+- **overlay.rs** 是模态层:命令面板(模糊匹配)、帮助、会话浏览、转录搜索、
+  provider/model 选择器、审批框。打开时独占键盘,永不占用布局行。
+- 每次绘制把「屏幕行 → Entry 下标」记进 `hit_owner`,鼠标点击据此展开/收起
+  对应的工具卡片。滚动条、上下文仪表、plan 面板、输入框和 footer 都是同一帧
+  布局的一部分;终端过小时按优先级先砍 plan/footer 再砍输入框,绝不越界绘制。
+
+### 事件里的工具信息
+
+为了画出卡片,`AgentEvent` 从「名字 + 一行预览」扩展为:
+
+```rust
+ToolStart { id, name, summary }                 // summary = tools::call_summary()
+ToolEnd   { id, name, is_error, preview,
+            output,      // 完整输出(封顶 32k),供展开查看
+            diff,        // write_file/apply_patch 的 unified diff
+            elapsed_ms }
+```
+
+`id` 是 wire 上的 call id——并行工具因此不会串卡。**diff 在引擎里生成**:
+执行前按 `tools::edited_path(call)` 读旧内容,成功后读新内容,交给
+`src/diff.rs`(去公共前后缀 + LCS,失败退化为整块替换)输出带 `@@` 的 hunk。
+TUI 只负责上色;`kazi run --output json` 也顺带得到全部信息。
+
+## 12. 为什么不用框架
 
 现有的 agent 框架 (LangChain/rig/Swarm…) 提供的是**包装**,购买的是接入速度,
 付出的代价是:层数深了以后,你不知道一次 422 是哪里产生的、流式碎片在哪里被拼坏、

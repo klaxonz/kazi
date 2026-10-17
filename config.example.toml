@@ -12,6 +12,10 @@ provider = "deepseek"
 # max_context_tokens = 60000       # rough budget; oldest non-system turns are dropped
 # max_parallel_tools = 4           # concurrent tool executions within a round
 
+# [ui]
+# theme = "dark"                   # dark | light | mono (the TUI's /theme switches live)
+# details = false                  # start with full tool output expanded (Ctrl+O toggles)
+
 # [mcp]
 # Local MCP (Model Context Protocol) servers; their tools join the catalog as
 # mcp_<server>_<name>, spawned at agent start via stdio:

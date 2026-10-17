@@ -2,8 +2,8 @@
 
 > *kazi* is Swahili for "work" — it works so you don't have to repeat yourself.
 
-**A tiny, from-scratch AI agent for your terminal.** One binary, ~3k lines of Rust,
-no agent framework. It talks to any OpenAI-compatible API (OpenAI, DeepSeek, Kimi,
+**A from-scratch AI agent for your terminal.** One binary, no agent framework.
+It talks to any OpenAI-compatible API (OpenAI, DeepSeek, Kimi,
 Qwen, OpenRouter...), Anthropic Claude, and local Ollama — and can read/write files,
 run shell commands (with your approval), and fetch web pages while doing so.
 
@@ -45,6 +45,10 @@ command that fixes it.
 ```toml
 provider = "deepseek"            # default when --provider is omitted
 
+[ui]
+theme = "dark"                   # dark | light | mono (Ctrl+T / /theme switch live)
+# details = true                 # start with full tool output expanded (Ctrl+O)
+
 [providers.deepseek]
 type = "openai"                  # any OpenAI-compatible endpoint
 base_url = "https://api.deepseek.com/v1"
@@ -83,62 +87,77 @@ allow_commands = ["cargo build", "cargo test", "git status"]  # auto-approved
 
 ## Use
 
-Interactive chat — **full-screen TUI by default** on a terminal (status bar
-with round/token counters, scrolling transcript with live tool activity,
-input stays responsive while a task streams). Pipes and redirections get the
-classic line REPL automatically, so scripts keep working:
+Interactive chat is the **full-screen TUI** and the only chat mode. A real
+terminal (stdin and stdout) is a hard requirement; scripts, pipes and CI use
+`kazi run`, which needs none:
 
 ```sh
-kazi                          # TUI (same as `kazi chat`)
-kazi chat --no-tui            # force the line REPL (streaming text, /commands)
-echo "/status" | kazi         # non-tty → line REPL, scriptable
+kazi                          # TUI chat (same as `kazi chat`)
+kazi run "fix the flaky test" # one task, non-interactive, exit code 0/1/2
 ```
 
-Both share the same engine, sessions, and slash commands (`/compact`,
-`/model`, `/resume`, `/new`, TAB completion, multiline tasks with trailing
-`\`). `--tui` forces the TUI; it falls back gracefully on terminals without
-alternate-screen support.
+Chat and `run` share the same engine and sessions. The TUI is a workspace, not
+a log:
 
-TUI keys: `↑/↓` input history (line navigation inside a multi-line task),
-`Ctrl+J` starts a new line, `←/→ Home/End Ctrl+A/E/U/K/W` line editing,
-`/` opens the command dropdown and `Tab` completes (also `@path` for file
-attachments), `PgUp/PgDn` or the mouse
-wheel to scroll (`Ctrl+Home/End` jump), `Esc` interrupts a running task (and
-quits when idle), `Ctrl+C` quits. Pasting a multi-line block keeps it as one
-task; approval prompts take `y` (once), `a`
-(always this exact command, for the session) or `n`/`Esc` (the line REPL also
-takes a typed reason, which is handed to the model). The TUI runs the
-**same slash commands** as
-the line REPL — `/new`, `/compact`, `/resume`, `/provider`, `/model`,
-`/permission`, `/status`, `/tools`, `/undo`, `/context`, `/last`, `/auth` — so
-there is no
-second-class front-end. `/undo` restores the files the last task changed and
-`/help` prints the table plus the key bindings. Every finished task autosaves,
-so quitting mid-task never costs you the session. `/last [n]` prints the newest
-tool output in full (the transcript only shows a one-line preview), and a live
-spinner with elapsed seconds shows that a task is running, not hung.
+- **Answers are rendered.** Markdown is formatted, fenced code is syntax
+  highlighted (Rust, Python, JS/TS, JSON, TOML, YAML, shell, C/C++, Go, Java,
+  SQL, HTML, CSS), tables become tables, and long lines wrap by display width.
+- **Tool calls are cards.** `glob **/*.rs`, `run_command cargo test`, a status
+  glyph, duration and the tool's real output. Collapsed cards show the first
+  rows; `Ctrl+O` expands everything, `Ctrl+E` the newest card, and **clicking a
+  card** toggles it. `write_file`/`apply_patch` show a coloured unified diff
+  with `+added`/`−removed` counts instead of "wrote N bytes".
+- **A header that answers questions**: permission mode, provider/model,
+  session, and a context gauge with percentage that turns yellow near the
+  budget and red before auto-compaction. A live spinner, elapsed seconds and
+  per-round token counts appear while a task runs.
+- **The input stays yours.** `Enter` while the agent is busy *queues* the
+  follow-up (visible in the footer) and runs it automatically when the task
+  ends. `Ctrl+J` starts a new line, the box grows to six rows, `↑/↓` walks
+  input history (or lines inside a multi-line task), and pasting a block keeps
+  it as one task.
+
+Keys: `Enter` send · `Ctrl+J` newline · `/` command dropdown · `Tab` completes
+(also `@path`) · `Ctrl+K` fuzzy command palette · `Ctrl+F` transcript search ·
+`Ctrl+R` session browser · `Ctrl+O` full tool output · `Ctrl+E` expand newest
+card · `Ctrl+T` cycle theme · `PgUp/PgDn` or the mouse wheel scroll
+(`Ctrl+Home/End` jump) · `Shift+Tab` cycles permission mode · `Esc` closes an
+overlay, clears a half-typed task, interrupts a running one, or quits from an
+empty prompt · `Ctrl+C` quits. Approval prompts take `y` (once), `a` (always
+this exact command, for the session), `n`/`Esc` (deny), or `r` to deny with a
+reason the model can act on. The mouse wheel scrolls and clicking a tool card
+opens it; hold `Shift` while dragging to select text natively.
+
+Slash commands: `/help` (scrollable overlay), `/new`, `/clear`, `/compact`,
+`/resume` (bare opens the session browser), `/sessions`, `/provider`, `/model`,
+`/permission`, `/yolo`, `/status`, `/context`, `/tools`, `/undo`, `/last
+[n]`, `/auth`, `/theme`, `/details`, `/export [path]`, `/copy [all]`, `/retry`,
+`/exit`. Every finished task autosaves, so quitting mid-task never costs you
+the session. `/undo` restores the files the last task changed.
 
 Picking a provider or model never means typing a name from memory:
 
-- **TUI** — bare `/model` opens ONE list of `provider/model` rows (the current
-  pick first, config + built-in candidates immediately, live model lists merged
-  in a moment later), so a
-  single selection switches provider and model together; type to filter, `↑/↓`
-  to move, `Enter` to switch, `Esc` to cancel. Bare `/provider` stays for
-  provider-only switches. Switching keeps the conversation — only the wire
-  changes — and it runs in the background with the spinner visible instead of
-  freezing the screen. `/resume` repoints autosave at the session it loaded.
-- **Line REPL** — bare `/provider` / `/model` print a numbered list; follow up
-  with `/model 2` (by number) or `/model <provider>/<model>` (by name, one
-  step). `/model` also gets TAB completion.
-- Slash commands complete as you type: `Enter` on a half-typed command runs the
-  unique match (`/mod` → `/model`) or the row the dropdown highlights, and an
-  ambiguous prefix (`/co`) lists its candidates.
+- Bare `/model` opens ONE list of `provider/model` rows (the current pick
+  first, config + built-in candidates immediately, live model lists merged
+  in a moment later), so a single selection switches provider and model
+  together; type to filter, `↑/↓` to move, `Enter` to switch, `Esc` to
+  cancel. `/model <provider>/<model>` is the direct form, and bare
+  `/provider` stays for provider-only switches. Switching keeps the
+  conversation — only the wire changes — and it runs in the background with
+  the spinner visible instead of freezing the screen. `/resume` repoints
+  autosave at the session it loaded.
+- Slash commands complete as you type: the dropdown highlights the matching
+  rows and `Tab`/`Enter` accept them (also `@path` for file attachments, and
+  an ambiguous prefix such as `/co` lists its candidates).
 - Candidates come from the provider's `models = [...]` config list, a live
   `GET /models` query (parallel, capped at 1.2 s each), and a built-in
   fallback — merged and deduped, so the picker works offline and never blocks
   on a dead endpoint. First run (missing key) walks you through choosing a
   provider and model before asking for the key.
+
+Appearance: `[ui] theme` picks `dark` (default), `light` or `mono`, and
+`details = true` starts with full tool output. `Ctrl+T` and `/theme` switch
+live; `KAZI_ASCII=1` falls back to plain ASCII glyphs for limited terminals.
 
 Every task run checkpoints the files it is about to modify (newest 20 kept),
 so `/undo` is a one-keystroke safety net after an aggressive edit. The report
@@ -147,7 +166,7 @@ already replayed is never applied twice — hand fixes in between stay safe.
 
 Permission modes: `edit` (default) gates commands behind approval, `read-only`
 refuses anything that writes, and `yolo` runs unattended. `Shift+Tab` cycles
-them in the TUI, `/permission` sets them in the REPL, `--permission-mode`
+them and `/permission` sets them (both in the TUI); `--permission-mode`
 picks the startup one. `@file` in a task attaches a file's contents, and
 `/context` shows where the token budget goes.
 
@@ -166,8 +185,9 @@ kazi run --output json "check cargo test status" | jq -r .answer   # structured 
 ```
 
 `--output json` emits one object `{ok, provider, task, answer, events[], error}`
-where `events` carries `text_delta` / `tool_start` / `tool_end` — pipe it into
-`jq` or store it as an audit trail.
+where `events` carries `text_delta` / `tool_start` / `tool_end` (the latter with
+the call id, the full capped tool output, any unified file diff and the measured
+duration) — pipe it into `jq` or store it as an audit trail.
 
 Discovery:
 
@@ -185,6 +205,7 @@ Override anything per call: `--provider <nick>` `--model <name>`
 | tool         | effect                                                  |
 |--------------|---------------------------------------------------------|
 | `list_dir`   | directory listing (names, sizes, dirs marked)           |
+| `glob`       | find files by pattern (`**/*.rs`, `src/**/mod.rs`)      |
 | `search_files` | recursive text search (glob filter, hidden/binaries skipped) |
 | `read_file`  | numbered lines, paging by offset/limit, refuses binaries |
 | `apply_patch`| exact, unique find-and-replace; ambiguity is an error   |
@@ -239,8 +260,8 @@ a single server can answer several calls from one model round at once.
 Saved conversations are visible and exportable:
 
 ```sh
-kazi chat "fix kproxy delay"  # session named after the topic
-kazi> /new refac-todo         # switch sessions without leaving the REPL
+kazi chat "fix kproxy delay"  # TUI session named after the topic
+/new refac-todo               # (typed in the TUI) switch sessions
 kazi sessions                 # list: name, message count, first message as topic
 kazi export fix-kproxy-delay notes.md
 ```
@@ -257,9 +278,9 @@ kazi export fix-kproxy-delay notes.md
   binary, so approving `git log` never clears `git push --force`.
 - File tools can be sandboxed with `tools.sandbox_root` — that now covers
   `search_files` and `run_command`'s `cwd` too, not just read/write.
-- A denial can carry a reason (type it at the line REPL's approval prompt):
-  the model receives it and may correct the command, instead of being told
-  never to retry.
+- A denial is reported to the model as an error result (never a silent
+  nothing), so it takes a different approach instead of repeating the
+  rejected call.
 - `fetch_url` refuses localhost/private IPs by design.
 - Model responses can lie or edit aggressively; skim `--yolo` sessions.
 - Session transcripts may contain prompt-injected content from fetched pages;
@@ -270,12 +291,12 @@ kazi export fix-kproxy-delay notes.md
 Everything the CLI does is library API (crate docs: `cargo doc --open`):
 
 ```rust
-use kazi::agent::{Agent, repl};
+use kazi::agent::{Agent, console};
 
 let cfg = kazi::config::load(None)?.0;
 let mut agent = Agent::default_cli(&cfg, Some("deepseek"), None, false).await?;
 let answer = agent
-    .run_task("How many .rs files are in src?", |e| repl::render_event(&e))
+    .run_task("How many .rs files are in src?", |e| console::render_event(&e))
     .await?;
 ```
 

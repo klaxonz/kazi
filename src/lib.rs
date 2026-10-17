@@ -7,12 +7,13 @@
 //! - a **library** (this crate): the engine ([`agent::Agent`]), provider
 //!   abstraction ([`llm::Provider`]), and tool system ([`tools`]) — embed
 //!   them into your own CLI or service;
-//! - a **binary** `kazi`: `kazi chat` REPL and `kazi run "task"` headless mode.
+//! - a **binary** `kazi`: `kazi chat` full-screen TUI and `kazi run "task"`
+//!   headless mode.
 //!
 //! ## Library quick look
 //!
 //! ```no_run
-//! use kazi::agent::{Agent, repl};
+//! use kazi::agent::{Agent, console};
 //!
 //! # async fn demo() -> anyhow::Result<()> {
 //! // config.toml: [providers.deepseek] type = "openai" ...
@@ -22,7 +23,7 @@
 //!     .expect("provider wired");
 //!
 //! let answer = agent
-//!     .run_task("How many .rs files are in src?", |event| repl::render_event(&event))
+//!     .run_task("How many .rs files are in src?", |event| console::render_event(&event))
 //!     .await
 //!     .expect("task");
 //! println!("{answer}");
@@ -40,13 +41,15 @@
 //! |-----------|--------------------------------------------------------------|
 //! | [`llm`]   | one [`llm::Provider`] trait; wire clients for 3 protocols     |
 //! | [`tools`] | [`tools::Tool`] trait + built-ins; approvals + sandboxing     |
-//! | [`agent`] | the loop ([`agent::Agent`]), history trimming, sessions, REPL |
+//! | [`agent`] | the loop ([`agent::Agent`]), history trimming, sessions, TUI  |
 //! | [`config`]| TOML config with provider precedence + env-key resolution     |
+//! | [`diff`]  | line diff used by tool cards and `--output json`              |
 
 pub mod agent;
 pub mod auth;
 pub mod cli;
 pub mod config;
+pub mod diff;
 pub mod llm;
 pub mod mcp;
 pub mod tools;

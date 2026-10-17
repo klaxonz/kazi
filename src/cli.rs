@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
-use crate::agent::{context::History, repl, session, tui, Agent, AgentError, AgentEvent};
+use crate::agent::{console, context::History, session, tui, Agent, AgentError, AgentEvent};
 use crate::config;
 use crate::tools::ToolRegistry;
 
@@ -58,15 +58,6 @@ pub struct EngineArgs {
         value_parser = parse_permission_mode
     )]
     pub permission_mode: Option<String>,
-    /// Force the classic line REPL instead of the TUI (pipes/scripts always
-    /// get the line REPL automatically)
-    #[arg(long = "no-tui")]
-    pub no_tui: bool,
-    /// Force the full-screen TUI even if autodetection would pick the line
-    /// REPL (falls back gracefully if the terminal can't do alternate
-    /// screens)
-    #[arg(long, conflicts_with = "no_tui")]
-    pub tui: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -193,10 +184,14 @@ async fn chat(
     topic: Option<String>,
     cfg_path: Option<&Path>,
 ) -> anyhow::Result<u8> {
-    // TUI is the default on real terminals; pipes/redirects (scripts, tests)
-    // always get the line REPL unless --tui is forced.
+    // chat is the full-screen TUI and needs a real terminal; pipes and
+    // scripts go through `kazi run`, which needs none.
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let want_tui = !args.no_tui && (args.tui || interactive);
+    if !interactive {
+        anyhow::bail!(
+            "kazi chat needs a real terminal (stdin and stdout) — for scripts, pipes and CI use `kazi run \"<task>\"`"
+        );
+    }
 
     let (cfg, cfg_file) = match config::load(cfg_path) {
         Ok(v) => v,
@@ -260,10 +255,7 @@ async fn chat(
         }
     }
     let mode = startup_mode(&cfg, args);
-    if want_tui {
-        return tui::chat_loop_with(cfg, provider, model, mode, topic, args.resume.clone()).await;
-    }
-    repl::chat_loop(cfg, provider, model, mode, topic, args.resume.clone()).await
+    tui::chat_loop_with(cfg, provider, model, mode, topic, args.resume.clone()).await
 }
 
 /// Remember a first-run choice in the config file, so the next launch does not
@@ -281,7 +273,7 @@ fn persist_choice(cfg_file: &Path, nick: &str, model: Option<&str>) {
     }
 }
 
-/// `[Y/n]`-style confirmation for pre-REPL flows; EOF takes the default.
+/// `[Y/n]`-style confirmation for onboarding flows; EOF takes the default.
 fn ask_yes(prompt: &str, default_yes: bool) -> anyhow::Result<bool> {
     let hint = if default_yes { "[Y/n]" } else { "[y/N]" };
     print!("{prompt} {hint}: ");
@@ -312,9 +304,8 @@ mod tests {
         let cli = Cli::try_parse_from(["kazi", "--permission-mode", "read-only"]).unwrap();
         assert_eq!(cli.engine.permission_mode.as_deref(), Some("read-only"));
 
-        let cli = Cli::try_parse_from(["kazi", "--model", "x", "--no-tui"]).unwrap();
+        let cli = Cli::try_parse_from(["kazi", "--model", "x"]).unwrap();
         assert_eq!(cli.engine.model.as_deref(), Some("x"));
-        assert!(cli.engine.no_tui);
 
         // the subcommand form keeps working
         let cli = Cli::try_parse_from(["kazi", "chat", "--yolo"]).unwrap();
@@ -453,7 +444,7 @@ async fn run_once(
 
     let mut events: Vec<AgentEvent> = Vec::new();
     let mut on_event: Box<dyn FnMut(AgentEvent)> = match fmt {
-        OutputFmt::Text => Box::new(|e| repl::render_event(&e)),
+        OutputFmt::Text => Box::new(|e| console::render_event(&e)),
         OutputFmt::Json => Box::new(|e| events.push(e)),
     };
 
@@ -822,9 +813,9 @@ fn resolve_pick(input: &str, items: &[String], default: usize) -> Option<usize> 
     }
 }
 
-/// Numbered picker for the pre-REPL/pre-TUI flows (onboarding, `kazi auth
-/// set`): prints the items and reads one line from stdin. Blank takes the
-/// default, `q` cancels; `None` on EOF or nothing to choose.
+/// Numbered picker for the onboarding flows (first run, `kazi auth set`):
+/// prints the items and reads one line from stdin. Blank takes the default,
+/// `q` cancels; `None` on EOF or nothing to choose.
 fn pick_one(prompt: &str, items: &[String], default: usize) -> Option<usize> {
     if items.is_empty() {
         return None;
@@ -882,7 +873,7 @@ async fn onboarding_pick(
         .unwrap_or(crate::llm::ProviderKind::OpenAiCompat);
 
     let configured = cfg.providers.get(&nick).and_then(|e| e.model.clone());
-    let models = crate::agent::repl::model_catalog(cfg, &nick, configured.as_deref()).await;
+    let models = crate::agent::console::model_catalog(cfg, &nick, configured.as_deref()).await;
     let model = if models.is_empty() {
         configured.clone().unwrap_or_default()
     } else {

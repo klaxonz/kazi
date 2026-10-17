@@ -9,6 +9,7 @@
 pub mod checkpoint;
 pub mod fetch;
 pub mod file;
+pub mod glob;
 pub mod patch;
 pub mod search;
 pub mod shell;
@@ -136,8 +137,8 @@ impl PermissionMode {
     }
 }
 
-/// Shared, atomically switchable permission mode (TUI Shift+Tab, REPL
-/// `/permission`, config at startup all point at the same cell).
+/// Shared, atomically switchable permission mode (`Shift+Tab` and `/permission`
+/// in the TUI, config at startup all point at the same cell).
 #[derive(Clone)]
 pub struct Permission {
     mode: Arc<std::sync::atomic::AtomicU8>,
@@ -200,7 +201,7 @@ pub fn approval_key(summary: &str) -> String {
 }
 
 /// Interactive gate for potentially-impactful actions (`run_command`).
-/// Implementations: terminal prompt (CLI/REPL), TUI prompt over a channel,
+/// Implementations: terminal prompt (`kazi run`), TUI prompt over a channel,
 /// always-allow (`--yolo`), always-deny (library default), tests.
 #[async_trait]
 pub trait Approver: Send + Sync {
@@ -299,6 +300,115 @@ pub(crate) fn optional_usize(args: &Value, key: &str) -> Option<usize> {
     args.get(key).and_then(Value::as_u64).map(|v| v as usize)
 }
 
+/// Tools whose successful run rewrites a file; the engine snapshots these
+/// paths so the UI can show the resulting diff. `todo_write` and friends never
+/// touch the filesystem.
+pub fn is_edit_tool(name: &str) -> bool {
+    matches!(name, "write_file" | "apply_patch")
+}
+
+/// The path an edit tool is about to write, if it names one.
+pub fn edited_path(call: &ToolCall) -> Option<&str> {
+    is_edit_tool(&call.name)
+        .then(|| call.arguments.get("path").and_then(Value::as_str))
+        .flatten()
+}
+
+/// Compact one-line human summary of a tool call's arguments, shown in the
+/// TUI tool card and in `kazi run` streaming output.
+pub fn call_summary(call: &ToolCall) -> String {
+    let a = &call.arguments;
+    let text = |key: &str| a.get(key).and_then(Value::as_str).unwrap_or("");
+    match call.name.as_str() {
+        "read_file" => {
+            let path = text("path");
+            match (optional_usize(a, "offset"), optional_usize(a, "limit")) {
+                (None, None) => clip_line(path, 80),
+                (off, lim) => format!(
+                    "{}:{}{}",
+                    clip_line(path, 64),
+                    off.unwrap_or(1),
+                    lim.map(|l| format!("+{l}")).unwrap_or_default()
+                ),
+            }
+        }
+        "write_file" => {
+            let bytes = text("content").len();
+            format!("{} ({bytes}B)", clip_line(text("path"), 64))
+        }
+        "apply_patch" => {
+            let removed = text("find").lines().count();
+            let added = text("replace").lines().count();
+            format!(
+                "{} (−{removed}/+{added} lines)",
+                clip_line(text("path"), 64)
+            )
+        }
+        "list_dir" => clip_line(
+            if text("path").is_empty() {
+                "."
+            } else {
+                text("path")
+            },
+            80,
+        ),
+        "glob" => {
+            let path = text("path");
+            let pattern = clip_line(text("pattern"), 60);
+            if path.is_empty() || path == "." {
+                pattern
+            } else {
+                format!("{pattern} in {}", clip_line(path, 30))
+            }
+        }
+        "search_files" => {
+            let glob = text("glob");
+            if glob.is_empty() {
+                format!("{:?}", clip_line(text("pattern"), 60))
+            } else {
+                format!("{:?} in {glob}", clip_line(text("pattern"), 60))
+            }
+        }
+        "run_command" => clip_line(&one_line(text("command")), 100),
+        "fetch_url" => clip_line(text("url"), 100),
+        "todo_write" => {
+            let n = a
+                .get("todos")
+                .and_then(Value::as_array)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            format!("{n} item(s)")
+        }
+        "delegate" => clip_line(&one_line(text("prompt")), 80),
+        name if name.starts_with("mcp_") => {
+            // mcp_<server>_<tool>: the arguments are the server's business
+            let args = serde_json::to_string(a).unwrap_or_default();
+            clip_line(&args, 80)
+        }
+        _ => {
+            let args = serde_json::to_string(a).unwrap_or_default();
+            clip_line(&args, 80)
+        }
+    }
+}
+
+/// First line of a possibly multi-line string, trimmed.
+fn one_line(s: &str) -> String {
+    s.lines().next().unwrap_or("").trim().to_string()
+}
+
+/// Clip to `n` display characters, appending `…` when shortened.
+fn clip_line(s: &str, n: usize) -> String {
+    let s = s.trim();
+    let count = s.chars().count();
+    if count <= n {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 /// Registry of built-in tools; names are unique keys into the catalog.
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
@@ -321,6 +431,7 @@ impl ToolRegistry {
             .register(Arc::new(todo::TodoWrite))
             .register(Arc::new(subagent::Delegate))
             .register(Arc::new(file::ListDir))
+            .register(Arc::new(glob::Glob))
             .register(Arc::new(file::ReadFile))
             .register(Arc::new(search::SearchFiles))
             .register(Arc::new(patch::ApplyPatch))
@@ -397,6 +508,7 @@ mod tests {
                 "todo_write",
                 "delegate",
                 "list_dir",
+                "glob",
                 "read_file",
                 "search_files",
                 "apply_patch",
@@ -452,6 +564,39 @@ mod tests {
             approval_key("$ rm -rf build\n  cwd: /a"),
             approval_key("$ rm -rf build\n  cwd: /b")
         );
+    }
+
+    #[test]
+    fn call_summaries_describe_the_arguments() {
+        let call = |name: &str, args: Value| ToolCall {
+            id: "c".into(),
+            name: name.into(),
+            arguments: args,
+        };
+        assert_eq!(
+            call_summary(&call("read_file", json!({"path": "src/main.rs"}))),
+            "src/main.rs"
+        );
+        assert!(call_summary(&call(
+            "run_command",
+            json!({"command": "cargo test\nsecond line"})
+        ))
+        .starts_with("cargo test"));
+        assert!(call_summary(&call(
+            "search_files",
+            json!({"pattern": "needle", "glob": "*.rs"})
+        ))
+        .contains("*.rs"));
+        assert!(
+            call_summary(&call("glob", json!({"pattern": "**/*.rs", "path": "src"})))
+                .contains("src")
+        );
+        assert_eq!(
+            call_summary(&call("todo_write", json!({"todos": [{}, {}]}))),
+            "2 item(s)"
+        );
+        // unknown tools still get a readable summary
+        assert!(!call_summary(&call("mystery", json!({"a": 1}))).is_empty());
     }
 
     #[test]

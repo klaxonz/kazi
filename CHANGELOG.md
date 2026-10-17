@@ -6,7 +6,77 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: MINOR = feature batch, PATCH = fixes only — see docs/VERSIONING.md).
 
-## [Unreleased]
+## [0.17.0] - 2026-10-17
+
+The TUI stops being a scrolling log and becomes a workspace: rendered answers,
+real tool cards with diffs, and keyboard/mouse navigation.
+
+### Added
+
+- **Markdown answers.** Assistant text is rendered instead of printed raw:
+  headings, bold/italic/strikethrough, inline code, links, bullet/numbered/todo
+  lists, blockquotes, tables and horizontal rules. Long lines wrap by display
+  width (CJK included), so a wide character never breaks the layout.
+- **Syntax-highlighted code.** Fenced blocks get a language label and a
+  tokenized colour pass for Rust, Python, JS/TS, JSON, TOML, YAML, shell,
+  C/C++, Go, Java, SQL, HTML and CSS — no extra dependency.
+- **Tool cards.** Every call is an entry with a summary line (`glob **/*.rs`,
+  `run_command cargo test`), status glyph, duration, and its real output. The
+  newest rows are shown collapsed; `Ctrl+O` expands everything, `Ctrl+E` the
+  newest card, and clicking a card toggles just that one. Errors show more
+  rows immediately.
+- **Coloured diffs.** `write_file` / `apply_patch` calls now show a unified
+  diff (`+added` / `−removed`, hunk headers, counts in the card title) instead
+  of "wrote N bytes". The engine snapshots the file before the call and
+  diffs it after; a new `kazi::diff` module does the line alignment.
+- **Overlays.** A command palette (`Ctrl+K`, fuzzy matching), help (`/help`,
+  scrollable), session browser (`Ctrl+R`, `Enter` resumes, `d d` deletes),
+  transcript search (`Ctrl+F`, jump to the matching entry) and provider/model
+  pickers all float above the screen and own the keyboard while open.
+- **A real header and footer.** Mode badge, provider/model, session, and a
+  context gauge with percentage and colour bands; the footer shows contextual
+  key hints plus queue/scroll/detail state.
+- **Bordered input with a placeholder**, soft-wrapping of long tasks (the box
+  grows with the wrapped row count, up to six rows), a live busy spinner,
+  elapsed time and per-round token counts.
+- **Follow-up queue.** `Enter` while a task runs queues the message (shown in
+  the transcript and the footer) and starts it automatically when the task
+  finishes, instead of refusing the keystroke.
+- **New commands:** `/theme [dark|light|mono]`, `/details [on|off]`,
+  `/sessions`, `/export [path]`, `/copy [all]` (system clipboard) and
+  `/retry`. `Ctrl+T` cycles the theme live.
+- **`[ui]` config**: `theme = "dark" | "light" | "mono"` and `details = true`
+  to start expanded. `KAZI_ASCII=1` swaps the Unicode glyph set for ASCII.
+- **`glob` tool** (`**`, `*`, `?`; skips build/hidden dirs; size + mtime
+  ordering), so the model can find files in one call instead of walking
+  `list_dir`.
+- Agent events now carry the call id, an argument summary, the full capped
+  tool output, an optional diff, and the measured duration — used by the TUI,
+  by `kazi run` streaming, and by `--output json`.
+
+### Changed
+
+- `/help` opens the scrollable help overlay instead of dumping text.
+- Denying an approval can carry a reason: `r`, type it, `Enter` — the model
+  receives the text and can correct its command.
+- `Esc` clears a non-empty input first and only quits from an empty prompt;
+  the old single keystroke lost half-typed tasks.
+- Tool cards match `ToolStart`/`ToolEnd` by call id, so parallel calls no
+  longer swap names/previews.
+
+### Fixed
+
+- The TUI no longer paints outside the buffer on very small terminals
+  (overlays, approval box and the layout bands all clamp to the screen).
+- ANSI escapes and other control bytes in tool output or model answers are
+  stripped before rendering, so a coloured command can never corrupt the
+  screen or the scroll arithmetic.
+- Full tool output is available in the UI (the transcript used to keep only a
+  160-character preview; `/last` was the only way to see the rest).
+
+## [0.16.0] - 2026-10-17
+
+### Added
 
 ### Added
 
@@ -22,9 +92,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Provider and model selection no longer means typing a name from memory.**
   Bare `/provider` and `/model` now offer a picker: the TUI opens a list
   overlay (type to filter, `↑/↓` to move, `Enter` to switch, `Esc` to cancel,
-  and choosing a provider then offers its models), while the line REPL prints
-  a numbered list you answer with `/model 2` or `/model <name>` — `/model`
-  also gets TAB completion. First-run onboarding and `kazi auth set` pick a
+  and choosing a provider then offers its models); `/model <provider>/<model>`
+  is the direct form. First-run onboarding and `kazi auth set` pick a
   provider from a list too.
 - Model discovery: candidates are merged from the provider's new
   `models = [...]` config list, a live `GET /models` query (OpenAI-compatible
@@ -41,8 +110,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the input box grows, `↑/↓` move between lines, `Home`/`End` stay inside the
   current line.
 - Shared, persisted input history (`<data-dir>/kazi/history.txt`): `↑` after a
-  restart recalls the last tasks in both front-ends.
-- `@path` TAB completion in both front-ends (directories keep the separator so
+  restart recalls the last tasks.
+- `@path` TAB completion (directories keep the separator so
   completion can continue).
 - `/resume` replays the loaded conversation into the TUI transcript instead of
   loading only the model's memory.
@@ -60,10 +129,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Quitting the TUI mid-task no longer discards the session.** Every finished
-  task autosaves (matching the line REPL), quitting with a task in flight
+  task autosaves; quitting with a task in flight
   cancels it and waits briefly for the agent before the final save, and the
   exit line stops claiming "session saved" when nothing reached the disk.
-- **`/resume` repoints autosave at the loaded session** in both front-ends.
+- **`/resume` repoints autosave at the loaded session.**
   Follow-up work used to be written into the session the chat started in, so
   the resumed conversation appeared to vanish on the next launch.
 - **`/undo` can no longer corrupt files or replay itself.** Parallel tool calls
@@ -72,9 +141,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.undone`, so a second `/undo` reports it instead of clobbering later hand
   edits, and the report lists the restored / removed / failed paths.
 - **Permission changes no longer throw the conversation away.** `/yolo` and
-  `/permission` in the line REPL flip the shared cell in place, and a
-  `/provider` or `/model` switch (both front-ends) carries the history over —
-  only the wire changes.
+  `/permission` flip the shared permission cell in place, and a
+  `/provider` or `/model` switch carries the history over — only the wire
+  changes.
 - **The TUI approval prompt is modal.** `Enter` no longer means "allow" and
   stray keystrokes are ignored — only `y`/`a`/`n`/`Esc` answer, so typing the
   next task can never grant an approval by accident.
@@ -96,8 +165,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Command verbs are case-insensitive; `/undo 3` explains instead of silently
   ignoring the argument; `/model <#>` no longer turns a stale number into a
   literal model name; `/provider` marks the current entry.
-- The line REPL shows the permission mode in the banner and in the prompt
-  (`kazi[ro]>`, `kazi[yolo]>`); a `--permission-mode` typo fails loudly, and a
+- A `--permission-mode` typo fails loudly, and a
   bad `agent.permission_mode` warns instead of silently meaning `edit`.
 - The TUI status bar keeps the permission tag visible on narrow terminals (it
   moved ahead of the provider text).
@@ -105,25 +173,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tools.sandbox_root` too — both used to reach outside it. The example config
   no longer suggests an empty `sandbox_root` that silently means the cwd.
 - `run --output json` keeps stdout valid JSON (resume notices moved to stderr).
-- A denial can carry a reason (line REPL: type it instead of `n`) which the
-  model receives, so it can correct the command instead of being told never to
-  retry.
+- A denied command is reported to the model as an error result, so it can
+  correct the command instead of being told never to retry.
 - The TUI transcript is capped (4000 rows) and wrapped rows are cached: long
   sessions no longer re-wrap everything on every keystroke, and a scrolled
   reader keeps their place as new output arrives.
 - Errors print their cause chain once; `auth.json` is written `0600` on Unix.
 - **Half-typed commands do what you meant.** The TUI dropdown is a real
   selector now (`↑/↓` move the highlight, `Enter` runs the highlighted row,
-  `Tab` completes a unique match or walks the candidates), and both front-ends
-  complete a partial command name to its unique match (`/mod` → `/model`)
-  instead of erroring — an ambiguous prefix lists its candidates.
+  `Tab` completes a unique match or walks the candidates), a partial command
+  name completes to its unique match (`/mod` → `/model`) instead of erroring,
+  and an ambiguous prefix lists its candidates.
 - **Provider/model switching no longer freezes the UI.** The rebuild reused
   nothing, so every switch re-handshaked MCP servers (60 s timeout each) before
   the screen moved again; it now reuses the live tool registry, runs as a
   background task with the spinner and elapsed seconds visible, and the live
   model probe is capped at 1.2 s per provider, fetched in parallel.
-- The line REPL builds switches through the same path (no MCP re-handshake) and
-  says it is checking the providers before listing models.
 - **`/model` picks provider AND model in one step**: one list of `provider/model`
   rows, with `/model <provider>/<model>` as the direct form. The old two-overlay
   chain (provider → model picker) is gone; `/provider` remains for
@@ -142,17 +207,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `llm::model_fits_wire()`; the OpenAI-compatible wire stays unfiltered
   (OpenRouter legitimately serves `anthropic/claude-*` there), and config
   `models = [...]` are never filtered (an explicit choice).
-- Switching model inside the TUI now probes the new model before committing,
-  matching the line REPL — a model the provider rejects is reported
+- Switching model inside the TUI probes the new model before committing; a
+  model the provider rejects is reported
   immediately instead of failing on the next task with an HTTP 400.
-- The line REPL now remembers a `/provider` or `/model` switch: subsequent
-  rebuilds used the config default provider because the switch only updated the
-  live agent, never the loop state (the TUI already got this right).
 
 ### Changed
 
 - `/compact` without `force` is a no-op when the context is under budget — the
   documented behaviour now matches the code.
+
+### Removed
+
+- **The classic line REPL is gone — `kazi chat` is the full-screen TUI.**
+  The `--no-tui`/`--tui` flags go with it, and so does the automatic pipe
+  detection: a piped or redirected `kazi chat` (which used to get the line
+  REPL silently) now exits with a pointer to `kazi run "<task>"`. Everything
+  the REPL offered — the slash-command table, persisted input history, `@path`
+  TAB completion — lives on in the TUI (`agent::repl` is now `agent::console`).
+  Typed denial reasons were a line-REPL-only affordance and go with it. The
+  `rustyline` dependency is dropped.
 
 ## [0.14.2] - 2026-10-17
 

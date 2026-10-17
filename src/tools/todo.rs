@@ -3,7 +3,8 @@
 //! The whole list is replaced on every call (the model owns the structure;
 //! partial updates invite desync). The engine snapshots the list after each
 //! tool round and emits [`super::agent::AgentEvent::TodosUpdated`] so any UI
-//! (TUI checklist pane, REPL `/todos`) can render it.
+//! (the TUI checklist pane and the streaming `TodosUpdated` events) can
+//! render it.
 
 use std::sync::Mutex;
 
