@@ -128,8 +128,9 @@ pub enum AuthCmd {
     /// Store the key for a provider (reads the value from an argument,
     /// stdin, or — interactively — a hidden prompt)
     Set {
-        /// Provider nickname from config (see `kazi providers`)
-        provider: String,
+        /// Provider nickname from config (see `kazi providers`); omit it on a
+        /// terminal to pick one from a list
+        provider: Option<String>,
         /// The key itself; omit to paste it (hidden prompt or stdin pipe)
         #[arg(value_name = "KEY")]
         key: Option<String>,
@@ -189,37 +190,42 @@ async fn chat(
     // On a real terminal a missing key should not hard-exit: offer to store
     // one (like claude/codex onboarding). Non-interactive paths keep the
     // fail-fast contract.
-    let nick = match cfg.resolve(args.provider.as_deref(), args.model.as_deref()) {
-        Ok(r) => r.nick,
-        Err(e) => anyhow::bail!("{e}"),
-    };
-    if let Err(e) = cfg.api_key_for(&nick) {
-        if !interactive {
-            return Err(e.into());
+    let mut provider = args.provider.clone();
+    let mut model = args.model.clone();
+    match cfg.resolve(provider.as_deref(), model.as_deref()) {
+        Ok(r) => {
+            if let Err(e) = cfg.api_key_for(&r.nick) {
+                if !interactive {
+                    return Err(e.into());
+                }
+                if let Some((p, m)) = onboarding_pick(&cfg, &r.nick, Some(&e)).await? {
+                    println!("{DIM}using `{p}` / `{m}` for this session — add them to config.toml to keep them{RESET}");
+                    provider = Some(p);
+                    model = Some(m);
+                }
+            }
         }
-        onboarding_offer(&cfg, &nick, e)?;
+        Err(e) => {
+            // unknown provider / nothing configured: pick interactively rather
+            // than dying, when there is a terminal and something to pick.
+            if !interactive || cfg.nicks().is_empty() {
+                return Err(e.into());
+            }
+            match onboarding_pick(&cfg, "", None).await? {
+                Some((p, m)) => {
+                    println!("{DIM}using `{p}` / `{m}` for this session — add them to config.toml to keep them{RESET}");
+                    provider = Some(p);
+                    model = Some(m);
+                }
+                None => return Err(e.into()),
+            }
+        }
     }
     let mode = startup_mode(&cfg, args);
     if want_tui {
-        return tui::chat_loop_with(
-            cfg,
-            args.provider.clone(),
-            args.model.clone(),
-            mode,
-            topic,
-            args.resume.clone(),
-        )
-        .await;
+        return tui::chat_loop_with(cfg, provider, model, mode, topic, args.resume.clone()).await;
     }
-    repl::chat_loop(
-        cfg,
-        args.provider.clone(),
-        args.model.clone(),
-        mode,
-        topic,
-        args.resume.clone(),
-    )
-    .await
+    repl::chat_loop(cfg, provider, model, mode, topic, args.resume.clone()).await
 }
 
 #[cfg(test)]
@@ -269,6 +275,17 @@ mod tests {
             Mode::ReadOnly,
             "--permission-mode wins over --yolo"
         );
+    }
+
+    #[test]
+    fn resolve_pick_handles_numbers_defaults_and_values() {
+        let items = vec!["deepseek".to_string(), "ollama".to_string()];
+        assert_eq!(resolve_pick("2", &items, 0), Some(1));
+        assert_eq!(resolve_pick("", &items, 1), Some(1), "blank = default");
+        assert_eq!(resolve_pick("ollama", &items, 0), Some(1), "exact value");
+        assert_eq!(resolve_pick("3", &items, 0), None, "out of range");
+        assert_eq!(resolve_pick("nope", &items, 0), None);
+        assert_eq!(resolve_pick("1", &[], 0), None, "nothing to pick");
     }
 }
 
@@ -487,7 +504,30 @@ fn auth_cmd(cmd: Option<AuthCmd>, cfg_path: Option<&Path>) -> anyhow::Result<u8>
         }
         AuthCmd::Set { provider, key } => {
             let (cfg, _) = config::load(cfg_path)?;
-            let nick = resolve_provider_nick(&cfg, &provider)?;
+            let nick = match provider {
+                Some(p) => resolve_provider_nick(&cfg, &p)?,
+                None => {
+                    // pick interactively from the providers that need a key
+                    let candidates: Vec<String> = cfg
+                        .nicks()
+                        .into_iter()
+                        .filter(|n| {
+                            cfg.kind_of_nick(n)
+                                .map(|k| k != crate::llm::ProviderKind::Ollama)
+                                .unwrap_or(true)
+                        })
+                        .collect();
+                    if !std::io::stdin().is_terminal() || candidates.is_empty() {
+                        anyhow::bail!(
+                            "usage: kazi auth set <provider> [KEY] — run `kazi providers` to list them"
+                        );
+                    }
+                    match pick_one("pick a provider to store a key for", &candidates, 0) {
+                        Some(i) => candidates[i].clone(),
+                        None => return Ok(1),
+                    }
+                }
+            };
             let kind = cfg
                 .kind_of_nick(&nick)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -644,43 +684,107 @@ const ECHO: u32 = 0o000010;
 #[cfg(not(windows))]
 const TCSANOW: i32 = 0;
 
-/// Interactive offer when the default provider has no key: store it now
-/// (recommended), export instructions, or just proceed (the session will
-/// fail on first request). Never shown for ollama (needs no key).
-fn onboarding_offer(
-    cfg: &config::Config,
-    nick: &str,
-    err: config::ConfigError,
-) -> anyhow::Result<()> {
-    println!("{YELLOW}warning: {err}{RESET}");
-    let needs_key = cfg
-        .kind_of_nick(nick)
-        .map(|k| k != crate::llm::ProviderKind::Ollama)
-        .unwrap_or(true);
-    if !needs_key {
-        return Ok(());
+/// Map a raw picker line to an item index: blank → `default`, a 1-based number
+/// or an exact value also work. `None` when nothing matches.
+fn resolve_pick(input: &str, items: &[String], default: usize) -> Option<usize> {
+    if items.is_empty() {
+        return None;
     }
-    print!("store an API key for `{nick}` now? [Y/n] ");
+    let default = default.min(items.len() - 1);
+    let t = input.trim();
+    if t.is_empty() {
+        return Some(default);
+    }
+    match t.parse::<usize>() {
+        Ok(n) if n >= 1 && n <= items.len() => Some(n - 1),
+        _ => items.iter().position(|it| it == t), // exact value
+    }
+}
+
+/// Numbered picker for the pre-REPL/pre-TUI flows (onboarding, `kazi auth
+/// set`): prints the items and reads one line from stdin. `None` on EOF or
+/// nothing to choose.
+fn pick_one(prompt: &str, items: &[String], default: usize) -> Option<usize> {
+    if items.is_empty() {
+        return None;
+    }
+    let default = default.min(items.len() - 1);
+    println!("{CYAN}{prompt}{RESET}");
+    for (i, it) in items.iter().enumerate() {
+        let mark = if i == default { "  (default)" } else { "" };
+        println!("  {}) {it}{mark}", i + 1);
+    }
+    print!("choose [1-{}, Enter = {}]: ", items.len(), default + 1);
     use std::io::Write;
-    std::io::stdout().flush()?;
+    let _ = std::io::stdout().flush();
     let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    match line.trim().to_lowercase().as_str() {
-        "" | "y" | "yes" => {
-            let value = read_secret()?;
-            let value = value.trim();
-            if value.is_empty() {
-                println!("{YELLOW}empty key — skipped{RESET}");
-            } else {
-                match crate::auth::store(nick, value) {
-                    Ok(path) => println!("stored key for {CYAN}{nick}{RESET} -> {}", path.display()),
-                    Err(e) => println!("{RED}cannot store key: {e}{RESET}"),
-                }
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return None;
+    }
+    resolve_pick(&line, items, default)
+}
+
+/// Interactive provider + model chooser for first-run onboarding: picks a
+/// provider, a model for it (config + live + defaults), then stores the API
+/// key when the provider needs one. Returns the `(provider, model)` to use for
+/// this session, or `None` when there is nothing to pick.
+async fn onboarding_pick(
+    cfg: &config::Config,
+    default_nick: &str,
+    warn: Option<&config::ConfigError>,
+) -> anyhow::Result<Option<(String, String)>> {
+    if let Some(e) = warn {
+        println!("{YELLOW}warning: {e}{RESET}");
+    }
+    let nicks = cfg.nicks();
+    if nicks.is_empty() {
+        println!(
+            "{YELLOW}no providers configured — run `kazi config --init`, then edit the file{RESET}"
+        );
+        return Ok(None);
+    }
+    let def = nicks.iter().position(|n| n == default_nick).unwrap_or(0);
+    let Some(pi) = pick_one("pick a provider", &nicks, def) else {
+        return Ok(None);
+    };
+    let nick = nicks[pi].clone();
+    let kind = cfg
+        .kind_of_nick(&nick)
+        .unwrap_or(crate::llm::ProviderKind::OpenAiCompat);
+
+    let configured = cfg.providers.get(&nick).and_then(|e| e.model.clone());
+    let models = crate::agent::repl::model_catalog(cfg, &nick, configured.as_deref()).await;
+    let model = if models.is_empty() {
+        configured.clone().unwrap_or_default()
+    } else {
+        let mdef = configured
+            .as_ref()
+            .and_then(|c| models.iter().position(|m| m == c))
+            .unwrap_or(0);
+        match pick_one("pick a model", &models, mdef) {
+            Some(mi) => models[mi].clone(),
+            None => configured.clone().unwrap_or_default(),
+        }
+    };
+    if model.is_empty() {
+        println!("{YELLOW}no model chosen — set `model` in config or pass --model{RESET}");
+        return Ok(None);
+    }
+
+    // store a key unless the provider is keyless (ollama) or already has one
+    if kind != crate::llm::ProviderKind::Ollama && cfg.api_key_for(&nick).is_err() {
+        let value = read_secret()?;
+        let value = value.trim();
+        if value.is_empty() {
+            println!("{DIM}skipped — export the env var before first use{RESET}");
+        } else {
+            match crate::auth::store(&nick, value) {
+                Ok(path) => println!("stored key for {CYAN}{nick}{RESET} -> {}", path.display()),
+                Err(e) => println!("{RED}cannot store key: {e}{RESET}"),
             }
         }
-        _ => println!("{DIM}skipped — export the env var before first use{RESET}"),
     }
-    Ok(())
+    Ok(Some((nick, model)))
 }
 
 fn tools_cmd() -> anyhow::Result<u8> {

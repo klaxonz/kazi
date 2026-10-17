@@ -115,6 +115,9 @@ pub struct ProviderEntry {
     /// Name of the env var holding the key. Defaults:
     /// openai → OPENAI_API_KEY, anthropic → ANTHROPIC_API_KEY, ollama → none.
     pub api_key_env: Option<String>,
+    /// Optional list of model ids this provider offers, shown by the
+    /// `/model` picker (merged with whatever the endpoint reports live).
+    pub models: Option<Vec<String>>,
 }
 
 /// (config, its path) so the CLI can tell users where things came from.
@@ -276,6 +279,33 @@ impl Config {
     pub fn nicks(&self) -> Vec<String> {
         self.providers.keys().cloned().collect()
     }
+
+    /// Model ids the user listed for a provider (`models = [...]`), for the
+    /// `/model` picker.
+    pub fn configured_models(&self, nick: &str) -> Vec<String> {
+        self.providers
+            .get(nick)
+            .and_then(|e| e.models.clone())
+            .unwrap_or_default()
+    }
+
+    /// Fully-resolved settings (kind + key) for a nick, for out-of-band calls
+    /// such as listing models. Unlike [`Config::resolve`], a missing `model`
+    /// is fine — it becomes an empty string — since discovery needs no model.
+    pub fn settings_for_nick(&self, nick: &str) -> Result<ProviderSettings, ConfigError> {
+        let entry = self
+            .providers
+            .get(nick)
+            .ok_or_else(|| ConfigError::Unknown(nick.to_string(), self.nicks().join(", ")))?;
+        let kind = Self::kind_of(nick, entry)?;
+        let api_key = self.api_key_for(nick)?;
+        Ok(ProviderSettings {
+            kind,
+            model: entry.model.clone().unwrap_or_default(),
+            base_url: entry.base_url.clone(),
+            api_key,
+        })
+    }
 }
 
 /// The example config ships inside the binary — `kazi config --init`.
@@ -381,5 +411,26 @@ model = "m2"
     fn example_toml_itself_parses() {
         let c: Config = toml::from_str(EXAMPLE_TOML).unwrap();
         assert!(c.providers.len() >= 3);
+    }
+
+    #[test]
+    fn provider_models_list_is_parsed_and_exposed() {
+        let c = cfg("[providers.a]\ntype = \"openai\"\nmodel = \"m1\"\nmodels = [\"m1\", \"m2\"]");
+        assert_eq!(
+            c.configured_models("a"),
+            vec!["m1".to_string(), "m2".to_string()]
+        );
+        // absent → empty, never an error
+        assert!(c.configured_models("missing").is_empty());
+    }
+
+    #[test]
+    fn settings_for_nick_needs_no_model() {
+        std::env::set_var("KAZI_TEST_SETTINGS_KEY", "k");
+        let c = cfg("[providers.a]\ntype = \"openai\"\napi_key_env = \"KAZI_TEST_SETTINGS_KEY\"");
+        let s = c.settings_for_nick("a").unwrap();
+        assert_eq!(s.kind, ProviderKind::OpenAiCompat);
+        assert_eq!(s.model, "", "discovery does not require a model");
+        assert_eq!(s.api_key.as_deref(), Some("k"));
     }
 }

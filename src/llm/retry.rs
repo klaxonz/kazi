@@ -117,6 +117,12 @@ impl Provider for RetryProvider {
             }
         }
     }
+
+    /// Discovery is a single cheap GET: forward it straight through (no retry
+    /// accounting; the picker tolerates an error by falling back to config).
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        self.inner.list_models().await
+    }
 }
 
 #[cfg(test)]

@@ -8,6 +8,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Provider and model selection no longer means typing a name from memory.**
+  Bare `/provider` and `/model` now offer a picker: the TUI opens a list
+  overlay (type to filter, `↑/↓` to move, `Enter` to switch, `Esc` to cancel,
+  and choosing a provider then offers its models), while the line REPL prints
+  a numbered list you answer with `/model 2` or `/model <name>` — `/model`
+  also gets TAB completion. First-run onboarding and `kazi auth set` pick a
+  provider from a list too.
+- Model discovery: candidates are merged from the provider's new
+  `models = [...]` config list, a live `GET /models` query (OpenAI-compatible
+  and Anthropic; Ollama reuses the OpenAI wire), and a built-in fallback —
+  deduped with the current model first, tolerant of an offline endpoint. The
+  `Provider` trait gained a defaulted `list_models()`.
+
+### Fixed
+
+- The model picker no longer offers models its wire cannot serve. An
+  Anthropic-wire provider (`/v1/messages`) only answers for Claude models, but
+  a gateway's `/models` endpoint may list its whole catalog — Command Code's
+  Provider API, for example, returns `deepseek/...` ids there that only work on
+  the OpenAI path. Live candidates are now filtered with
+  `llm::model_fits_wire()`; the OpenAI-compatible wire stays unfiltered
+  (OpenRouter legitimately serves `anthropic/claude-*` there), and config
+  `models = [...]` are never filtered (an explicit choice).
+- Switching model inside the TUI now probes the new model before committing,
+  matching the line REPL — a model the provider rejects is reported
+  immediately instead of failing on the next task with an HTTP 400.
+- The line REPL now remembers a `/provider` or `/model` switch: subsequent
+  rebuilds used the config default provider because the switch only updated the
+  live agent, never the loop state (the TUI already got this right).
+
 ## [0.14.2] - 2026-10-17
 
 ### Fixed

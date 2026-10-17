@@ -119,13 +119,95 @@ pub fn usage_for(verb: &str) -> String {
     }
 }
 
-/// `/provider` with no argument: what is configured.
+/// `/provider` with no argument: what is configured, as a numbered picker.
 pub fn providers_text(cfg: &Config) -> String {
-    format!(
-        "configured providers: {}\n{}",
-        cfg.nicks().join(", "),
-        usage_for("/provider")
-    )
+    let nicks = cfg.nicks();
+    let mut out = String::from("configured providers:\n");
+    for (i, nick) in nicks.iter().enumerate() {
+        let model = cfg
+            .providers
+            .get(nick)
+            .and_then(|e| e.model.clone())
+            .unwrap_or_else(|| "(no model set)".to_string());
+        out.push_str(&format!("  {}) {nick:<14} model={model}\n", i + 1));
+    }
+    out.push_str(&usage_for("/provider"));
+    out
+}
+
+/// Numbered model list for `/model` with no argument.
+pub fn models_text(nick: &str, models: &[String], current: Option<&str>) -> String {
+    if models.is_empty() {
+        return format!(
+            "no model candidates for `{nick}` — type a name instead ({})",
+            usage_for("/model")
+        );
+    }
+    let mut out = format!("models for {nick}:\n");
+    for (i, m) in models.iter().enumerate() {
+        let mark = if Some(m.as_str()) == current {
+            "  <- current"
+        } else {
+            ""
+        };
+        out.push_str(&format!("  {}) {m}{mark}\n", i + 1));
+    }
+    out.push_str(&usage_for("/model"));
+    out
+}
+
+/// Model candidates from config `models` + the built-in fallback only — no
+/// network, instant and offline-safe (seeds TAB completion at startup).
+pub fn model_catalog_static(cfg: &Config, nick: &str, current: Option<&str>) -> Vec<String> {
+    let kind = cfg
+        .kind_of_nick(nick)
+        .unwrap_or(crate::llm::ProviderKind::OpenAiCompat);
+    crate::llm::merge_catalog(&cfg.configured_models(nick), &[], kind, current)
+}
+
+/// Full candidate set for the picker: config `models` ∪ a best-effort live
+/// `/models` fetch (≤3s) ∪ the built-in fallback, deduped, current first.
+/// Never fails — an unreachable endpoint just yields fewer candidates.
+pub async fn model_catalog(cfg: &Config, nick: &str, current: Option<&str>) -> Vec<String> {
+    let config_models = cfg.configured_models(nick);
+    let kind = cfg
+        .kind_of_nick(nick)
+        .unwrap_or(crate::llm::ProviderKind::OpenAiCompat);
+    let live = match cfg
+        .settings_for_nick(nick)
+        .ok()
+        .and_then(|s| crate::llm::build_provider(&s).ok())
+    {
+        Some(p) => {
+            match tokio::time::timeout(std::time::Duration::from_secs(3), p.list_models()).await {
+                Ok(Ok(m)) => m,
+                _ => Vec::new(),
+            }
+        }
+        None => Vec::new(),
+    };
+    crate::llm::merge_catalog(&config_models, &live, kind, current)
+}
+
+/// The effective provider nick for the current selection (flag > env > config).
+fn effective_nick(
+    cfg: &Config,
+    provider: &Option<String>,
+    model: &Option<String>,
+) -> Option<String> {
+    cfg.resolve(provider.as_deref(), model.as_deref())
+        .ok()
+        .map(|r| r.nick)
+}
+
+/// Resolve a `/model` or `/provider` argument that may be a 1-based index into
+/// the list a bare command printed: `Some(i)` selects that item; `None` means
+/// "treat the argument as a literal name".
+fn listed_index(arg: &str, len: usize) -> Option<usize> {
+    match arg.parse::<usize>() {
+        Ok(n) if n >= 1 && n <= len => Some(n - 1),
+        _ => None,
+    }
 }
 
 /// `/new` and `/clear`: reset the history and pick a fresh autosave target.
@@ -352,14 +434,14 @@ const COMMANDS: &[CmdSpec] = &[
     },
     CmdSpec {
         name: "/provider",
-        args: "<nick>",
-        help: "switch provider (TAB lists them)",
+        args: "<nick|#>",
+        help: "switch provider (bare /provider lists them)",
         arg: ArgKind::Provider,
     },
     CmdSpec {
         name: "/model",
-        args: "<name>",
-        help: "override the current provider's model",
+        args: "<name|#>",
+        help: "switch model (bare /model lists them)",
         arg: ArgKind::Model,
     },
     CmdSpec {
@@ -524,6 +606,8 @@ struct SlashHelper {
     nicks: Vec<String>,
     /// Model as last set via `/model` (display in hints).
     model: Option<String>,
+    /// Known model candidates for the current provider (`/model` completion).
+    models: Vec<String>,
     yolo: bool,
 }
 
@@ -578,6 +662,15 @@ impl SlashHelper {
                 .map(|n| Pair {
                     display: n.clone(),
                     replacement: n.clone(),
+                })
+                .collect(),
+            ArgKind::Model => self
+                .models
+                .iter()
+                .filter(|m| m.starts_with(token))
+                .map(|m| Pair {
+                    display: m.clone(),
+                    replacement: m.clone(),
                 })
                 .collect(),
             ArgKind::Toggle => ["on", "off"]
@@ -665,6 +758,9 @@ pub struct ChatState {
     /// Provider nick; `None` = follow config precedence.
     provider: Option<String>,
     model: Option<String>,
+    /// Cached `/model` candidates for the current provider (bare `/model` and
+    /// TAB completion share this).
+    models: Vec<String>,
     mode: crate::tools::PermissionMode,
     session_name: String,
 }
@@ -675,6 +771,7 @@ impl Clone for ChatState {
             cfg: self.cfg.clone(),
             provider: self.provider.clone(),
             model: self.model.clone(),
+            models: self.models.clone(),
             mode: self.mode,
             session_name: self.session_name.clone(),
         }
@@ -689,10 +786,19 @@ impl ChatState {
         mode: crate::tools::PermissionMode,
         session_name: String,
     ) -> Self {
+        let models = match cfg
+            .resolve(provider.as_deref(), model.as_deref())
+            .ok()
+            .map(|r| r.nick)
+        {
+            Some(nick) => model_catalog_static(&cfg, &nick, model.as_deref()),
+            None => Vec::new(),
+        };
         Self {
             cfg,
             provider,
             model,
+            models,
             mode,
             session_name,
         }
@@ -834,6 +940,7 @@ pub async fn chat_loop(
     rl.set_helper(Some(SlashHelper {
         nicks: state.cfg.nicks(),
         model: state.model.clone(),
+        models: state.models.clone(),
         yolo: state.mode == crate::tools::PermissionMode::Yolo,
     }));
 
@@ -891,6 +998,8 @@ pub async fn chat_loop(
             if let Some(h) = rl.helper_mut() {
                 h.yolo = state.mode == crate::tools::PermissionMode::Yolo;
                 h.model = state.model.clone();
+                h.models = state.models.clone();
+                h.nicks = state.cfg.nicks();
             }
             continue;
         }
@@ -992,27 +1101,61 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
                 println!("{}", resume_text(&mut live.agent, prefix).await);
             }
         }
-        ("/provider", nick) => {
-            if nick.is_empty() {
+        ("/provider", arg) => {
+            if arg.is_empty() {
                 println!("{}", providers_text(&state.cfg));
             } else {
+                let nicks = state.cfg.nicks();
+                let nick = match listed_index(arg, nicks.len()) {
+                    Some(i) => nicks[i].clone(),
+                    None => arg.to_string(),
+                };
                 let mut next = state.clone();
-                next.provider = Some(nick.to_string());
+                next.provider = Some(nick);
+                // a model override from the old provider may not exist on the
+                // new one — drop it and the now-stale candidate cache
+                next.model = None;
+                next.models.clear();
                 match next.rebuild().await {
                     Ok(new) => {
                         println!("switched -> {}", new.describe());
+                        *state = next;
                         *live = new;
                     }
                     Err(e) => println!("{RED}switch failed: {e}{RESET}"),
                 }
             }
         }
-        ("/model", m) => {
-            if m.is_empty() {
-                println!("current: {}\n{}", live.describe(), usage_for("/model"));
+        ("/model", arg) => {
+            if arg.is_empty() {
+                let nick = effective_nick(&state.cfg, &state.provider, &state.model);
+                let current = state.model.clone().or_else(|| {
+                    state
+                        .cfg
+                        .resolve(state.provider.as_deref(), None)
+                        .ok()
+                        .map(|r| r.settings.model)
+                });
+                state.models = match &nick {
+                    Some(n) => model_catalog(&state.cfg, n, current.as_deref()).await,
+                    None => Vec::new(),
+                };
+                println!(
+                    "{}",
+                    models_text(
+                        nick.as_deref().unwrap_or("(none)"),
+                        &state.models,
+                        current.as_deref()
+                    )
+                );
             } else {
+                // a bare number indexes the list printed by bare `/model`
+                let chosen = match listed_index(arg, state.models.len()) {
+                    Some(i) => state.models[i].clone(),
+                    None => arg.to_string(),
+                };
                 let mut next = state.clone();
-                next.model = Some(m.to_string());
+                next.model = Some(chosen);
                 match next.rebuild().await {
                     Ok(mut new) => {
                         // Dry-run before committing: a wrong model name only
@@ -1023,6 +1166,7 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
                         match new.agent.probe().await {
                             Ok(()) => {
                                 println!("switched -> {}", new.describe());
+                                *state = next;
                                 *live = new;
                             }
                             Err(e) => println!(
@@ -1169,6 +1313,7 @@ mod tests {
         let helper = SlashHelper {
             nicks: vec!["deepseek".into(), "ollama".into()],
             model: None,
+            models: vec!["deepseek-chat".into(), "deepseek-reasoner".into()],
             yolo: false,
         };
         // verb completion at position 0
@@ -1182,13 +1327,25 @@ mod tests {
         // TAB on a known arg kind lists everything even with empty token
         let (_, cands) = helper.completions("/provider ", 10).expect("in scope");
         assert_eq!(cands.len(), 2);
+        // model completion from the cached candidates
+        let (start, cands) = helper
+            .completions("/model deepseek-", 16)
+            .expect("in scope");
+        assert_eq!(start, 7);
+        assert_eq!(cands.len(), 2);
         // toggle offers on/off
         let (_, cands) = helper.completions("/yolo o", 7).expect("in scope");
         assert_eq!(cands.len(), 2);
         // non-slash line: out of scope
         assert!(helper.completions("list files", 10).is_none());
-        // unknown arg kind → empty candidates, still in scope
-        let (_, cands) = helper.completions("/model m", 8).expect("in scope");
+        // no model candidates cached → empty, still in scope
+        let bare = SlashHelper {
+            nicks: vec![],
+            model: None,
+            models: vec![],
+            yolo: false,
+        };
+        let (_, cands) = bare.completions("/model m", 8).expect("in scope");
         assert!(cands.is_empty());
     }
 
@@ -1197,12 +1354,13 @@ mod tests {
         let helper = SlashHelper {
             nicks: vec!["a".into()],
             model: Some("m1".into()),
+            models: vec![],
             yolo: true,
         };
         let history = DefaultHistory::new();
         let ctx = rustyline::Context::new(&history);
         let hint = helper.hint("/model", 6, &ctx).expect("hint");
-        assert!(hint.contains("<name>") && hint.contains("m1"));
+        assert!(hint.contains("<name|#>") && hint.contains("m1"));
         let hint = helper
             .hint("/provider ", 10, &ctx)
             .expect("hint after space");
@@ -1210,6 +1368,37 @@ mod tests {
         // mid-line cursor or past the verb → silent
         assert!(helper.hint("/model gpt", 10, &ctx).is_none());
         assert!(helper.hint("plain text", 10, &ctx).is_none());
+    }
+
+    #[test]
+    fn listed_index_selects_by_number_or_name() {
+        assert_eq!(listed_index("2", 3), Some(1));
+        assert_eq!(listed_index("1", 1), Some(0));
+        assert_eq!(listed_index("0", 3), None, "1-based: 0 is not an index");
+        assert_eq!(listed_index("4", 3), None, "out of range → literal name");
+        assert_eq!(listed_index("gpt-4o", 3), None);
+        assert_eq!(listed_index("", 3), None);
+    }
+
+    #[test]
+    fn models_text_marks_current_and_handles_empty() {
+        let models = vec!["a".to_string(), "b".to_string()];
+        let t = models_text("deepseek", &models, Some("b"));
+        assert!(t.contains("1) a"), "{t}");
+        assert!(t.contains("2) b  <- current"), "{t}");
+        assert!(models_text("x", &[], None).contains("no model candidates"));
+    }
+
+    #[test]
+    fn model_catalog_static_merges_config_and_defaults() {
+        let cfg: Config = toml::from_str(
+            "[providers.anthropic]\ntype = \"anthropic\"\nmodel = \"claude-sonnet-4-5\"\nmodels = [\"claude-x\"]",
+        )
+        .unwrap();
+        let c = model_catalog_static(&cfg, "anthropic", Some("claude-sonnet-4-5"));
+        assert_eq!(c[0], "claude-sonnet-4-5", "current first");
+        assert!(c.contains(&"claude-x".to_string()), "config list merged");
+        assert!(c.len() > 2, "built-in fallback merged too: {c:?}");
     }
 
     #[test]

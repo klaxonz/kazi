@@ -301,6 +301,74 @@ fn window_for_cursor(text: &str, cursor: usize, budget: usize) -> (String, usize
     (chars[start..end].iter().collect(), pre)
 }
 
+/// Which list a modal [`Picker`] is choosing from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickerKind {
+    Provider,
+    Model,
+}
+
+/// A modal list picker rendered above the input: `/provider` and `/model`
+/// open one. Type to filter, ↑/↓ to move, Enter to select, Esc to cancel.
+#[derive(Debug, Clone)]
+struct Picker {
+    kind: PickerKind,
+    title: String,
+    all: Vec<String>,
+    filter: String,
+    cursor: usize,
+    /// Hoisted/marked in the list (the currently active value).
+    current: Option<String>,
+}
+
+impl Picker {
+    fn new(
+        kind: PickerKind,
+        title: impl Into<String>,
+        all: Vec<String>,
+        current: Option<&str>,
+    ) -> Self {
+        let cursor = current
+            .and_then(|c| all.iter().position(|m| m == c))
+            .unwrap_or(0);
+        Self {
+            kind,
+            title: title.into(),
+            all,
+            filter: String::new(),
+            cursor,
+            current: current.map(str::to_string),
+        }
+    }
+
+    /// Case-insensitive substring filter over the candidates.
+    fn filtered(&self) -> Vec<&String> {
+        if self.filter.is_empty() {
+            return self.all.iter().collect();
+        }
+        let needle = self.filter.to_lowercase();
+        self.all
+            .iter()
+            .filter(|m| m.to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    /// Move the cursor within the filtered list, clamped at both ends.
+    fn move_cursor(&mut self, delta: isize) {
+        let len = self.filtered().len();
+        if len == 0 {
+            self.cursor = 0;
+            return;
+        }
+        let cur = self.cursor.min(len - 1) as isize;
+        self.cursor = (cur + delta).clamp(0, len as isize - 1) as usize;
+    }
+
+    fn selected(&self) -> Option<String> {
+        self.filtered().get(self.cursor).map(|m| (*m).clone())
+    }
+}
+
 /// Everything needed to render one screenful.
 struct Screen {
     provider_desc: String,
@@ -324,6 +392,8 @@ struct Screen {
     /// A pending approval question: rendered instead of the input line and
     /// answered by the next keystroke (y/a/n).
     pending_approval: Option<ApprovalAsk>,
+    /// A modal list picker (provider/model selection), drawn above the input.
+    picker: Option<Picker>,
     /// The model's plan checklist: (content, status) pairs.
     todos: Vec<(String, String)>,
     /// Current permission mode (mirrors the shared cell; Shift+Tab cycles).
@@ -348,6 +418,7 @@ impl Screen {
             scroll: std::cell::Cell::new(0),
             busy: false,
             pending_approval: None,
+            picker: None,
             todos: Vec::new(),
             mode: crate::tools::PermissionMode::Edit,
             quit: false,
@@ -579,50 +650,54 @@ impl Screen {
         // fragments of the lines it covers. How many entries fit is decided by
         // the space above the input, not by a fixed budget.
         if self.pending_approval.is_none() {
-            let hints = self.command_hints();
             let avail = input.y.saturating_sub(status.y + 1) as usize;
-            if !hints.is_empty() && avail >= 2 {
-                let shown = hints.len().min((avail - 1).min(16));
-                let hidden = hints.len() - shown;
-                let cmd_w = hints
-                    .iter()
-                    .take(shown)
-                    .map(|(c, _)| UnicodeWidthStr::width(c.as_str()))
-                    .max()
-                    .unwrap_or(8);
-                let height = (shown + 1) as u16;
-                let area = ratatui::layout::Rect {
-                    x: 0,
-                    y: input.y - height,
-                    width: f.area().width,
-                    height,
-                };
-                let mut lines: Vec<Line> = hints
-                    .iter()
-                    .take(shown)
-                    .enumerate()
-                    .map(|(i, (cmd, help))| {
-                        let cmd_style = if i == 0 {
-                            Style::default().fg(Color::Black).bg(CYAN).bold()
+            if let Some(picker) = &self.picker {
+                draw_picker(f, input, avail, picker);
+            } else {
+                let hints = self.command_hints();
+                if !hints.is_empty() && avail >= 2 {
+                    let shown = hints.len().min((avail - 1).min(16));
+                    let hidden = hints.len() - shown;
+                    let cmd_w = hints
+                        .iter()
+                        .take(shown)
+                        .map(|(c, _)| UnicodeWidthStr::width(c.as_str()))
+                        .max()
+                        .unwrap_or(8);
+                    let height = (shown + 1) as u16;
+                    let area = ratatui::layout::Rect {
+                        x: 0,
+                        y: input.y - height,
+                        width: f.area().width,
+                        height,
+                    };
+                    let mut lines: Vec<Line> = hints
+                        .iter()
+                        .take(shown)
+                        .enumerate()
+                        .map(|(i, (cmd, help))| {
+                            let cmd_style = if i == 0 {
+                                Style::default().fg(Color::Black).bg(CYAN).bold()
+                            } else {
+                                Style::default().fg(DIM)
+                            };
+                            Line::from(vec![
+                                Span::styled(format!(" {cmd:<cmd_w$} "), cmd_style),
+                                Span::styled(help.clone(), Style::default().fg(DIM)),
+                            ])
+                        })
+                        .collect();
+                    lines.push(Line::styled(
+                        if hidden > 0 {
+                            format!(" … +{hidden} more · Tab completes")
                         } else {
-                            Style::default().fg(DIM)
-                        };
-                        Line::from(vec![
-                            Span::styled(format!(" {cmd:<cmd_w$} "), cmd_style),
-                            Span::styled(help.clone(), Style::default().fg(DIM)),
-                        ])
-                    })
-                    .collect();
-                lines.push(Line::styled(
-                    if hidden > 0 {
-                        format!(" … +{hidden} more · Tab completes")
-                    } else {
-                        " Tab completes".to_string()
-                    },
-                    Style::default().fg(DIM),
-                ));
-                f.render_widget(Clear, area);
-                f.render_widget(Paragraph::new(Text::from(lines)), area);
+                            " Tab completes".to_string()
+                        },
+                        Style::default().fg(DIM),
+                    ));
+                    f.render_widget(Clear, area);
+                    f.render_widget(Paragraph::new(Text::from(lines)), area);
+                }
             }
         }
 
@@ -668,6 +743,71 @@ impl Screen {
             .min(input.right().saturating_sub(1));
         f.set_cursor_position(ratatui::layout::Position { x, y: input.y + 1 });
     }
+}
+
+/// Render the modal picker as an overlay directly above the input: a title
+/// line, the filtered rows (cursor highlighted, window scrolled to keep it
+/// visible), and a footer with the current filter and key hints.
+fn draw_picker(f: &mut Frame, input: ratatui::layout::Rect, avail: usize, p: &Picker) {
+    if avail < 3 {
+        return; // no room for title + a row + footer
+    }
+    let hints = p.filtered();
+    let shown = hints.len().min(avail - 2).min(16);
+    let start = if shown > 0 && p.cursor >= shown {
+        p.cursor + 1 - shown
+    } else {
+        0
+    };
+    let height = (shown + 2) as u16;
+    let area = ratatui::layout::Rect {
+        x: 0,
+        y: input.y - height,
+        width: f.area().width,
+        height,
+    };
+    let mut lines: Vec<Line> = Vec::with_capacity(shown + 2);
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" {} ", p.title),
+            Style::default().fg(Color::Black).bg(CYAN).bold(),
+        ),
+        Span::styled(
+            match &p.current {
+                Some(c) => format!(" current: {c}"),
+                None => String::new(),
+            },
+            Style::default().fg(DIM),
+        ),
+    ]));
+    if shown == 0 {
+        lines.push(Line::styled("  (no match)", Style::default().fg(YELLOW)));
+    } else {
+        for (i, m) in hints.iter().enumerate().skip(start).take(shown) {
+            let style = if i == p.cursor {
+                Style::default().fg(Color::Black).bg(CYAN).bold()
+            } else {
+                Style::default().fg(DIM)
+            };
+            let marker = if Some(m.as_str()) == p.current.as_deref() {
+                "  (current)"
+            } else {
+                ""
+            };
+            lines.push(Line::styled(format!(" {m}{marker}"), style));
+        }
+    }
+    let extra = if shown < hints.len() {
+        format!(" · ↑/↓ · Enter · Esc  ({}/{})", p.cursor + 1, hints.len())
+    } else {
+        " · ↑/↓ · Enter · Esc".to_string()
+    };
+    lines.push(Line::styled(
+        format!(" filter: {}_", p.filter) + &extra,
+        Style::default().fg(DIM),
+    ));
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 /// (start, end, clamped_offset) of the transcript window: `off` counts lines
@@ -1046,7 +1186,21 @@ async fn run_command(
         }
         "provider" => {
             if arg.is_empty() {
-                push_lines(screen, repl::providers_text(&sess.cfg));
+                let nicks = sess.cfg.nicks();
+                if nicks.is_empty() {
+                    push_lines(screen, repl::providers_text(&sess.cfg));
+                } else {
+                    let current = sess
+                        .provider
+                        .clone()
+                        .or_else(|| sess.cfg.resolve(None, None).ok().map(|r| r.nick));
+                    screen.picker = Some(Picker::new(
+                        PickerKind::Provider,
+                        "select provider",
+                        nicks,
+                        current.as_deref(),
+                    ));
+                }
             } else {
                 rebuild_agent(
                     screen,
@@ -1056,20 +1210,48 @@ async fn run_command(
                     permission,
                     Some(arg.to_string()),
                     sess.model.clone(),
+                    false,
                 )
                 .await;
             }
         }
         "model" => {
             if arg.is_empty() {
-                let cur = match slot.lock().await.as_ref() {
-                    Some(a) => a.provider().describe(),
-                    None => BUSY_TEXT.to_string(),
-                };
-                push_lines(
-                    screen,
-                    format!("current: {cur}\n{}", repl::usage_for("/model")),
-                );
+                let nick = sess
+                    .provider
+                    .clone()
+                    .or_else(|| sess.cfg.resolve(None, None).ok().map(|r| r.nick));
+                match nick {
+                    Some(nick) => {
+                        let cur = sess.model.clone().or_else(|| {
+                            sess.cfg
+                                .resolve(sess.provider.as_deref(), None)
+                                .ok()
+                                .map(|r| r.settings.model)
+                        });
+                        let models = repl::model_catalog(&sess.cfg, &nick, cur.as_deref()).await;
+                        if models.is_empty() {
+                            push_lines(
+                                screen,
+                                format!(
+                                    "no model candidates for `{nick}` — use /model <name> ({})",
+                                    repl::usage_for("/model")
+                                ),
+                            );
+                        } else {
+                            screen.picker = Some(Picker::new(
+                                PickerKind::Model,
+                                format!("select model ({nick})"),
+                                models,
+                                cur.as_deref(),
+                            ));
+                        }
+                    }
+                    None => push_lines(
+                        screen,
+                        "no provider resolved — check config (`kazi providers`)",
+                    ),
+                }
             } else {
                 rebuild_agent(
                     screen,
@@ -1079,6 +1261,7 @@ async fn run_command(
                     permission,
                     sess.provider.clone(),
                     Some(arg.to_string()),
+                    true,
                 )
                 .await;
             }
@@ -1156,6 +1339,9 @@ fn mode_note(mode: crate::tools::PermissionMode) -> &'static str {
 /// Rebuild the agent for `/provider` and `/model`: a fresh provider, the
 /// same permission cell (so Shift+Tab stays in sync) and the same approval
 /// channel. The conversation is dropped, exactly like the line REPL does.
+/// When `probe` is set, one tiny no-tools round verifies the model before it is
+/// committed — a wrong name is otherwise only rejected on the next real task.
+/// Returns `true` when the switch took (so callers may chain a picker).
 #[allow(clippy::too_many_arguments)]
 async fn rebuild_agent(
     screen: &mut Screen,
@@ -1165,7 +1351,8 @@ async fn rebuild_agent(
     permission: &crate::tools::Permission,
     provider: Option<String>,
     model: Option<String>,
-) {
+    probe: bool,
+) -> bool {
     let approver: std::sync::Arc<dyn Approver> =
         std::sync::Arc::new(TuiApprover::new(ask_tx.clone()));
     let built = Agent::default_cli_with_approver(
@@ -1178,6 +1365,16 @@ async fn rebuild_agent(
     .await;
     match built {
         Ok(mut agent) => {
+            if probe {
+                if let Err(e) = agent.probe().await {
+                    let msg = format!(
+                        "model rejected by provider, staying on {}\n{e}",
+                        screen.provider_desc
+                    );
+                    push_lines(screen, msg);
+                    return false;
+                }
+            }
             agent.ctx.permission = permission.clone();
             let desc = agent.provider().describe();
             sess.provider = provider;
@@ -1185,8 +1382,71 @@ async fn rebuild_agent(
             screen.provider_desc = desc.clone();
             *slot.lock().await = Some(agent);
             push_lines(screen, format!("switched -> {desc}"));
+            true
         }
-        Err(e) => push_lines(screen, format!("switch failed: {e}")),
+        Err(e) => {
+            push_lines(screen, format!("switch failed: {e}"));
+            false
+        }
+    }
+}
+
+/// Apply a completed picker choice: a model rebuilds on the same provider; a
+/// provider switch drops the old model override and then offers that
+/// provider's models (choosing a provider usually means choosing a model next).
+async fn apply_selection(
+    screen: &mut Screen,
+    slot: &std::sync::Arc<tokio::sync::Mutex<Option<Agent>>>,
+    sess: &mut SessionState,
+    ask_tx: &tokio::sync::mpsc::UnboundedSender<ApprovalAsk>,
+    permission: &crate::tools::Permission,
+    kind: PickerKind,
+    chosen: String,
+) {
+    use super::repl;
+    match kind {
+        PickerKind::Model => {
+            rebuild_agent(
+                screen,
+                slot,
+                sess,
+                ask_tx,
+                permission,
+                sess.provider.clone(),
+                Some(chosen),
+                true,
+            )
+            .await;
+        }
+        PickerKind::Provider => {
+            let prev_model = sess.model.take();
+            let ok = rebuild_agent(
+                screen,
+                slot,
+                sess,
+                ask_tx,
+                permission,
+                Some(chosen.clone()),
+                None,
+                false,
+            )
+            .await;
+            if ok {
+                let cur = sess.model.clone();
+                let models = repl::model_catalog(&sess.cfg, &chosen, cur.as_deref()).await;
+                if !models.is_empty() {
+                    screen.picker = Some(Picker::new(
+                        PickerKind::Model,
+                        format!("select model ({chosen})"),
+                        models,
+                        cur.as_deref(),
+                    ));
+                }
+            } else {
+                // switch failed: keep the provider's previous model override
+                sess.model = prev_model;
+            }
+        }
     }
 }
 
@@ -1266,6 +1526,48 @@ async fn tui_inner(
             maybe_ev = events.next() => match maybe_ev {
                 Some(Ok(CtEvent::Key(key))) if key.kind != KeyEventKind::Release => {
                     log_key_event(&key);
+                    // a modal picker owns the keyboard while it is open
+                    if screen.picker.is_some() {
+                        let mut close = false;
+                        let mut accept: Option<(PickerKind, String)> = None;
+                        if let Some(p) = screen.picker.as_mut() {
+                            match key.code {
+                                KeyCode::Up => p.move_cursor(-1),
+                                KeyCode::Down => p.move_cursor(1),
+                                KeyCode::Backspace => {
+                                    p.filter.pop();
+                                    p.cursor = 0;
+                                }
+                                KeyCode::Esc => close = true,
+                                KeyCode::Enter => {
+                                    accept = p.selected().map(|s| (p.kind, s));
+                                }
+                                code => {
+                                    if let Some(ch) = accepted_char(&code, key.modifiers) {
+                                        p.filter.push(ch);
+                                        p.cursor = 0;
+                                    }
+                                }
+                            }
+                        }
+                        if close {
+                            screen.picker = None;
+                        }
+                        if let Some((kind, chosen)) = accept {
+                            screen.picker = None;
+                            apply_selection(
+                                screen,
+                                &shared_agent,
+                                sess,
+                                ask_tx,
+                                permission,
+                                kind,
+                                chosen,
+                            )
+                            .await;
+                        }
+                        continue;
+                    }
                     // a pending approval swallows the next keystroke
                     if let Some(pending) = screen.pending_approval.take() {
                         let decision = match key.code {
@@ -1712,6 +2014,71 @@ mod tests {
         assert!(
             s.command_hints().is_empty(),
             "a slash mid-line is not a command"
+        );
+    }
+
+    #[test]
+    fn picker_filters_moves_and_selects() {
+        let mut p = Picker::new(
+            PickerKind::Model,
+            "select model",
+            vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "alpine".to_string(),
+            ],
+            Some("beta"),
+        );
+        // cursor parks on the current value
+        assert_eq!(p.selected().as_deref(), Some("beta"));
+        // case-insensitive substring filter
+        p.filter = "AL".to_string();
+        let names: Vec<&str> = p.filtered().into_iter().map(String::as_str).collect();
+        assert_eq!(names, vec!["alpha", "alpine"]);
+        // cursor follows the filtered list and clamps at both ends
+        p.cursor = 0;
+        p.move_cursor(1);
+        assert_eq!(p.selected().as_deref(), Some("alpine"));
+        p.move_cursor(9);
+        assert_eq!(p.selected().as_deref(), Some("alpine"), "clamped at end");
+        p.move_cursor(-9);
+        assert_eq!(p.selected().as_deref(), Some("alpha"), "clamped at start");
+        // no matches: nothing selected, moving is a no-op (no panic)
+        p.filter = "zzz".to_string();
+        assert!(p.filtered().is_empty());
+        assert_eq!(p.selected(), None);
+        p.move_cursor(1);
+        assert_eq!(p.selected(), None);
+    }
+
+    #[test]
+    fn picker_renders_as_overlay() {
+        let mut s = Screen::new("deepseek", "sess", 10);
+        for _ in 0..8 {
+            s.push(LineKind::Dim, "TRANSCRIPT_MARKER".to_string());
+        }
+        s.picker = Some(Picker::new(
+            PickerKind::Model,
+            "select model",
+            vec!["m1".to_string(), "m2".to_string()],
+            Some("m2"),
+        ));
+        let mut term = Terminal::new(TestBackend::new(64, 14)).unwrap();
+        term.draw(|f| s.draw(f)).unwrap();
+        let rows = frame_rows(&term);
+        assert!(
+            rows.iter().any(|r| r.contains("select model")),
+            "title missing: {rows:#?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("m1")), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains("m2")), "{rows:#?}");
+        assert!(
+            rows.iter().any(|r| r.contains("filter:")),
+            "footer missing: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("TRANSCRIPT_MARKER")),
+            "the picker must not eat the whole transcript: {rows:#?}"
         );
     }
 

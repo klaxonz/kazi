@@ -54,4 +54,10 @@ impl Provider for OllamaProvider {
     ) -> Result<LlmResponse, LlmError> {
         self.inner.complete_stream(req, tx).await
     }
+
+    /// Inherited from the OpenAI-compatible transport — Ollama serves
+    /// `GET /v1/models` too (its `/api/tags` is an equivalent source).
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        <OpenAiProvider as Provider>::list_models(&self.inner).await
+    }
 }

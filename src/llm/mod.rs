@@ -123,6 +123,74 @@ pub trait Provider: Send + Sync {
         req: LlmRequest,
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<LlmResponse, LlmError>;
+
+    /// Model ids the endpoint reports as available, best-effort. Defaults to
+    /// empty (a provider that cannot enumerate models); the picker then falls
+    /// back to config/default lists. Never fatal — callers treat an error or an
+    /// empty list the same way.
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        Ok(Vec::new())
+    }
+}
+
+/// Built-in fallback model list per provider kind, used when the endpoint
+/// cannot be queried and config lists nothing. OpenAiCompat is intentionally
+/// empty: gateway model names are arbitrary.
+pub fn default_models(kind: ProviderKind) -> &'static [&'static str] {
+    match kind {
+        ProviderKind::Anthropic => &["claude-sonnet-4-5", "claude-opus-4-1", "claude-haiku-4-5"],
+        ProviderKind::Ollama => &["qwen3:14b", "llama3.2", "deepseek-r1"],
+        ProviderKind::OpenAiCompat => &[],
+    }
+}
+
+/// Whether a model id can plausibly be served on this provider's wire. A
+/// gateway's `/models` endpoint may list every model it proxies even though its
+/// Anthropic wire (`/v1/messages`) only accepts Claude models — offering the
+/// rest would just 400 on the next task (e.g. Command Code's Provider API:
+/// "Use /provider/v1/chat/completions for OpenAI and OSS models"). The
+/// OpenAI-compatible wire is left unfiltered because it legitimately carries
+/// non-OpenAI ids too (OpenRouter serves `anthropic/claude-*`).
+pub fn model_fits_wire(kind: ProviderKind, model: &str) -> bool {
+    match kind {
+        ProviderKind::Anthropic => model.to_ascii_lowercase().contains("claude"),
+        ProviderKind::OpenAiCompat | ProviderKind::Ollama => true,
+    }
+}
+
+/// Merge picker candidates: explicit config `models`, then the live endpoint
+/// list, then the built-in fallback — deduped, with the current model hoisted
+/// to the front when it is known. Model ids are case-sensitive. Live ids are
+/// filtered to those the wire can actually serve ([`model_fits_wire`]); config
+/// ids are taken as-is (an explicit user choice).
+pub fn merge_catalog(
+    config_models: &[String],
+    live: &[String],
+    kind: ProviderKind,
+    current: Option<&str>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if let Some(cur) = current.map(str::trim).filter(|c| !c.is_empty()) {
+        out.push(cur.to_string());
+        seen.insert(cur.to_string());
+    }
+    for m in config_models
+        .iter()
+        .map(String::as_str)
+        .chain(
+            live.iter()
+                .map(String::as_str)
+                .filter(|m| model_fits_wire(kind, m)),
+        )
+        .chain(default_models(kind).iter().copied())
+    {
+        let m = m.trim();
+        if !m.is_empty() && seen.insert(m.to_string()) {
+            out.push(m.to_string());
+        }
+    }
+    out
 }
 
 /// Build an HTTP client shared by all providers.
@@ -168,5 +236,48 @@ mod tests {
         let long = "x".repeat(1000);
         let msg = provider_error_message(&long);
         assert_eq!(msg.chars().count(), 401, "capped with an ellipsis");
+    }
+
+    #[test]
+    fn merge_catalog_orders_dedups_and_hoists_current() {
+        // OpenAiCompat wire keeps every live id (no wire filter)
+        let cfg = vec!["cfg-a".to_string(), "shared".to_string()];
+        let live = vec!["live-a".to_string(), "shared".to_string()];
+        let merged = merge_catalog(&cfg, &live, ProviderKind::OpenAiCompat, Some("cur"));
+        // current first, then config, then live
+        assert_eq!(merged, vec!["cur", "cfg-a", "shared", "live-a"]);
+    }
+
+    #[test]
+    fn merge_catalog_filters_live_models_by_wire() {
+        // an Anthropic-wire gateway lists OSS models too, but only Claude ids
+        // actually answer on /v1/messages — the rest must not be offered
+        let live = vec![
+            "deepseek/deepseek-v4.1-flash".to_string(),
+            "claude-opus-4-1".to_string(),
+        ];
+        let merged = merge_catalog(&[], &live, ProviderKind::Anthropic, None);
+        assert!(merged.contains(&"claude-opus-4-1".to_string()));
+        assert!(
+            !merged.iter().any(|m| m.contains("deepseek")),
+            "OSS ids must be filtered off the Anthropic wire: {merged:?}"
+        );
+        // config ids are an explicit choice: never filtered
+        let cfg = vec!["my-proxy-model".to_string()];
+        let merged = merge_catalog(&cfg, &[], ProviderKind::Anthropic, None);
+        assert!(merged.contains(&"my-proxy-model".to_string()));
+    }
+
+    #[test]
+    fn merge_catalog_falls_back_to_defaults_and_handles_empty() {
+        let merged = merge_catalog(&[], &[], ProviderKind::Ollama, None);
+        assert!(merged.contains(&"qwen3:14b".to_string()));
+        // OpenAiCompat has no defaults and no sources → empty
+        assert!(merge_catalog(&[], &[], ProviderKind::OpenAiCompat, None).is_empty());
+        // a current model alone is still a usable single-item list
+        assert_eq!(
+            merge_catalog(&[], &[], ProviderKind::OpenAiCompat, Some("my-model")),
+            vec!["my-model".to_string()]
+        );
     }
 }

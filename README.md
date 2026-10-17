@@ -43,6 +43,7 @@ type = "openai"                  # any OpenAI-compatible endpoint
 base_url = "https://api.deepseek.com/v1"
 api_key_env = "DEEPSEEK_API_KEY"
 model = "deepseek-chat"
+# models = ["deepseek-chat", "deepseek-reasoner"]  # extras the /model picker offers (optional)
 
 [providers.anthropic]
 type = "anthropic"
@@ -99,6 +100,19 @@ the line REPL — `/new`, `/compact`, `/resume`, `/provider`, `/model`,
 `/permission`, `/status`, `/tools`, `/undo`, `/context` — so there is no
 second-class front-end. `/undo` restores the files the last task changed and
 `/help` prints the table plus the key bindings.
+
+Picking a provider or model never means typing a name from memory:
+
+- **TUI** — bare `/provider` and `/model` open a list overlay: type to filter,
+  `↑/↓` to move, `Enter` to switch, `Esc` to cancel. Choosing a provider then
+  offers that provider's models.
+- **Line REPL** — bare `/provider` / `/model` print a numbered list; follow up
+  with `/model 2` (by number) or `/model gpt-4o` (by name). `/model` also gets
+  TAB completion.
+- Candidates come from the provider's `models = [...]` config list, a live
+  `GET /models` query, and a built-in fallback — merged and deduped, so the
+  picker works offline and never blocks on a dead endpoint. First run (missing
+  key) walks you through choosing a provider and model before asking for the key.
 
 Every task run checkpoints the files it is about to modify (newest 20 kept),
 so `/undo` is a one-keystroke safety net after an aggressive edit.

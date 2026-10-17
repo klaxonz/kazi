@@ -37,6 +37,7 @@ type = "openai"
 base_url = "https://api.deepseek.com/v1"
 api_key_env = "DEEPSEEK_API_KEY"
 model = "deepseek-chat"
+# models = ["deepseek-chat", "deepseek-reasoner"]   # extras the /model picker offers (optional)
 
 [providers.openrouter]
 type = "openai"

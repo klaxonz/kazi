@@ -83,6 +83,25 @@ kazi 保留原始字符串,让工具报错驱动模型重试。
 
 往返正确性由测试锁定:`anthropic.rs` 中的 wire 单测断言了以上每一种形态。
 
+### 模型发现与选择器
+
+`Provider` trait 上还有一个带默认实现的 `list_models()`(默认返回空):
+OpenAI 兼容走 `GET {base}/models`,Anthropic 走 `GET {base}/v1/models`,
+Ollama 复用前者;`RetryProvider` 直接转发。`/provider`、`/model` 和首次引导
+都不再要求手输名字,而是从候选列表里选。
+
+候选由 `llm::merge_catalog()` 合并三处来源并去重(优先级 config > 实时 > 内置):
+
+1. `config.toml` 里该 provider 的 `models = [...]`(用户显式列出)
+2. 端点实时返回的模型 id
+3. `llm::default_models(kind)` 的内置回退清单
+
+取候选的入口是 `repl::model_catalog()`(带 ~3s 超时,任何一个来源失败都静默
+退化,离线也能用)。TUI 把列表画成输入框上方的浮层(`tui.rs::draw_picker`,
+方向键移动 + 输入即时过滤 + Enter 选中);行 REPL 打印带编号的列表,用
+`/model 2` 或 `/model <name>` 选择。选择器的候选、编号解析分别是
+`Picker`(纯逻辑,可单测)和 `repl::listed_index()` / `cli::resolve_pick()`。
+
 ## 3. 流式输出
 
 两个协议都用 SSE,但格式不同 (`src/llm/sse.rs` 是共用的 ~80 行解码器,含义注释齐全):

@@ -116,6 +116,20 @@ impl OpenAiProvider {
         }
     }
 
+    /// Parse the model-listing response (`{"data": [{"id": "..."}, ...]}`).
+    /// Shared shape for OpenAI-compatible and Anthropic `/models` endpoints.
+    pub(crate) fn parse_models(v: &Value) -> Vec<String> {
+        v["data"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m["id"].as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Parse a non-streaming `chat.completions` response.
     fn parse_response(v: &Value) -> Result<LlmResponse, LlmError> {
         let choice = v["choices"]
@@ -276,6 +290,21 @@ impl Provider for OpenAiProvider {
             usage,
         })
     }
+
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        let mut rb = self.http.get(format!("{}/models", self.base));
+        if let Some(k) = &self.api_key {
+            rb = rb.bearer_auth(k);
+        }
+        let resp = rb.send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(LlmError::http(status, &body));
+        }
+        let v: Value = resp.json().await?;
+        Ok(Self::parse_models(&v))
+    }
 }
 
 #[cfg(test)]
@@ -348,5 +377,20 @@ mod tests {
             r.tool_calls[0].arguments,
             serde_json::Value::String("{oops".to_string())
         );
+    }
+
+    #[test]
+    fn parse_models_reads_ids_and_tolerates_junk() {
+        let v = json!({"object": "list", "data": [
+            {"id": "gpt-4o", "object": "model"},
+            {"id": "gpt-4o-mini"},
+            {"object": "model"}          // no id: skipped
+        ]});
+        assert_eq!(
+            OpenAiProvider::parse_models(&v),
+            vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]
+        );
+        // missing data array → empty, never a panic
+        assert!(OpenAiProvider::parse_models(&json!({"error": "nope"})).is_empty());
     }
 }

@@ -360,6 +360,25 @@ impl Provider for AnthropicProvider {
             usage,
         })
     }
+
+    /// `GET /v1/models` — Anthropic lists models on the same `data[].id`
+    /// envelope as OpenAI, so the parser is shared with [`super::openai`].
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        let resp = self
+            .http
+            .get(format!("{}/v1/models", self.base))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", API_VERSION)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(LlmError::http(status, &body));
+        }
+        let v: Value = resp.json().await?;
+        Ok(super::openai::OpenAiProvider::parse_models(&v))
+    }
 }
 
 #[cfg(test)]
