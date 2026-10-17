@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-17
+
+### Added
+
+- **In-TUI command completion**: typing `/` opens a dropdown of every slash
+  command with its help text (the first row is the one Tab completes to);
+  `Tab` completes to the first match, or to the longest shared prefix when
+  several commands share it, and opens the argument position for commands
+  that take one. The dropdown closes as soon as arguments begin.
+
 ## [0.12.0] - 2026-10-17
 
 ### Added

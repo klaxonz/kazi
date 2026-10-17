@@ -77,9 +77,10 @@ Both share the same engine, sessions, and slash commands (`/compact`,
 alternate-screen support.
 
 TUI keys: `↑/↓` input history, `←/→ Home/End Ctrl+A/E/U/K/W` line editing,
-`PgUp/PgDn` or the mouse wheel to scroll (`Ctrl+Home/End` jump), `Esc`
-interrupts a running task (and quits when idle), `Ctrl+C` quits, `/undo`
-restores the files the last task changed, `/help` lists all of it.
+`/` opens the command dropdown and `Tab` completes, `PgUp/PgDn` or the mouse
+wheel to scroll (`Ctrl+Home/End` jump), `Esc` interrupts a running task (and
+quits when idle), `Ctrl+C` quits, `/undo` restores the files the last task
+changed, `/help` lists all of it.
 
 Every task run checkpoints the files it is about to modify (newest 20 kept),
 so `/undo` is a one-keystroke safety net after an aggressive edit.

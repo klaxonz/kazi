@@ -321,6 +321,59 @@ fn usage_line(spec: &CmdSpec) -> String {
     }
 }
 
+/// Completion rows for a partially typed command (`token` includes the
+/// leading slash): `(name + args, help)`. Powers the TUI's `/` dropdown.
+pub fn command_rows(token: &str) -> Vec<(String, String)> {
+    COMMANDS
+        .iter()
+        .filter(|c| c.name.starts_with(token))
+        .map(|c| {
+            let name = if c.args.is_empty() {
+                c.name.to_string()
+            } else {
+                format!("{} {}", c.name, c.args)
+            };
+            (name, c.help.to_string())
+        })
+        .collect()
+}
+
+/// Tab completion for a partial command name: the longest common prefix of
+/// the candidates, or `None` when that would not extend what was typed.
+pub fn command_completion(token: &str) -> Option<String> {
+    let names: Vec<&str> = COMMANDS
+        .iter()
+        .filter(|c| c.name.starts_with(token))
+        .map(|c| c.name)
+        .collect();
+    let first = *names.first()?;
+    let mut prefix = first.to_string();
+    for name in &names[1..] {
+        let common = prefix
+            .bytes()
+            .zip(name.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        prefix.truncate(common);
+    }
+    if prefix.len() > token.len() {
+        Some(prefix)
+    } else {
+        None
+    }
+}
+
+/// The command token being typed, if the input is still in command position
+/// (starts with `/`, no space yet). `None` once arguments begin.
+pub fn pending_command(input: &str) -> Option<&str> {
+    let t = input.trim_start();
+    if t.starts_with('/') && !t.contains(char::is_whitespace) {
+        Some(t)
+    } else {
+        None
+    }
+}
+
 /// Levenshtein distance (chars, no freebies) — enough for 8-char command names.
 fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
@@ -1138,6 +1191,29 @@ mod tests {
 #[cfg(test)]
 mod slug_tests {
     use super::*;
+
+    #[test]
+    fn command_completion_and_dropdown_rows() {
+        // command position detection
+        assert_eq!(pending_command("/hel"), Some("/hel"));
+        assert!(pending_command("/help me").is_none(), "arguments end it");
+        assert!(pending_command("plain task").is_none());
+        assert!(pending_command("ask about /undo").is_none());
+
+        // rows for `/` cover the whole table and carry help text
+        let all = command_rows("/");
+        assert!(all.len() >= 10, "got {} rows", all.len());
+        assert!(all.iter().any(|(n, _)| n == "/resume <prefix>"), "{all:?}");
+        assert!(all.iter().any(|(_, help)| help.contains("restore files")));
+
+        // unique prefix completes all the way
+        assert_eq!(command_completion("/res").as_deref(), Some("/resume"));
+        // a fork that shares only what was typed makes no progress
+        assert_eq!(command_completion("/co"), None);
+        assert_eq!(command_completion("/"), None);
+        // already-complete name: nothing to add
+        assert_eq!(command_completion("/undo"), None);
+    }
 
     #[test]
     fn approval_answers_map_to_decisions() {

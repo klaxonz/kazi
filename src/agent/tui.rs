@@ -43,6 +43,7 @@ const YELLOW: Color = Color::Yellow;
 const TUI_HELP: &[&str] = &[
     "keys: Enter submit · Esc interrupt (idle: quit) · Ctrl+C quit",
     "↑/↓ input history · Ctrl+A/E/U/K/W edit · Ctrl+L clear transcript",
+    "/ opens the command list · Tab completes",
     "PgUp/PgDn or mouse wheel scroll · Ctrl+Home top · Ctrl+End bottom",
     "Shift+Tab cycles permission mode (read-only → yolo → edit)",
     "@file in a task attaches the file's contents",
@@ -154,6 +155,12 @@ impl Input {
         let b = self.byte_of(self.cursor);
         self.text.insert(b, ch);
         self.cursor += 1;
+    }
+
+    /// Replace the whole line (Tab completion) and park the caret at the end.
+    fn set_text(&mut self, text: String) {
+        self.text = text;
+        self.cursor = self.chars_len();
     }
 
     fn backspace(&mut self) {
@@ -370,6 +377,15 @@ impl Screen {
         self.scroll.set(usize::MAX); // clamped in draw()
     }
 
+    /// Completion rows to offer while the line is still a command token —
+    /// the `/` dropdown. Empty once the user types an argument.
+    fn command_hints(&self) -> Vec<(String, String)> {
+        match super::repl::pending_command(&self.input.text) {
+            Some(token) => super::repl::command_rows(token),
+            None => Vec::new(),
+        }
+    }
+
     /// Render one agent event into the screen state.
     fn consume(&mut self, ev: AgentEvent) {
         match ev {
@@ -458,17 +474,41 @@ impl Screen {
         Some(t)
     }
 
-    /// Paint one frame. Height budget: status 1, plan checklist (when the
-    /// model keeps one), transcript, input 3.
+    /// Paint one frame. Height budget: status 1, plan checklist, command
+    /// completion rows, transcript, input 3.
     fn draw(&self, f: &mut Frame) {
         let todo_rows = self.todos.len().min(6) as u16;
-        let [status, todos_area, body, input] = Layout::vertical([
+        let hints = self.command_hints();
+        let hint_rows = hints.len().min(8) as u16;
+        let [status, todos_area, hints_area, body, input] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(todo_rows),
+            Constraint::Length(hint_rows),
             Constraint::Min(3),
             Constraint::Length(3),
         ])
         .areas(f.area());
+
+        // `/` dropdown: the first row is the one Tab would complete to
+        if hint_rows > 0 {
+            let lines: Vec<Line> = hints
+                .iter()
+                .take(8)
+                .enumerate()
+                .map(|(i, (cmd, help))| {
+                    let cmd_style = if i == 0 {
+                        Style::default().fg(CYAN)
+                    } else {
+                        Style::default().fg(DIM)
+                    };
+                    Line::from(vec![
+                        Span::styled(format!("  {cmd:<26}"), cmd_style),
+                        Span::styled(help.clone(), Style::default().fg(DIM)),
+                    ])
+                })
+                .collect();
+            f.render_widget(Paragraph::new(Text::from(lines)), hints_area);
+        }
 
         if todo_rows > 0 {
             let lines: Vec<Line> = self
@@ -1024,6 +1064,20 @@ async fn tui_inner(
                             }
                         }
                     }
+                    KeyCode::Tab => {
+                        // complete the command token; a unique match opens its
+                        // argument position (trailing space)
+                        let token = super::repl::pending_command(&screen.input.text)
+                            .map(|t| t.to_string());
+                        if let Some(token) = token {
+                            let hints = super::repl::command_rows(&token);
+                            if hints.len() == 1 {
+                                screen.input.set_text(format!("{token} "));
+                            } else if let Some(done) = super::repl::command_completion(&token) {
+                                screen.input.set_text(done);
+                            }
+                        }
+                    }
                     KeyCode::Backspace => screen.input.backspace(),
                     KeyCode::Delete => screen.input.delete(),
                     KeyCode::Left => screen.input.left(),
@@ -1303,6 +1357,48 @@ mod tests {
         assert_eq!(scroll_range(100, 10, 999), (0, 10, 90));
         // fewer lines than the viewport
         assert_eq!(scroll_range(3, 10, 0), (0, 3, 0));
+    }
+
+    #[test]
+    fn command_dropdown_renders_in_frame() {
+        use ratatui::backend::TestBackend;
+        let mut s = Screen::new("deepseek", "sess", 10);
+        s.input.set_text("/u".into());
+        let mut term = Terminal::new(TestBackend::new(64, 12)).unwrap();
+        term.draw(|f| s.draw(f)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(text.contains("/undo"), "dropdown row missing:\n{text}");
+        assert!(
+            text.contains("restore files"),
+            "help column missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn command_hints_track_command_position() {
+        let mut s = Screen::new("prov", "sess", 10);
+        assert!(s.command_hints().is_empty(), "no slash, no dropdown");
+
+        s.input.set_text("/".into());
+        assert!(s.command_hints().len() >= 10, "`/` lists the table");
+
+        s.input.set_text("/undo".into());
+        assert_eq!(s.command_hints().len(), 1, "narrowed to one");
+
+        s.input.set_text("/undo ".into());
+        assert!(s.command_hints().is_empty(), "arguments close the dropdown");
+
+        s.input.set_text("please /undo".into());
+        assert!(
+            s.command_hints().is_empty(),
+            "a slash mid-line is not a command"
+        );
     }
 
     #[test]
