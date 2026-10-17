@@ -994,6 +994,14 @@ mod tests {
         path
     }
 
+    /// A per-test directory under the scratch root: tests run in parallel and
+    /// used to write the same file name into one shared dir, which raced.
+    fn scratch_named(name: &str) -> std::path::PathBuf {
+        let dir = scratch().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     fn agent_with(script: Vec<LlmResponse>) -> Agent {
         let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(script));
         let mut agent = Agent::new(
@@ -1051,7 +1059,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_call_round_then_final() {
-        std::fs::write(scratch().join("note.txt"), b"first line\nsecond line").unwrap();
+        let dir = scratch_named("read-round");
+        std::fs::write(dir.join("note.txt"), b"first line\nsecond line").unwrap();
         let script = vec![
             LlmResponse {
                 tool_calls: vec![ToolCall {
@@ -1069,6 +1078,7 @@ mod tests {
             },
         ];
         let mut a = agent_with(script);
+        a.ctx.cwd = dir.clone();
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<AgentEvent>::new()));
         let ev_events = events.clone();
         let out = a
@@ -1499,6 +1509,8 @@ mod tests {
         ];
         let mut a =
             agent_with_ctx(script, test_ctx()).with_feedback(Some("echo KAZI_FEEDBACK_OK".into()));
+        // its own dir: `gen.txt` must not race with other tests
+        a.ctx.cwd = scratch_named("feedback-round");
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(bool, String)>::new()));
         let sink = seen.clone();
         a.run_task("write a file", move |ev| {
@@ -1591,7 +1603,8 @@ mod tests {
 
     #[tokio::test]
     async fn parallel_tool_calls_execute_both_in_call_order() {
-        std::fs::write(scratch().join("note.txt"), b"first line").unwrap();
+        let dir = scratch_named("parallel-round");
+        std::fs::write(dir.join("note.txt"), b"first line").unwrap();
         let script = vec![
             LlmResponse {
                 tool_calls: vec![
@@ -1614,6 +1627,7 @@ mod tests {
             },
         ];
         let mut a = agent_with(script);
+        a.ctx.cwd = dir.clone();
         let out = a.run_task("run two tools", |_| {}).await.unwrap();
         assert_eq!(out, "both done");
         // system, user, assistant(2 calls), tool(a), tool(b), assistant
@@ -1627,9 +1641,10 @@ mod tests {
     #[tokio::test]
     async fn denied_command_isolated_other_tools_still_run() {
         use crate::tools::DenyApprover;
-        std::fs::write(scratch().join("note.txt"), b"first line").unwrap();
+        let dir = scratch_named("denied-round");
+        std::fs::write(dir.join("note.txt"), b"first line").unwrap();
         let ctx = ToolCtx {
-            cwd: scratch().to_path_buf(),
+            cwd: dir.clone(),
             sandbox_root: None,
             timeout: Duration::from_secs(10),
             output_limit: 4096,

@@ -121,7 +121,8 @@ spinner with elapsed seconds shows that a task is running, not hung.
 Picking a provider or model never means typing a name from memory:
 
 - **TUI** — bare `/model` opens ONE list of `provider/model` rows (the current
-  pick first, live model lists merged with the config + built-in fallback), so a
+  pick first, config + built-in candidates immediately, live model lists merged
+  in a moment later), so a
   single selection switches provider and model together; type to filter, `↑/↓`
   to move, `Enter` to switch, `Esc` to cancel. Bare `/provider` stays for
   provider-only switches. Switching keeps the conversation — only the wire

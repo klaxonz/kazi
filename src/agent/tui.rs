@@ -455,10 +455,11 @@ enum PickerKind {
     Model,
 }
 
-/// A provider/model switch finishing in the background, so the event loop keeps
-/// drawing (spinner + elapsed) instead of freezing on MCP/HTTP work.
-enum SwitchDone {
-    Ok {
+/// Work that finishes in the background and reports back to the event loop, so
+/// the UI keeps drawing (spinner + elapsed) instead of freezing on MCP/HTTP
+/// work.
+enum BackgroundEvent {
+    Switched {
         agent: Box<Agent>,
         provider: Option<String>,
         model: Option<String>,
@@ -468,6 +469,35 @@ enum SwitchDone {
         agent: Box<Agent>,
         note: String,
     },
+    /// `/compact` finished (the agent comes back mutated).
+    Compacted {
+        agent: Box<Agent>,
+        note: String,
+    },
+    /// Live model candidates for the open picker (rows are `nick/model`).
+    Choices {
+        rows: Vec<String>,
+        current: Option<String>,
+    },
+}
+
+/// Merge freshly fetched rows into an open picker: existing order wins, new
+/// rows are appended, cursor untouched (the user may be filtering). Returns how
+/// many rows were added.
+fn merge_picker_rows(picker: &mut Picker, rows: Vec<String>, current: Option<String>) -> usize {
+    let mut added = 0usize;
+    for row in rows {
+        if !picker.all.contains(&row) {
+            picker.all.push(row);
+            added += 1;
+        }
+    }
+    if let Some(cur) = current {
+        if picker.all.contains(&cur) {
+            picker.current = Some(cur);
+        }
+    }
+    added
 }
 
 /// A modal list picker rendered above the input: `/provider` and `/model`
@@ -1409,8 +1439,8 @@ pub async fn chat_loop_tui(
     let provider_desc = agent.provider().describe();
     let max_rounds = agent.max_rounds();
     let permission = agent.ctx.permission.clone();
-    // provider/model switches run as background tasks and report back here
-    let (switch_tx, mut switches) = tokio::sync::mpsc::unbounded_channel::<SwitchDone>();
+    // provider/model switches and live model refreshes report back here
+    let (bg_tx, mut background) = tokio::sync::mpsc::unbounded_channel::<BackgroundEvent>();
 
     enable_raw_mode()?;
     let mut stdout: Stdout = std::io::stdout();
@@ -1444,8 +1474,8 @@ pub async fn chat_loop_tui(
         sess,
         &ask_tx,
         &session_allows,
-        &mut switches,
-        &switch_tx,
+        &mut background,
+        &bg_tx,
     )
     .await;
 
@@ -1545,7 +1575,7 @@ async fn run_command(
     ask_tx: &tokio::sync::mpsc::UnboundedSender<ApprovalAsk>,
     session_allows: &SessionAllows,
     permission: &crate::tools::Permission,
-    switch_tx: &tokio::sync::mpsc::UnboundedSender<SwitchDone>,
+    bg_tx: &tokio::sync::mpsc::UnboundedSender<BackgroundEvent>,
     save: &(impl Fn(&str, &Agent) + ?Sized),
 ) {
     use super::repl;
@@ -1648,18 +1678,27 @@ async fn run_command(
                     return;
                 }
             };
-            let mut guard = slot.lock().await;
-            let text = match guard.as_mut() {
-                Some(a) => {
-                    let text = repl::compact_text(a, force).await;
-                    // the status bar's ctx estimate must not go stale
-                    screen.est_tokens = a.history.estimate_tokens();
-                    text
-                }
-                None => BUSY_TEXT.to_string(),
+            // the summarizer round-trip can take seconds: run it in the
+            // background so the UI keeps drawing (the old inline await froze it)
+            let Some(agent) = slot.lock().await.take() else {
+                push_lines(screen, BUSY_TEXT);
+                return;
             };
-            drop(guard);
-            push_lines(screen, text);
+            screen.busy = true;
+            screen.started.set(Some(std::time::Instant::now()));
+            screen.push(
+                LineKind::Dim,
+                format!("compacting{} …", if force { " (force)" } else { "" }),
+            );
+            let tx = bg_tx.clone();
+            tokio::spawn(async move {
+                let mut agent = agent;
+                let note = repl::compact_text(&mut agent, force).await;
+                let _ = tx.send(BackgroundEvent::Compacted {
+                    agent: Box::new(agent),
+                    note,
+                });
+            });
         }
         "resume" => {
             if arg.is_empty() {
@@ -1715,7 +1754,7 @@ async fn run_command(
                     Some(arg.to_string()),
                     None,
                     false,
-                    switch_tx,
+                    bg_tx,
                 )
                 .await;
             }
@@ -1735,9 +1774,11 @@ async fn run_command(
                                 .map(|r| r.settings.model)
                         });
                         // ONE list for provider AND model: a row is `nick/model`,
-                        // so a single selection can switch both
+                        // so a single selection can switch both. It opens
+                        // INSTANTLY from config + built-in candidates; live rows
+                        // merge in from the background a moment later.
                         let choices =
-                            repl::all_model_choices(&sess.cfg, Some(&nick), cur.as_deref()).await;
+                            repl::model_choices_static(&sess.cfg, Some(&nick), cur.as_deref());
                         if choices.is_empty() {
                             push_lines(
                                 screen,
@@ -1754,6 +1795,23 @@ async fn run_command(
                                 choices,
                                 current.as_deref(),
                             ));
+                            // live rows merge in from the background instead of
+                            // delaying the picker
+                            let cfg = sess.cfg.clone();
+                            let tx = bg_tx.clone();
+                            let live_nick = nick.clone();
+                            let live_cur = cur.clone();
+                            tokio::spawn(async move {
+                                let rows = repl::all_model_choices(
+                                    &cfg,
+                                    Some(&live_nick),
+                                    live_cur.as_deref(),
+                                )
+                                .await;
+                                let current =
+                                    live_cur.as_deref().map(|m| format!("{live_nick}/{m}"));
+                                let _ = tx.send(BackgroundEvent::Choices { rows, current });
+                            });
                         }
                     }
                     None => push_lines(
@@ -1762,7 +1820,7 @@ async fn run_command(
                     ),
                 }
             } else if arg.chars().all(|c| c.is_ascii_digit()) {
-                // a bare number indexes the combined list the picker shows
+                // a bare number indexes the instant list the picker opens with
                 let nick = sess
                     .provider
                     .clone()
@@ -1774,7 +1832,7 @@ async fn run_command(
                         .map(|r| r.settings.model)
                 });
                 let choices =
-                    repl::all_model_choices(&sess.cfg, nick.as_deref(), cur.as_deref()).await;
+                    repl::model_choices_static(&sess.cfg, nick.as_deref(), cur.as_deref());
                 match repl::resolve_model_arg(arg, &choices) {
                     Ok(chosen) => {
                         let (provider, model) =
@@ -1789,7 +1847,7 @@ async fn run_command(
                             provider,
                             Some(model),
                             true,
-                            switch_tx,
+                            bg_tx,
                         )
                         .await;
                     }
@@ -1808,7 +1866,7 @@ async fn run_command(
                     provider,
                     Some(model),
                     true,
-                    switch_tx,
+                    bg_tx,
                 )
                 .await;
             }
@@ -1885,7 +1943,7 @@ fn mode_note(mode: crate::tools::PermissionMode) -> &'static str {
 
 /// Kick off a provider/model switch in the BACKGROUND: the event loop keeps
 /// drawing (spinner + elapsed) while MCP/HTTP work happens, and the rebuilt
-/// agent arrives over `switch_tx` with the conversation carried along.
+/// agent arrives over `bg_tx` with the conversation carried along.
 /// `probe` verifies the model with one tiny round before the switch commits.
 #[allow(clippy::too_many_arguments)]
 async fn start_switch(
@@ -1898,7 +1956,7 @@ async fn start_switch(
     provider: Option<String>,
     model: Option<String>,
     probe: bool,
-    switch_tx: &tokio::sync::mpsc::UnboundedSender<SwitchDone>,
+    bg_tx: &tokio::sync::mpsc::UnboundedSender<BackgroundEvent>,
 ) {
     let Some(old) = slot.lock().await.take() else {
         push_lines(screen, BUSY_TEXT);
@@ -1920,7 +1978,7 @@ async fn start_switch(
         session_allows.clone(),
     ));
     let mode = permission.get();
-    let tx = switch_tx.clone();
+    let tx = bg_tx.clone();
     tokio::spawn(async move {
         let mut old = old;
         match old
@@ -1934,7 +1992,7 @@ async fn start_switch(
                             "model rejected by provider, staying on {}\n{e}",
                             old.provider().describe()
                         );
-                        let _ = tx.send(SwitchDone::Failed {
+                        let _ = tx.send(BackgroundEvent::Failed {
                             agent: Box::new(old),
                             note,
                         });
@@ -1945,7 +2003,7 @@ async fn start_switch(
                 // a switch changes the wire, not the conversation
                 agent.history =
                     std::mem::replace(&mut old.history, super::context::History::new(None));
-                let _ = tx.send(SwitchDone::Ok {
+                let _ = tx.send(BackgroundEvent::Switched {
                     agent: Box::new(agent),
                     provider,
                     model,
@@ -1953,7 +2011,7 @@ async fn start_switch(
                 });
             }
             Err(e) => {
-                let _ = tx.send(SwitchDone::Failed {
+                let _ = tx.send(BackgroundEvent::Failed {
                     agent: Box::new(old),
                     note: format!("switch failed: {e}"),
                 });
@@ -1988,7 +2046,7 @@ async fn apply_selection(
     ask_tx: &tokio::sync::mpsc::UnboundedSender<ApprovalAsk>,
     session_allows: &SessionAllows,
     permission: &crate::tools::Permission,
-    switch_tx: &tokio::sync::mpsc::UnboundedSender<SwitchDone>,
+    bg_tx: &tokio::sync::mpsc::UnboundedSender<BackgroundEvent>,
     kind: PickerKind,
     chosen: String,
 ) {
@@ -2004,7 +2062,7 @@ async fn apply_selection(
                 Some(chosen),
                 None,
                 false,
-                switch_tx,
+                bg_tx,
             )
             .await;
         }
@@ -2021,7 +2079,7 @@ async fn apply_selection(
                 provider,
                 Some(model),
                 true,
-                switch_tx,
+                bg_tx,
             )
             .await;
         }
@@ -2045,8 +2103,8 @@ async fn tui_inner(
     sess: &mut SessionState,
     ask_tx: &tokio::sync::mpsc::UnboundedSender<ApprovalAsk>,
     session_allows: &SessionAllows,
-    switches: &mut tokio::sync::mpsc::UnboundedReceiver<SwitchDone>,
-    switch_tx: &tokio::sync::mpsc::UnboundedSender<SwitchDone>,
+    background: &mut tokio::sync::mpsc::UnboundedReceiver<BackgroundEvent>,
+    bg_tx: &tokio::sync::mpsc::UnboundedSender<BackgroundEvent>,
 ) -> anyhow::Result<Option<Agent>> {
     // Agent handoff: the runner task owns the agent while a task runs (the
     // engine needs `&mut`), then parks it back here for the next task and
@@ -2086,21 +2144,42 @@ async fn tui_inner(
                 screen.spinner.set(screen.spinner.get().wrapping_add(1));
             }
 
-            // ---- a provider/model switch landed ----------------------------
-            Some(done) = switches.recv() => {
-                screen.busy = false;
-                screen.started.set(None);
+            // ---- background work landed (switch / compact / live models) ----
+            Some(done) = background.recv() => {
                 match done {
-                    SwitchDone::Ok { agent, provider, model, desc } => {
+                    BackgroundEvent::Switched { agent, provider, model, desc } => {
+                        screen.busy = false;
+                        screen.started.set(None);
                         *shared_agent.lock().await = Some(*agent);
                         sess.provider = provider;
                         sess.model = model;
                         screen.provider_desc = desc.clone();
                         push_lines(screen, format!("switched -> {desc}"));
                     }
-                    SwitchDone::Failed { agent, note } => {
+                    BackgroundEvent::Failed { agent, note } => {
+                        screen.busy = false;
+                        screen.started.set(None);
                         *shared_agent.lock().await = Some(*agent);
                         push_lines(screen, note);
+                    }
+                    BackgroundEvent::Compacted { agent, note } => {
+                        screen.busy = false;
+                        screen.started.set(None);
+                        screen.est_tokens = agent.history.estimate_tokens();
+                        *shared_agent.lock().await = Some(*agent);
+                        push_lines(screen, note);
+                    }
+                    BackgroundEvent::Choices { rows, current } => {
+                        // only meaningful while the model picker is open
+                        let added = match screen.picker.as_mut() {
+                            Some(p) if p.kind == PickerKind::Model => {
+                                merge_picker_rows(p, rows, current)
+                            }
+                            _ => 0,
+                        };
+                        if added > 0 {
+                            push_lines(screen, format!("+{added} live model(s) merged in"));
+                        }
                     }
                 }
                 screen.scroll_to_bottom();
@@ -2193,7 +2272,7 @@ async fn tui_inner(
                                 ask_tx,
                                 session_allows,
                                 permission,
-                                switch_tx,
+                                bg_tx,
                                 kind,
                                 chosen,
                             )
@@ -2268,7 +2347,7 @@ async fn tui_inner(
                                     ask_tx,
                                     session_allows,
                                     permission,
-                                    switch_tx,
+                                    bg_tx,
                                     on_session_save,
                                 )
                                 .await;
@@ -2839,6 +2918,30 @@ mod tests {
     }
 
     #[test]
+    fn live_rows_merge_into_an_open_picker() {
+        let mut p = Picker::new(
+            PickerKind::Model,
+            "provider / model",
+            vec!["a/m1".to_string()],
+            Some("a/m1"),
+        );
+        let added = merge_picker_rows(
+            &mut p,
+            vec!["a/m1".to_string(), "a/m2".to_string()],
+            Some("a/m1".into()),
+        );
+        assert_eq!(added, 1);
+        assert_eq!(p.all, vec!["a/m1".to_string(), "a/m2".to_string()]);
+        // a second identical refresh adds nothing, and an empty one is a no-op
+        assert_eq!(
+            merge_picker_rows(&mut p, vec!["a/m1".to_string(), "a/m2".to_string()], None),
+            0
+        );
+        assert_eq!(merge_picker_rows(&mut p, Vec::new(), None), 0);
+        assert_eq!(p.all.len(), 2);
+    }
+
+    #[test]
     fn completed_command_input_follows_the_dropdown() {
         let mut s = Screen::new("p", "sess", 10);
         s.input.set_text("/".into());
@@ -3092,7 +3195,7 @@ mod tests {
         let perm = crate::tools::Permission::default();
         let save = |_: &str, _: &Agent| {};
         let allows = SessionAllows::default();
-        let (switch_tx, _switch_rx) = tokio::sync::mpsc::unbounded_channel::<SwitchDone>();
+        let (bg_tx, _bg_rx) = tokio::sync::mpsc::unbounded_channel::<BackgroundEvent>();
 
         for cmd in [
             "help",
@@ -3105,7 +3208,6 @@ mod tests {
             "permission",
             "permission read-only",
             "yolo",
-            "compact",
             "resume",
             "definitely-not-a-command",
             "new demo",
@@ -3118,7 +3220,7 @@ mod tests {
                 &tx,
                 &allows,
                 &perm,
-                &switch_tx,
+                &bg_tx,
                 &save,
             )
             .await;
@@ -3147,5 +3249,27 @@ mod tests {
             "session switched for later saves"
         );
         assert_eq!(perm.get(), crate::tools::PermissionMode::Yolo);
+
+        // `/compact` now runs in the background (it takes the agent out of the
+        // slot), so it goes last and is checked for its note only
+        run_command(
+            "compact",
+            &mut screen,
+            &slot,
+            &mut sess,
+            &tx,
+            &allows,
+            &perm,
+            &bg_tx,
+            &save,
+        )
+        .await;
+        let text = screen
+            .lines
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("compacting"), "compact note:\n{text}");
     }
 }

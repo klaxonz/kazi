@@ -128,6 +128,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rows, with `/model <provider>/<model>` as the direct form. The old two-overlay
   chain (provider → model picker) is gone; `/provider` remains for
   provider-only switches.
+- **The model picker opens instantly.** It used to wait for the live `/models`
+  queries before drawing anything (up to 1.2 s of frozen UI); it now paints the
+  config + built-in candidates immediately and merges live rows in from the
+  background (the transcript says how many arrived). `/compact` runs in the
+  background for the same reason — the summarizer round-trip no longer freezes
+  the screen.
 - The model picker no longer offers models its wire cannot serve. An
   Anthropic-wire provider (`/v1/messages`) only answers for Claude models, but
   a gateway's `/models` endpoint may list its whole catalog — Command Code's

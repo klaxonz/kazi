@@ -246,42 +246,16 @@ fn age_label(saved_at: u64) -> String {
     }
 }
 
-/// Every configured provider's candidate models as `nick/model` rows, current
-/// provider first — ONE list for provider + model, so switching both is a
-/// single choice. Static (config + built-in) for every provider plus a short
-/// parallel live probe each, capped so opening the picker never hangs.
-pub async fn all_model_choices(
+/// Merge candidate rows for every configured provider into `nick/model` rows,
+/// current provider first, the current pick hoisted. `live` carries
+/// per-provider live model lists (empty slice = static candidates only).
+fn merge_choice_rows(
     cfg: &Config,
     current_nick: Option<&str>,
     current_model: Option<&str>,
+    live: &[(String, Vec<String>)],
 ) -> Vec<String> {
-    const LIVE_CAP_MS: u64 = 1_200;
     let nicks = cfg.nicks();
-    let fetches = nicks.iter().cloned().map(|nick| {
-        let cfg = cfg.clone();
-        async move {
-            let live = match cfg
-                .settings_for_nick(&nick)
-                .ok()
-                .and_then(|s| crate::llm::build_provider(&s).ok())
-            {
-                Some(p) => {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_millis(LIVE_CAP_MS),
-                        p.list_models(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(m)) => m,
-                        _ => Vec::new(),
-                    }
-                }
-                None => Vec::new(),
-            };
-            (nick, live)
-        }
-    });
-    let live: Vec<(String, Vec<String>)> = futures::future::join_all(fetches).await;
 
     // current provider first, then the rest in config order
     let mut ordered: Vec<String> = Vec::new();
@@ -332,6 +306,54 @@ pub async fn all_model_choices(
         }
     }
     out
+}
+
+/// The INSTANT candidate list: config `models` + built-in fallback only, no
+/// network. This is what a picker opens with — waiting for `/models` before
+/// drawing the list is what made `/model` feel like a hang.
+pub fn model_choices_static(
+    cfg: &Config,
+    current_nick: Option<&str>,
+    current_model: Option<&str>,
+) -> Vec<String> {
+    merge_choice_rows(cfg, current_nick, current_model, &[])
+}
+
+/// The same list with live `/models` results merged in: every configured
+/// provider is probed in parallel with a short cap, so this costs at most one
+/// cap's worth of latency and never blocks on a dead endpoint.
+pub async fn all_model_choices(
+    cfg: &Config,
+    current_nick: Option<&str>,
+    current_model: Option<&str>,
+) -> Vec<String> {
+    const LIVE_CAP_MS: u64 = 1_200;
+    let fetches = cfg.nicks().into_iter().map(|nick| {
+        let cfg = cfg.clone();
+        async move {
+            let live = match cfg
+                .settings_for_nick(&nick)
+                .ok()
+                .and_then(|s| crate::llm::build_provider(&s).ok())
+            {
+                Some(p) => {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(LIVE_CAP_MS),
+                        p.list_models(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(m)) => m,
+                        _ => Vec::new(),
+                    }
+                }
+                None => Vec::new(),
+            };
+            (nick, live)
+        }
+    });
+    let live: Vec<(String, Vec<String>)> = futures::future::join_all(fetches).await;
+    merge_choice_rows(cfg, current_nick, current_model, &live)
 }
 
 /// The single command a partial name (`/mod`) refers to, if unambiguous — so
@@ -1931,6 +1953,9 @@ mod tests {
         );
         assert_eq!(rows[0], "b/m2", "the current pick is hoisted: {rows:?}");
         assert!(rows.iter().any(|r| r == "a/m1"), "{rows:?}");
+        // the instant list (what a picker opens with) is identical when there is
+        // no live data to merge — and it needs no network at all
+        assert_eq!(model_choices_static(&cfg, Some("b"), Some("m2")), rows);
     }
 
     #[test]
