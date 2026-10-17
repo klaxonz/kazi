@@ -1082,6 +1082,12 @@ const COMMANDS: &[CmdSpec] = &[
         arg: ArgKind::No,
     },
     CmdSpec {
+        name: "/instructions",
+        args: "",
+        help: "project files (KAZI.md / AGENTS.md) loaded into the system prompt",
+        arg: ArgKind::No,
+    },
+    CmdSpec {
         name: "/status",
         args: "",
         help: "provider, model, rounds, usage",
@@ -1189,9 +1195,21 @@ fn spec_of(verb: &str) -> Option<&'static CmdSpec> {
     COMMANDS.iter().find(|c| c.name == verb)
 }
 
+/// Whether a name is a built-in verb (custom commands may not shadow one).
+pub fn is_builtin_command(name: &str) -> bool {
+    spec_of(name).is_some()
+}
+
 /// Rendered command table (`/help` output; the startup banner in the TUI
 /// shares this).
 pub fn help_text() -> String {
+    help_text_with(&[])
+}
+
+/// Built-ins plus the project's own commands (from `.kazi/commands`). A custom
+/// command that would shadow a built-in is labelled rather than silently
+/// unreachable.
+pub fn help_text_with(customs: &[super::custom::CustomCommand]) -> String {
     let mut out = String::from("commands:\n");
     for c in COMMANDS {
         let cmd = if c.args.is_empty() {
@@ -1200,6 +1218,24 @@ pub fn help_text() -> String {
             format!("{} {}", c.name, c.args)
         };
         out.push_str(&format!("  {cmd:<26} {}\n", c.help));
+    }
+    if !customs.is_empty() {
+        out.push_str("\nproject commands (.kazi/commands):\n");
+        for c in customs {
+            let shadowed = is_builtin_command(&c.name);
+            let help = if c.description.is_empty() {
+                if shadowed {
+                    "(shadowed by the built-in of the same name)".to_string()
+                } else {
+                    String::new()
+                }
+            } else if shadowed {
+                format!("{} (shadowed by the built-in)", c.description)
+            } else {
+                c.description.clone()
+            };
+            out.push_str(&format!("  {:<26} {}\n", c.usage(), help));
+        }
     }
     out.truncate(out.trim_end().len() + 1);
     out
@@ -1225,7 +1261,16 @@ pub fn no_arg_violation(verb: &str, arg: &str) -> Option<String> {
 /// Completion rows for a partially typed command (`token` includes the
 /// leading slash): `(name + args, help)`. Powers the TUI's `/` dropdown.
 pub fn command_rows(token: &str) -> Vec<(String, String)> {
-    COMMANDS
+    command_rows_with(token, &[])
+}
+
+/// Same, plus the project's custom commands (which never shadow a built-in:
+/// the built-in would win anyway, so the duplicate row is useless).
+pub fn command_rows_with(
+    token: &str,
+    customs: &[super::custom::CustomCommand],
+) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = COMMANDS
         .iter()
         .filter(|c| c.name.starts_with(token))
         .map(|c| {
@@ -1236,17 +1281,44 @@ pub fn command_rows(token: &str) -> Vec<(String, String)> {
             };
             (name, c.help.to_string())
         })
-        .collect()
+        .collect();
+    for c in customs {
+        if c.name.starts_with(token) && !is_builtin_command(&c.name) {
+            rows.push((
+                c.usage(),
+                if c.description.is_empty() {
+                    "project command".to_string()
+                } else {
+                    c.description.clone()
+                },
+            ));
+        }
+    }
+    rows
 }
 
 /// Tab completion for a partial command name: the longest common prefix of
 /// the candidates, or `None` when that would not extend what was typed.
 pub fn command_completion(token: &str) -> Option<String> {
-    let names: Vec<&str> = COMMANDS
+    command_completion_with(token, &[])
+}
+
+/// Same, including the project's own commands.
+pub fn command_completion_with(
+    token: &str,
+    customs: &[super::custom::CustomCommand],
+) -> Option<String> {
+    let mut names: Vec<&str> = COMMANDS
         .iter()
         .filter(|c| c.name.starts_with(token))
         .map(|c| c.name)
         .collect();
+    names.extend(
+        customs
+            .iter()
+            .map(|c| c.name.as_str())
+            .filter(|n| n.starts_with(token) && !is_builtin_command(n)),
+    );
     let first = *names.first()?;
     let mut prefix = first.to_string();
     for name in &names[1..] {
@@ -1266,18 +1338,38 @@ pub fn command_completion(token: &str) -> Option<String> {
 
 /// Targeted help for one command (`/help theme`): usage line plus description.
 pub fn help_for(arg: &str) -> Option<String> {
+    help_for_with(arg, &[])
+}
+
+/// Targeted help, extended with the project's own commands.
+pub fn help_for_with(arg: &str, customs: &[super::custom::CustomCommand]) -> Option<String> {
     let verb = if arg.starts_with('/') {
         arg.to_string()
     } else {
         format!("/{}", arg.trim())
     };
-    let spec = spec_of(&verb)?;
-    let usage = if spec.args.is_empty() {
-        spec.name.to_string()
-    } else {
-        format!("{} {}", spec.name, spec.args)
-    };
-    Some(format!("{usage}\n  {}", spec.help))
+    if let Some(spec) = spec_of(&verb) {
+        let usage = if spec.args.is_empty() {
+            spec.name.to_string()
+        } else {
+            format!("{} {}", spec.name, spec.args)
+        };
+        return Some(format!("{usage}\n  {}", spec.help));
+    }
+    let custom = customs.iter().find(|c| c.name == verb)?;
+    let mut out = custom.usage();
+    if !custom.description.is_empty() {
+        out.push_str(&format!("\n  {}", custom.description));
+    }
+    out.push_str(&format!(
+        "\n  from {} ({})",
+        custom.path.display(),
+        match custom.scope {
+            super::custom::Scope::Global => "global",
+            super::custom::Scope::Project => "project",
+        }
+    ));
+    Some(out)
 }
 
 /// TAB completion for the FIRST argument of a slash command, e.g.
@@ -1692,6 +1784,60 @@ mod slug_tests {
         assert_eq!(command_completion("/"), None);
         // already-complete name: nothing to add
         assert_eq!(command_completion("/undo"), None);
+    }
+
+    #[test]
+    fn project_commands_appear_in_rows_help_and_completion() {
+        let custom = super::super::custom::CustomCommand {
+            name: "/review".into(),
+            description: "Review a diff".into(),
+            argument_hint: "<path>".into(),
+            body: "look at $ARGUMENTS".into(),
+            path: std::path::PathBuf::from("/repo/.kazi/commands/review.md"),
+            scope: super::super::custom::Scope::Project,
+        };
+        // a custom command that would shadow a built-in must not add a row
+        let shadow = super::super::custom::CustomCommand {
+            name: "/undo".into(),
+            description: "evil".into(),
+            ..custom.clone()
+        };
+        let customs = vec![custom.clone(), shadow];
+
+        let rows = command_rows_with("/rev", &customs);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "/review <path>");
+        assert_eq!(rows[0].1, "Review a diff");
+
+        // the dropdown for "/" lists it once and skips the shadow
+        let all = command_rows_with("/", &customs);
+        assert_eq!(
+            all.iter().filter(|(n, _)| n.starts_with("/review")).count(),
+            1
+        );
+        assert_eq!(all.iter().filter(|(n, _)| n == "/undo").count(), 1);
+
+        // completion includes the project's names
+        assert_eq!(
+            command_completion_with("/rev", &customs).as_deref(),
+            Some("/review")
+        );
+
+        // help text grows a labelled section
+        let help = help_text_with(&customs);
+        assert!(help.contains("project commands (.kazi/commands)"), "{help}");
+        assert!(help.contains("/review <path>"), "{help}");
+        assert!(help.contains("shadowed by the built-in"), "{help}");
+
+        // targeted help resolves the project command and names its file
+        let targeted = help_for_with("/review", &customs).unwrap();
+        assert!(targeted.contains("Review a diff"));
+        assert!(targeted.contains("review.md"));
+        assert!(help_for_with("/nope", &customs).is_none());
+        // built-ins still resolve through the same entry point
+        assert!(help_for_with("undo", &customs)
+            .unwrap()
+            .contains("restore files"));
     }
 
     #[test]

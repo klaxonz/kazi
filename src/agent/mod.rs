@@ -15,6 +15,8 @@
 
 pub mod console;
 pub mod context;
+pub mod custom;
+pub mod instructions;
 pub mod session;
 pub mod tui;
 
@@ -349,8 +351,9 @@ impl crate::tools::subagent::SubAgentRunner for SubAgentRunnerImpl {
 /// contracts, the loop carries the mechanics; a wall of instructions here
 /// would burn context. Mentioned behaviors: read before write, adapt on
 /// failure, concrete reporting.
-fn system_prompt(cwd: &std::path::Path) -> String {
-    format!(
+/// Base prompt plus, when present, the rendered project instructions.
+fn system_prompt_with(cwd: &std::path::Path, instructions: Option<&str>) -> String {
+    let mut out = format!(
         "You are kazi, a focused assistant operating in the user's terminal.\n\
          Working directory: {}.\n\n\
          Ground rules:\n\
@@ -363,7 +366,11 @@ fn system_prompt(cwd: &std::path::Path) -> String {
            repeat a failing call unchanged.\n\
          - Answer in the user's language. Keep replies tight; no filler.",
         cwd.display()
-    )
+    );
+    if let Some(block) = instructions {
+        out.push_str(block);
+    }
+    out
 }
 
 #[derive(Debug, Error)]
@@ -488,6 +495,8 @@ pub struct Agent {
     /// `[providers.<nick>] vision`: `Some(false)` refuses images before the
     /// request; `None` lets the provider decide.
     vision: Option<bool>,
+    /// Project instruction files loaded for this session (`/instructions`).
+    instructions: instructions::Instructions,
 }
 
 impl Agent {
@@ -541,6 +550,7 @@ impl Agent {
             cost_usd: 0.0,
             priced: false,
             vision: None,
+            instructions: instructions::Instructions::default(),
         }
     }
 
@@ -591,6 +601,11 @@ impl Agent {
 
     pub fn provider(&self) -> &Arc<dyn Provider> {
         &self.provider
+    }
+
+    /// Project instruction files that shaped this session's system prompt.
+    pub fn instructions(&self) -> &instructions::Instructions {
+        &self.instructions
     }
 
     pub fn max_rounds(&self) -> u32 {
@@ -755,7 +770,14 @@ impl Agent {
             .agent
             .max_context_tokens
             .unwrap_or(DEFAULT_MAX_CONTEXT_TOKENS);
-        let system = system_prompt(&ctx.cwd);
+        // Project instructions ride in the system prompt (and therefore reach
+        // sub-agents too). `[agent] instructions = false` opts out.
+        let instructions = if cfg.agent.instructions.unwrap_or(true) {
+            instructions::discover(&ctx.cwd)
+        } else {
+            instructions::Instructions::default()
+        };
+        let system = system_prompt_with(&ctx.cwd, instructions.render().as_deref());
         let runner = Arc::new(SubAgentRunnerImpl::new(
             wrapped.clone(),
             ctx.clone(),
@@ -778,6 +800,7 @@ impl Agent {
         agent.max_usd_per_task = cfg.agent.max_usd_per_task;
         agent.price = cfg.price_for(&agent.provider_model()).cloned();
         agent.vision = cfg.providers.get(&agent.nick).and_then(|e| e.vision);
+        agent.instructions = instructions;
         agent.nick = nick;
         agent.auth_hint = auth_hint;
         agent

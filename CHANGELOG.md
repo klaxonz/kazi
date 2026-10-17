@@ -6,6 +6,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: MINOR = feature batch, PATCH = fixes only — see docs/VERSIONING.md).
 
+## [0.23.0] - 2026-10-17
+
+kazi learns the repository: its guidance files shape the system prompt, and its
+own commands become slash commands.
+
+### Added
+
+- **Project instructions**: `KAZI.md` (or the cross-tool `AGENTS.md`) is loaded
+  from the working directory and every parent directory, plus
+  `<config>/kazi/KAZI.md`. Outer files come first, so the nearest one is the most
+  specific and wins on conflicts; the system prompt names every path.
+  Budgets: 16 KiB per file, 48 KiB total, 5 files — truncation is marked.
+  `[agent] instructions = false` disables it. `/instructions` lists what was
+  loaded (and why something was skipped).
+- **Custom commands**: `.kazi/commands/<name>.md` (and
+  `<config>/kazi/commands/`) become `/<name>`. Optional front matter carries
+  `description` and `argument-hint`; the body is a prompt template with
+  `$ARGUMENTS` (raw text) and `$1`…`$9` (positional). Without a placeholder the
+  arguments are appended. A nearer file overrides a farther one with the same
+  name; invalid filenames, binary files and empty bodies are skipped.
+- The commands show up in the `/` dropdown, in the `?` help overlay (a
+  "project commands" section), in `/help` and `/help <name>` (with the file it
+  came from), and `kazi run "/name args"` expands them, so scripts and the TUI
+  share one vocabulary.
+- A custom command that would shadow a built-in is labelled in help and never
+  wins at dispatch — the wrong prompt is worse than a duplicate row.
+
+### Changed
+
+- The TUI discovers project commands once at startup (edit + restart to reload),
+  which keeps the dropdown, the help text and dispatch consistent.
+- `system_prompt` grew a `with` variant so the engine can append the
+  instruction block; sub-agents inherit the rendered prompt as before.
+
+### Tests
+
+`cargo test` — 292 passing (was 282): discovery order and precedence, per-file
+and total budgets, front-matter parsing (including unterminated front matter),
+placeholder expansion, the console surfaces (rows, completion, help text,
+targeted help) and dispatch from a TUI command line.
+
 ## [0.22.0] - 2026-10-17
 
 MCP servers stop being tool-only: their resources and prompt templates are now

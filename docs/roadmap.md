@@ -1,6 +1,6 @@
 # kazi 产品方向与路线图
 
-> 状态:0.19、0.20 已发布(2026-10-17);0.21 仍是设计。
+> 状态:0.19 – 0.23 已发布(2026-10-17);可扩展工作台里还剩技能 / hook / profile / 库 API。
 > 这份文档只回答一个问题:**每个版本还缺什么,先做哪个,为什么先做它**。
 > 原则(§3)、0.19 的六个支柱(§5)与「明确不做」(§7)是本文的可执行部分;
 > 版本口径遵循 [VERSIONING.md](VERSIONING.md)(pre-1.0:MINOR = 功能批)。
@@ -15,6 +15,10 @@
 > **0.22 实际交付**:§6 的 MCP 补全(`mcp_resources` / `mcp_prompts` 两个只读工具、
 > 两条 transport 都实现 `resources/*` 与 `prompts/*`、`/mcp` 概览)。
 > §6 的其余项(`fetch_url` 直接返回附件、全文索引 + 正则 `/find`)仍未开工。
+> **0.23 实际交付**:§6(0.21 主题)的**项目约定**(§5 里 `KAZI.md`/`AGENTS.md` 的发现、
+> 预算、来源标注与 `/instructions`)与**自定义命令**(`.kazi/commands/*.md`、
+> front-matter、`$ARGUMENTS`/`$1..$9`、进补全与 `/help`、`kazi run` 同步展开)。
+> 剩下的 0.21 主题项:**技能**(`use_skill`)、**hook**、**profile**、**`kazi::prelude` 冻结**。
 
 ## 1. 现状:0.18 的 kazi 是什么
 

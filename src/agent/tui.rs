@@ -872,6 +872,8 @@ struct Screen {
     cache_read: u64,
     /// Active effort preset, shown as a badge in the header.
     preset: String,
+    /// The project's own slash commands (`.kazi/commands`), loaded at startup.
+    customs: Vec<super::custom::CustomCommand>,
     /// How many turns are pinned (`/pin`); the footer warns when a long task
     /// can lose its oldest instructions.
     pin_count: usize,
@@ -957,6 +959,7 @@ impl Screen {
             current_task: 0,
             cache_read: 0,
             preset: "balanced".to_string(),
+            customs: Vec::new(),
             pin_count: 0,
             jobs_running: 0,
             changeset_reply: None,
@@ -1220,7 +1223,7 @@ impl Screen {
     /// Completion rows for the inline `/` dropdown.
     fn command_hints(&self) -> Vec<(String, String)> {
         match super::console::pending_command(&self.input.text) {
-            Some(token) => super::console::command_rows(token),
+            Some(token) => super::console::command_rows_with(token, &self.customs),
             None => Vec::new(),
         }
     }
@@ -1250,7 +1253,9 @@ impl Screen {
             let wants_arg = row.split_whitespace().nth(1).is_some();
             self.input
                 .set_text(if wants_arg { format!("{name} ") } else { name });
-        } else if let Some(done) = super::console::command_completion(&self.input.text) {
+        } else if let Some(done) =
+            super::console::command_completion_with(&self.input.text, &self.customs)
+        {
             self.input.set_text(done);
         } else if hints.len() > 1 {
             self.move_command_sel(1);
@@ -1262,7 +1267,7 @@ impl Screen {
     /// row the dropdown is highlighting.
     fn resolve_command_input(&self) -> Option<String> {
         let token = super::console::pending_command(&self.input.text)?;
-        let rows = super::console::command_rows(token);
+        let rows = super::console::command_rows_with(token, &self.customs);
         if rows.is_empty() {
             return None;
         }
@@ -1369,13 +1374,50 @@ impl Screen {
                 c.move_cursor(delta);
             }
             Overlay::Help(h) => {
-                let max = overlay::help_lines(self.theme)
-                    .len()
+                // the overlay already carries its extra rows: counting them here
+                // needs no borrow of `self` (which is mutably borrowed above)
+                let max = (overlay::help_lines(self.theme).len() + h.extra.len())
                     .saturating_sub(body_height as usize);
                 h.scroll = (h.scroll.min(max) as isize + delta * 3).clamp(0, max as isize) as usize;
             }
             Overlay::Diff(d) => d.scroll_by(delta * 3, body_height as usize),
         }
+    }
+
+    /// The help overlay, with the project's commands appended (they live on
+    /// disk, so the static table in `overlay` cannot know them).
+    fn help_overlay(&self) -> Overlay {
+        Overlay::Help(Help {
+            scroll: 0,
+            extra: self.help_extra(),
+        })
+    }
+
+    /// Just the project-command section (empty when there is none).
+    fn help_extra(&self) -> Vec<ratatui::text::Line<'static>> {
+        let mut lines: Vec<ratatui::text::Line<'static>> = Vec::new();
+        if self.customs.is_empty() {
+            return lines;
+        }
+        let dim = ratatui::style::Style::default().fg(self.theme.dim);
+        lines.push(ratatui::text::Line::from(""));
+        lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+            "project commands",
+            dim,
+        )));
+        for c in &self.customs {
+            lines.push(ratatui::text::Line::from(format!(
+                "  {:<22} {}{}",
+                c.usage(),
+                c.description,
+                if super::console::is_builtin_command(&c.name) {
+                    " (shadowed by the built-in)"
+                } else {
+                    ""
+                }
+            )));
+        }
+        lines
     }
 
     fn input_rows(&self, width: u16) -> u16 {
@@ -2426,6 +2468,23 @@ pub async fn chat_loop_tui(
     );
     screen.mode = permission.get();
     screen.preset = agent.preset().to_string();
+    // project commands are discovered once at startup: editing one mid-session
+    // is a restart, which keeps the dropdown and the help text consistent
+    screen.customs = super::custom::discover(std::path::Path::new(&screen.cwd));
+    if !screen.customs.is_empty() {
+        let names: Vec<String> = screen
+            .customs
+            .iter()
+            .map(|c| c.name.clone())
+            .filter(|n| !super::console::is_builtin_command(n))
+            .collect();
+        if !names.is_empty() {
+            screen.push_notice(
+                Level::Info,
+                format!("project commands: {}", names.join(" ")),
+            );
+        }
+    }
     screen.bell = sess.cfg.ui.bell.unwrap_or(false);
     screen.transcript.push_rule(format!(
         "kazi · {} · {}",
@@ -2555,9 +2614,9 @@ async fn run_command(
         "" => {}
         "help" => {
             if arg.is_empty() {
-                screen.overlay = Some(Overlay::Help(Help::default()));
+                screen.overlay = Some(screen.help_overlay());
             } else {
-                match console::help_for(arg) {
+                match console::help_for_with(arg, &screen.customs) {
                     Some(text) => screen.show_text(text),
                     None => {
                         let verb = if arg.starts_with('/') {
@@ -3262,6 +3321,35 @@ async fn run_command(
             };
             screen.show_text(text);
         }
+        "instructions" => {
+            let text = match slot.lock().await.as_ref() {
+                Some(a) => {
+                    let ins = a.instructions();
+                    if ins.is_empty() {
+                        "no project instructions loaded — add KAZI.md (or AGENTS.md) to the repository"
+                            .to_string()
+                    } else {
+                        let mut out = format!("project instructions ({}):\n", ins.files.len());
+                        for f in &ins.files {
+                            out.push_str(&format!(
+                                "  {}{}  ·  {} chars{}\n",
+                                f.path.display(),
+                                if f.global { " (global)" } else { "" },
+                                f.chars,
+                                if f.truncated { " (truncated)" } else { "" }
+                            ));
+                        }
+                        for note in &ins.notes {
+                            out.push_str(&format!("  note: {note}\n"));
+                        }
+                        out.push_str("  (the nearest file wins on conflicts; [agent] instructions = false disables)");
+                        out
+                    }
+                }
+                None => BUSY_TEXT.to_string(),
+            };
+            screen.show_text(text);
+        }
         "mcp" => {
             let names = match slot.lock().await.as_ref() {
                 Some(a) => a.registry().names(),
@@ -3368,6 +3456,23 @@ async fn run_command(
             return screen.last_task.clone();
         }
         other => {
+            // project commands are prompts, not actions: expanding one yields
+            // a task, exactly like typing the text yourself
+            let verb = format!("/{other}");
+            if let Some(custom) = screen.customs.iter().find(|c| c.name == verb) {
+                if console::is_builtin_command(&verb) {
+                    // unreachable in practice (built-ins match above), but a
+                    // name collision must never run the WRONG prompt
+                    screen.show_text(console::unknown_command_text(other));
+                    return None;
+                }
+                let expanded = custom.expand(arg);
+                screen.push_notice(
+                    Level::Info,
+                    format!("{} → {}", custom.name, clip(&custom.description, 60)),
+                );
+                return Some(expanded);
+            }
             screen.show_text(console::unknown_command_text(other));
         }
     }
@@ -4129,7 +4234,7 @@ async fn tui_inner(
                     // 3) the editor
                     match key.code {
                         KeyCode::F(1) => {
-                            screen.overlay = Some(Overlay::Help(Help::default()));
+                            screen.overlay = Some(screen.help_overlay());
                         }
                         KeyCode::F(3) => {
                             let delta = if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -5592,6 +5697,52 @@ mod tests {
             1_000,
             2,
         )
+    }
+
+    #[tokio::test]
+    async fn a_project_command_expands_into_the_task() {
+        let slot = Arc::new(tokio::sync::Mutex::new(Some(stub_agent())));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalAsk>();
+        let mut sess = SessionState {
+            cfg: crate::config::Config::default(),
+            provider: None,
+            model: None,
+            session_name: "sess".to_string(),
+            config_file: None,
+            jobs: None,
+        };
+        let mut screen = test_screen();
+        screen.customs = vec![super::super::custom::CustomCommand {
+            name: "/review".into(),
+            description: "Review a file".into(),
+            argument_hint: "<path>".into(),
+            body: "review this carefully: $ARGUMENTS".into(),
+            path: std::path::PathBuf::from("/repo/.kazi/commands/review.md"),
+            scope: super::super::custom::Scope::Project,
+        }];
+        let perm = crate::tools::Permission::default();
+        let allows = SessionAllows::default();
+        let (bg_tx, _bg_rx) = tokio::sync::mpsc::unbounded_channel::<BackgroundEvent>();
+
+        let follow = run_command(
+            "review src/main.rs",
+            &mut screen,
+            &slot,
+            &mut sess,
+            &tx,
+            &allows,
+            &perm,
+            &bg_tx,
+        )
+        .await
+        .expect("a project command yields a task");
+        assert_eq!(follow, "review this carefully: src/main.rs");
+        // the dropdown and help know about it too
+        screen.input.set_text("/rev".to_string());
+        let rows = screen.command_hints();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "/review <path>");
+        assert!(!screen.help_extra().is_empty());
     }
 
     #[tokio::test]

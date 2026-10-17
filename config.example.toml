@@ -30,6 +30,12 @@ provider = "deepseek"
 # output = 1.10
 # cache_read = 0.027
 
+# [agent]
+# instructions = true              # load KAZI.md / AGENTS.md from the repo (and <config>/kazi/) into the system prompt
+# feedback_command = "cargo clippy --all-targets"   # run after a round that changed files; output goes back to the model
+# max_usd_per_task = 0.50          # stop between rounds once a task costs this much (needs [usage.prices])
+# preset = "balanced"              # fast | balanced | deep (or an entry in [agent.presets.<name>])
+
 # [ui]
 # theme = "dark"                   # dark | light | nord | solarized | mono (the TUI's /theme changes this line)
 # details = false                  # start with full tool output expanded (Ctrl+O toggles; /details writes this line)

@@ -271,6 +271,40 @@ kazi config      # show config path / current contents
 Override anything per call: `--provider <nick>` `--model <name>`
 `--resume <session>` / `--yolo` (see Safety).
 
+## Project instructions and your own commands
+
+kazi reads the repository's own guidance before it starts:
+
+- `KAZI.md` (or the cross-tool `AGENTS.md`) in the working directory **and every
+  parent directory** up to the filesystem root, plus `<config>/kazi/KAZI.md` for
+  the machine. Outer files come first, so the nearest one is the most specific
+  and wins when they disagree;
+- each file is capped at 16 KiB and the whole set at 48 KiB (truncation is
+  marked, never silent), so a stray 2 MB file cannot eat the context window;
+- they land in the system prompt with their paths, which means sub-agents get
+  them too. `/instructions` shows what was loaded, and
+  `[agent] instructions = false` turns the whole thing off.
+
+And it runs the commands your project defines. Drop a markdown file in
+`.kazi/commands/` (or `<config>/kazi/commands/` for all projects):
+
+```markdown
+---
+description: Review a diff the way this repo expects
+argument-hint: <path>
+---
+Read $1 and review it against the rules in docs/style.md.
+Mention every finding with a file:line reference. Extra notes: $ARGUMENTS
+```
+
+`/review src/agent/mod.rs` then sends that prompt as an ordinary task, with
+`$ARGUMENTS` (raw text) and `$1`…`$9` substituted. Without a placeholder the
+arguments are appended as a final line. The command shows up in the `/`
+dropdown, in `/help` (under "project commands") and in `/help review`; a custom
+name that would shadow a built-in is labelled, never silently unreachable.
+`kazi run "/review src/agent/mod.rs"` expands it too, so scripts get the same
+verbs.
+
 ## Built-in tools
 
 | tool         | effect                                                  |

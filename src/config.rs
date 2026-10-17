@@ -107,6 +107,9 @@ pub struct AgentCfg {
     /// Check to run after a round that changed files (e.g.
     /// "cargo clippy --all-targets"); its output goes back to the model.
     pub feedback_command: Option<String>,
+    /// Load `KAZI.md` / `AGENTS.md` project instructions into the system
+    /// prompt (default true). `false` opts out entirely.
+    pub instructions: Option<bool>,
     /// Active request preset (`fast` | `balanced` (default) | `deep`), or the
     /// name of an entry in `presets`. `/effort` writes this line back.
     pub preset: Option<String>,

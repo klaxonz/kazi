@@ -465,9 +465,16 @@ async fn run_once(
         agent
     };
 
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    // `kazi run "/review src/main.rs"` uses the project's own command, same
+    // expansion as the TUI (built-ins are not shadowed)
+    let expanded_task = crate::agent::custom::expand_line(task, &cwd);
+    let task = expanded_task.as_deref().unwrap_or(task);
+    if expanded_task.is_some() && fmt == OutputFmt::Text {
+        eprintln!("{DIM}(project command expanded){RESET}");
+    }
     // `@image.png` travels as a message part; text attachments are already
     // expanded into `task` by the caller
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let (images, image_notes) = crate::agent::expand_image_refs(task, &cwd);
     for note in &image_notes {
         eprintln!("{YELLOW}warning:{RESET} {note}");

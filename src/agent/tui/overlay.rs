@@ -318,6 +318,9 @@ impl Changeset {
 #[derive(Debug, Clone, Default)]
 pub struct Help {
     pub scroll: usize,
+    /// Project-specific commands appended by the caller (they come from disk,
+    /// not from the static table this module owns).
+    pub extra: Vec<Line<'static>>,
 }
 
 /// Full-screen unified-diff viewer (`/diff`). Owns its own scroll so a long
@@ -1029,7 +1032,8 @@ fn draw_help(f: &mut Frame, screen: Rect, theme: Theme, help: &Help) {
         width: rect.width.saturating_sub(2),
         height: rect.height.saturating_sub(2),
     };
-    let body = help_lines(theme);
+    let mut body = help_lines(theme);
+    body.extend(help.extra.iter().cloned());
     let max = body.len().saturating_sub(inner.height as usize);
     let off = help.scroll.min(max);
     let visible: Vec<Line<'static>> = body.into_iter().skip(off).collect();
