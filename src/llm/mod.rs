@@ -51,7 +51,9 @@ pub struct ProviderSettings {
 pub enum LlmError {
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
-    #[error("authentication failed (HTTP {0}): the API key is missing or invalid — check the provider's `api_key_env` variable in your config")]
+    /// Pre-formatted rejection text: the status plus whatever the provider
+    /// said, so a plan/model refusal never reads as "your key is wrong".
+    #[error("{0}")]
     Auth(String),
     #[error("rate limited (HTTP 429) — wait a moment and retry, or lower `max_rounds`")]
     RateLimited,
@@ -68,13 +70,37 @@ impl LlmError {
     /// provider's error body for diagnosis.
     pub fn http(status: u16, body: &str) -> Self {
         match status {
-            401 | 403 => Self::Auth(status.to_string()),
+            401 | 403 => Self::Auth(format!(
+                "request rejected by the provider (HTTP {status}): {}\n  → if that names a model or plan, the provider refused it; if it names a key, check the provider's `api_key_env`",
+                provider_error_message(body)
+            )),
             429 => Self::RateLimited,
             _ => Self::Api {
                 status,
                 body: body.chars().take(2000).collect(),
             },
         }
+    }
+}
+
+/// Pull the provider's human-readable message out of an error body. Both the
+/// OpenAI and Anthropic envelopes carry it at `error.message`; anything
+/// unparseable is passed through (trimmed to a readable length).
+pub fn provider_error_message(body: &str) -> String {
+    const CAP: usize = 400;
+    let text = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v["error"]["message"]
+                .as_str()
+                .or_else(|| v["message"].as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.trim().to_string());
+    if text.chars().count() > CAP {
+        text.chars().take(CAP).collect::<String>() + "…"
+    } else {
+        text
     }
 }
 
@@ -117,5 +143,30 @@ pub fn build_provider(settings: &ProviderSettings) -> Result<Arc<dyn Provider>, 
         ProviderKind::OpenAiCompat => Ok(Arc::new(openai::OpenAiProvider::new(http, settings))),
         ProviderKind::Anthropic => Ok(Arc::new(anthropic::AnthropicProvider::new(http, settings))),
         ProviderKind::Ollama => Ok(Arc::new(ollama::OllamaProvider::new(http, settings))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejections_surface_the_provider_message() {
+        // a plan gate must not read as "your key is wrong"
+        let body = r#"{"type":"error","error":{"type":"permission_error","message":"MODEL_NOT_IN_PLAN: Claude Sonnet 4.6 available in Pro and above plans"}}"#;
+        let msg = LlmError::http(403, body).to_string();
+        assert!(msg.contains("MODEL_NOT_IN_PLAN"), "{msg}");
+        assert!(msg.contains("HTTP 403"), "{msg}");
+
+        // OpenAI-shaped envelope
+        let body = r#"{"error":{"message":"invalid api key","type":"authentication_error"}}"#;
+        assert!(LlmError::http(401, body)
+            .to_string()
+            .contains("invalid api key"));
+
+        // unparseable body passes through, capped for the terminal
+        let long = "x".repeat(1000);
+        let msg = provider_error_message(&long);
+        assert_eq!(msg.chars().count(), 401, "capped with an ellipsis");
     }
 }

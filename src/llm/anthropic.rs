@@ -165,11 +165,12 @@ impl AnthropicProvider {
         (system_parts.join("\n\n"), out)
     }
 
-    fn wire_request(&self, req: &LlmRequest) -> Value {
+    fn wire_request(&self, req: &LlmRequest, stream: bool) -> Value {
         let (system, messages) = Self::wire(&req.messages);
         let mut body = json!({
             "model": self.model,
             "max_tokens": MAX_TOKENS,
+            "stream": stream,
             "messages": messages,
         });
         if !system.is_empty() {
@@ -227,7 +228,7 @@ impl Provider for AnthropicProvider {
             .post(self.url())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", API_VERSION)
-            .json(&self.wire_request(&req))
+            .json(&self.wire_request(&req, false))
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -249,7 +250,7 @@ impl Provider for AnthropicProvider {
             .post(self.url())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", API_VERSION)
-            .json(&self.wire_request(&req))
+            .json(&self.wire_request(&req, true))
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -416,12 +417,32 @@ mod tests {
             model: "m".into(),
             api_key: "k".into(),
         }
-        .wire_request(&req);
+        .wire_request(&req, false);
         assert_eq!(body["system"], "sit in one place");
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
         assert_eq!(body["tool_choice"]["type"], "auto");
         assert!(body["max_tokens"].is_u64());
+        assert_eq!(body["stream"], false, "complete() must not stream");
+    }
+
+    #[test]
+    fn streaming_request_sets_stream_true() {
+        let req = LlmRequest {
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+        };
+        let body = AnthropicProvider {
+            http: reqwest::Client::new(),
+            base: DEFAULT_BASE_URL.into(),
+            model: "m".into(),
+            api_key: "k".into(),
+        }
+        .wire_request(&req, true);
+        assert_eq!(
+            body["stream"], true,
+            "complete_stream() must ask for SSE, else the decoder sees one JSON object"
+        );
     }
 
     #[test]

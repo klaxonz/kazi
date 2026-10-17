@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-10-17
+
+### Fixed
+
+- **The Anthropic provider never actually streamed.** `complete_stream` sent a
+  request without `"stream": true`, so any real Anthropic-wire endpoint
+  answered with a single JSON object, the SSE decoder found no frames, and
+  every streamed round died with "stream produced no content". Found the
+  moment kazi was pointed at a real Anthropic endpoint (Command Code's
+  Provider API `/v1/messages`); `OpenAI` and `Ollama` were unaffected because
+  their request builders set the flag. Covered by a request-shape test.
+- Provider rejections now include the provider's own message: a plan/model
+  gate such as `HTTP 403 MODEL_NOT_IN_PLAN: …` no longer reads as
+  "authentication failed — the API key is missing or invalid", which sent
+  users hunting for a key problem that did not exist.
+
 ## [0.14.1] - 2026-10-17
 
 ### Fixed

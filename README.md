@@ -49,6 +49,21 @@ type = "anthropic"
 api_key_env = "ANTHROPIC_API_KEY"
 model = "claude-sonnet-4-5"
 
+# Command Code's Provider API works like any other upstream: one API over
+# every top model, OpenAI *and* Anthropic wires. Same key as the CLI
+# (Studio -> API keys); Claude models answer only on the Anthropic wire.
+[providers.commandcode]
+type = "openai"                  # OpenAI wire: deepseek/*, Kimi, GLM, Qwen, grok, gemini...
+base_url = "https://api.commandcode.ai/provider/v1"
+api_key_env = "CMD_API_KEY"
+model = "deepseek/deepseek-v4-pro"
+
+[providers.commandcode-claude]
+type = "anthropic"               # kazi appends /v1/messages, so the root stops one segment earlier
+base_url = "https://api.commandcode.ai/provider"
+api_key_env = "CMD_API_KEY"
+model = "claude-sonnet-5-5"
+
 [providers.ollama]
 type = "ollama"                  # local, needs no key
 model = "qwen3:14b"
