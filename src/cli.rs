@@ -980,7 +980,22 @@ async fn onboarding_pick(
 }
 
 fn tools_cmd() -> anyhow::Result<u8> {
-    println!("{}", ToolRegistry::builtin().catalog());
+    // list what the agent would actually have here: skills add `use_skill`
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let skills = std::sync::Arc::new(crate::agent::skills::discover(&cwd));
+    let registry = ToolRegistry::builtin().with_skills(skills.clone());
+    println!("{}", registry.catalog());
+    if !skills.is_empty() {
+        println!(
+            "\n{} skill(s) available to use_skill: {}",
+            skills.len(),
+            skills
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     Ok(0)
 }
 

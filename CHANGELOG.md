@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: MINOR = feature batch, PATCH = fixes only — see docs/VERSIONING.md).
 
+## [0.24.1] - 2026-10-17
+
+### Fixed
+
+- `kazi tools` listed the static built-ins only, so a repository with skills
+  showed no `use_skill` — the command that exists to answer "what can the model
+  do here" disagreed with the running agent. It now builds the registry the same
+  way (skills included) and names the discovered skills underneath the catalog.
+
 ## [0.24.0] - 2026-10-17
 
 Skills: the repository's procedures, loaded on demand instead of carried in
