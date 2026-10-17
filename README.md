@@ -209,7 +209,10 @@ anything that writes, and `yolo` runs unattended. `Shift+Tab` cycles them and
 `/permission` sets them (both in the TUI); `--permission-mode` picks the startup
 one. `@file` in a task attaches a file's contents (the TUI
 echoes `attaching @a.rs, @b.rs` when the task starts), and `/context` shows
-where the token budget goes.
+where the token budget goes. `@screenshot.png` (png / jpg / webp / gif, up to
+5 MiB) is sent as an **image** rather than inlined as text, on both wires; a
+provider marked `vision = false` refuses it locally with an actionable message
+instead of spending a round on a certain rejection.
 
 **Review mode** is for the tasks you want to see before they land: every write is
 parked, and one modal lists the files with their diffs (`space` toggles a file,

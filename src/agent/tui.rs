@@ -2173,12 +2173,24 @@ async fn launch_task(
     }
     let cancel = owned.cancel_token();
     let expanded = super::expand_file_refs(&task, &owned.ctx.cwd);
+    // images go as message parts, not as text; anything that could not be
+    // attached is said out loud instead of vanishing
+    let (images, image_notes) = super::expand_image_refs(&task, &owned.ctx.cwd);
+    for note in &image_notes {
+        screen.push_notice(Level::Warn, note.clone());
+    }
+    if !images.is_empty() {
+        screen.push_notice(
+            Level::Info,
+            format!("sending {} image attachment(s)", images.len()),
+        );
+    }
     let slot2 = slot.clone();
     let tx2 = tx.clone();
     let handle = tokio::spawn(async move {
         let mut owned = owned;
         let out = owned
-            .run_task(&expanded, |ev| {
+            .run_task_with_images(&expanded, images, |ev| {
                 let _ = tx2.send(Pump::Ev(ev));
             })
             .await;
@@ -3468,32 +3480,9 @@ fn export_session(agent: &Agent, sess: &SessionState, arg: &str) -> String {
     }
 }
 
-/// Minimal base64 (no padding-free variants needed): used for the OSC 52
-/// clipboard escape so a remote session can copy without a local tool.
+/// Local alias for the shared encoder (OSC 52 clipboard and tests).
 fn base64(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(TABLE[((n >> 18) & 63) as usize] as char);
-        out.push(TABLE[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[((n >> 6) & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
+    crate::base64::encode(data)
 }
 
 /// Ask the terminal itself to set the clipboard with OSC 52. Only used when a
@@ -5751,6 +5740,7 @@ mod tests {
         cfg.providers.insert(
             "deepseek".into(),
             crate::config::ProviderEntry {
+                vision: None,
                 r#type: "openai".into(),
                 model: Some("deepseek-chat".into()),
                 base_url: None,

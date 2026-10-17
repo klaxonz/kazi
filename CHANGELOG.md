@@ -6,6 +6,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: MINOR = feature batch, PATCH = fixes only — see docs/VERSIONING.md).
 
+## [0.20.0] - 2026-10-17
+
+Images become a first-class attachment — the last 0.19 roadmap item, split out
+so the wire change lands on its own.
+
+### Added
+
+- **Image attachments**: `@screenshot.png` (png / jpg / jpeg / webp / gif, up to
+  5 MiB) in a task is sent as a user-message image part instead of being inlined
+  as text. OpenAI-compatible endpoints get `image_url` data URLs, Anthropic gets
+  `{type:"image", source:{type:"base64",…}}` blocks; a text-only message keeps
+  the plain string shape some gateways insist on.
+- `[providers.<nick>] vision = false` refuses attached images **before** the
+  request with an actionable error ("remove them, or set `vision = true`"), so a
+  known non-vision model never spends a round discovering it.
+- `Message::user_with_images` / `llm::ImagePart` / `kazi::base64` (the encoder
+  the clipboard already needed) are public for embedders.
+
+### Changed
+
+- Session files may now contain `images` on user messages. The field is
+  `#[serde(default, skip_serializing_if = "Vec::is_empty")]`, so sessions
+  written by 0.19 and earlier load unchanged and no version bump of the file
+  format is needed.
+- `@image` references are echoed as "sent as an image part" in the expanded
+  text, and the TUI reports any attachment it had to skip (missing, empty, over
+  the size limit).
+
+### Tests
+
+`cargo test` — 276 passing (was 269): wire encoding for both protocols, the
+image-only message shape, old-session compatibility, the attachment whitelist
+and the `vision = false` refusal.
 ## [0.19.0] - 2026-10-17
 
 A session you can control: approval prompts are identified and queued, writes can

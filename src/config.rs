@@ -301,6 +301,10 @@ pub struct ProviderEntry {
     /// The endpoint needs no credential (local gateways such as Ollama,
     /// LM Studio, or Magpie). Skips the key lookup and error.
     pub no_auth: Option<bool>,
+    /// Whether this provider's models accept image input. `None` (default)
+    /// sends them and lets the provider decide; `false` refuses locally with
+    /// an actionable error instead of burning a round on a certain rejection.
+    pub vision: Option<bool>,
 }
 
 /// (config, its path) so the CLI can tell users where things came from.

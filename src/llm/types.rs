@@ -47,6 +47,32 @@ impl ToolCall {
     }
 }
 
+/// One image attached to a user message.
+///
+/// The bytes travel base64-encoded because that is what both wires accept and
+/// what a session file can carry: a resumed conversation must be able to
+/// replay the screenshot the user sent. `media_type` is the IANA type
+/// ("image/png"), never a guess from the extension alone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImagePart {
+    pub media_type: String,
+    pub data_base64: String,
+}
+
+impl ImagePart {
+    pub fn new(media_type: impl Into<String>, bytes: &[u8]) -> Self {
+        Self {
+            media_type: media_type.into(),
+            data_base64: crate::base64::encode(bytes),
+        }
+    }
+
+    /// `data:` URL form, which is what the OpenAI wire wants.
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.media_type, self.data_base64)
+    }
+}
+
 /// A single message in the conversation history.
 ///
 /// Invariants maintained by the agent loop:
@@ -65,6 +91,10 @@ pub struct Message {
     /// For `Role::Tool`: whether the tool reported a failure.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
+    /// Images sent with a user message. Absent in sessions written before
+    /// 0.20 (the field defaults to empty), so old files still load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImagePart>,
 }
 
 impl Message {
@@ -75,6 +105,7 @@ impl Message {
             tool_calls: vec![],
             tool_call_id: None,
             is_error: false,
+            images: vec![],
         }
     }
     pub fn user(content: impl Into<String>) -> Self {
@@ -84,6 +115,24 @@ impl Message {
             tool_calls: vec![],
             tool_call_id: None,
             is_error: false,
+            images: vec![],
+        }
+    }
+    /// A user message carrying images (see [`ImagePart`]). `text` may be
+    /// empty when the user only pasted a screenshot.
+    pub fn user_with_images(text: impl Into<String>, images: Vec<ImagePart>) -> Self {
+        let content = text.into();
+        Self {
+            role: Role::User,
+            content: if content.trim().is_empty() {
+                None
+            } else {
+                Some(content)
+            },
+            tool_calls: vec![],
+            tool_call_id: None,
+            is_error: false,
+            images,
         }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
@@ -93,6 +142,7 @@ impl Message {
             tool_calls: vec![],
             tool_call_id: None,
             is_error: false,
+            images: vec![],
         }
     }
     /// Assistant message that requests tool calls; `text` may be empty.
@@ -104,6 +154,7 @@ impl Message {
             tool_calls: calls,
             tool_call_id: None,
             is_error: false,
+            images: vec![],
         }
     }
     pub fn tool_result(
@@ -117,6 +168,7 @@ impl Message {
             tool_calls: vec![],
             tool_call_id: Some(tool_call_id.into()),
             is_error,
+            images: vec![],
         }
     }
     /// Plain text content, or `""` when this message carries none.

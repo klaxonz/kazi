@@ -64,7 +64,25 @@ impl OpenAiProvider {
             .iter()
             .map(|m| match m {
                 Message { role: Role::System, content, .. } => json!({"role": "system", "content": content.as_deref().unwrap_or("")}),
-                Message { role: Role::User, content, .. } => json!({"role": "user", "content": content.as_deref().unwrap_or("")}),
+                Message { role: Role::User, content, images, .. } => {
+                    if images.is_empty() {
+                        json!({"role": "user", "content": content.as_deref().unwrap_or("")})
+                    } else {
+                        // multimodal user turn: text first, then one image_url
+                        // per attachment as a data URL (no upload endpoint)
+                        let mut parts: Vec<Value> = Vec::new();
+                        if let Some(text) = content.as_deref().filter(|t| !t.trim().is_empty()) {
+                            parts.push(json!({"type": "text", "text": text}));
+                        }
+                        for img in images {
+                            parts.push(json!({
+                                "type": "image_url",
+                                "image_url": {"url": img.data_url()},
+                            }));
+                        }
+                        json!({"role": "user", "content": parts})
+                    }
+                }
                 Message { role: Role::Assistant, content, tool_calls, .. } => {
                     let mut v = json!({"role": "assistant"});
                     if let Some(c) = content {
@@ -412,5 +430,28 @@ mod tests {
         );
         // missing data array → empty, never a panic
         assert!(OpenAiProvider::parse_models(&json!({"error": "nope"})).is_empty());
+    }
+
+    #[test]
+    fn images_ride_as_data_urls_on_the_openai_wire() {
+        let img = crate::llm::ImagePart::new("image/jpeg", b"JPEG");
+        let msgs = vec![crate::llm::Message::user_with_images(
+            "what is this?",
+            vec![img],
+        )];
+        let wire = OpenAiProvider::wire_messages(&msgs);
+        let content = wire[0]["content"].as_array().expect("multimodal array");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "what is this?");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/jpeg;base64,SlBFRw=="
+        );
+
+        // text-only messages keep the plain string shape (some gateways are
+        // stricter about arrays than about strings)
+        let wire = OpenAiProvider::wire_messages(&[crate::llm::Message::user("hi")]);
+        assert_eq!(wire[0]["content"], "hi");
     }
 }

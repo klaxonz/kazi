@@ -82,6 +82,12 @@ pub fn expand_file_refs(task: &str, cwd: &std::path::Path) -> String {
         let Some(path) = ref_path(raw) else {
             continue;
         };
+        if image_media_type(path).is_some() {
+            // images travel as message parts, not as text (see
+            // `expand_image_refs`); one line keeps the transcript honest
+            attachments.push(format!("[image attached @{path}: sent as an image part]"));
+            continue;
+        }
         let full = cwd.join(path);
         match std::fs::read(&full) {
             Ok(bytes) if bytes.iter().take(8192).any(|b| *b == 0) => {
@@ -104,6 +110,64 @@ pub fn expand_file_refs(task: &str, cwd: &std::path::Path) -> String {
     } else {
         format!("{task}\n\n{}", attachments.join("\n\n"))
     }
+}
+
+/// Media type for an image path we can attach, or `None` for anything else.
+/// Extensions are only a hint: the bytes are what the wire sends, and this
+/// list is the set both provider wires accept.
+pub fn image_media_type(path: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        _ => None,
+    }
+}
+
+/// Largest image sent to a provider (base64 makes it ~33% bigger on the wire).
+const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Collect the image `@paths` in a task as message parts.
+///
+/// Returns `(images, notes)`: `notes` are one-line, human-facing explanations
+/// for anything that could not be attached (missing, too large, empty), so the
+/// user learns about it instead of silently losing the attachment.
+pub fn expand_image_refs(
+    task: &str,
+    cwd: &std::path::Path,
+) -> (Vec<crate::llm::ImagePart>, Vec<String>) {
+    let mut images: Vec<crate::llm::ImagePart> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    for raw in task.split_whitespace() {
+        let Some(path) = ref_path(raw) else {
+            continue;
+        };
+        let Some(media_type) = image_media_type(path) else {
+            continue;
+        };
+        let full = cwd.join(path);
+        match std::fs::metadata(&full) {
+            Ok(meta) if meta.len() > MAX_IMAGE_BYTES => notes.push(format!(
+                "@{path} is {} bytes, over the {} MiB image limit — not attached",
+                meta.len(),
+                MAX_IMAGE_BYTES / 1024 / 1024
+            )),
+            Ok(meta) if meta.len() == 0 => {
+                notes.push(format!("@{path} is empty — not attached"));
+            }
+            Ok(_) => match std::fs::read(&full) {
+                Ok(bytes) => images.push(crate::llm::ImagePart::new(media_type, &bytes)),
+                Err(e) => notes.push(format!("cannot read @{path}: {e}")),
+            },
+            Err(_) => notes.push(format!("@{path} does not exist — not attached")),
+        }
+    }
+    (images, notes)
 }
 
 /// Run the post-edit feedback check (`agent.feedback_command`) and shape its
@@ -313,6 +377,11 @@ pub enum AgentError {
     /// Stopped on request (Esc in the TUI / cancel token). History is kept.
     #[error("task cancelled")]
     Cancelled,
+    /// Images were attached but the provider is marked `vision = false`.
+    #[error(
+        "the provider `{nick}` is configured with vision = false, so the {count} attached image(s) cannot be sent — remove them, or set `vision = true` / drop the flag in its [providers.*] entry"
+    )]
+    VisionUnsupported { nick: String, count: usize },
     /// The per-task USD budget was reached between rounds. History is kept,
     /// so raising the budget and asking again resumes where it stopped.
     #[error(
@@ -416,6 +485,9 @@ pub struct Agent {
     cost_usd: f64,
     /// Whether `cost_usd` means anything (a priced round happened).
     priced: bool,
+    /// `[providers.<nick>] vision`: `Some(false)` refuses images before the
+    /// request; `None` lets the provider decide.
+    vision: Option<bool>,
 }
 
 impl Agent {
@@ -468,6 +540,7 @@ impl Agent {
             price: None,
             cost_usd: 0.0,
             priced: false,
+            vision: None,
         }
     }
 
@@ -704,6 +777,7 @@ impl Agent {
         agent.preset = cfg.active_preset().0;
         agent.max_usd_per_task = cfg.agent.max_usd_per_task;
         agent.price = cfg.price_for(&agent.provider_model()).cloned();
+        agent.vision = cfg.providers.get(&agent.nick).and_then(|e| e.vision);
         agent.nick = nick;
         agent.auth_hint = auth_hint;
         agent
@@ -888,9 +962,30 @@ impl Agent {
     pub async fn run_task(
         &mut self,
         task: &str,
+        on_event: impl FnMut(AgentEvent),
+    ) -> Result<String, AgentError> {
+        self.run_task_with_images(task, Vec::new(), on_event).await
+    }
+
+    /// Same, with images attached to the task's user message.
+    ///
+    /// A provider explicitly marked `vision = false` is refused BEFORE the
+    /// request: a certain provider rejection must not cost a round (or the
+    /// attachment's tokens).
+    pub async fn run_task_with_images(
+        &mut self,
+        task: &str,
+        images: Vec<crate::llm::ImagePart>,
         mut on_event: impl FnMut(AgentEvent),
     ) -> Result<String, AgentError> {
-        self.history.push(Message::user(task.to_string()));
+        if !images.is_empty() && self.vision == Some(false) {
+            return Err(AgentError::VisionUnsupported {
+                nick: self.nick.clone(),
+                count: images.len(),
+            });
+        }
+        self.history
+            .push(Message::user_with_images(task.to_string(), images));
         self.usage = Usage::default();
         self.cost_usd = 0.0;
         self.priced = false;
@@ -2344,6 +2439,70 @@ mod tests {
             "{tool_text:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn images_are_attached_or_refused_before_the_request() {
+        let dir = std::env::temp_dir().join(format!("kazi-img-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("shot.png"), b"PNGDATA").unwrap();
+        std::fs::write(dir.join("note.txt"), "text").unwrap();
+
+        // images and text refs are separated: png -> part, txt -> inline text
+        let task = "look at @shot.png and @note.txt";
+        let (images, notes) = expand_image_refs(task, &dir);
+        assert_eq!(images.len(), 1);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(images[0].media_type, "image/png");
+        let expanded = expand_file_refs(task, &dir);
+        assert!(expanded.contains("note.txt"), "text ref inlined");
+        assert!(expanded.contains("image attached @shot.png"));
+
+        // a missing image is reported, not silently skipped
+        let (images, notes) = expand_image_refs("see @nope.png", &dir);
+        assert!(images.is_empty());
+        assert!(notes[0].contains("does not exist"), "{notes:?}");
+
+        // a provider marked vision = false refuses before any round runs
+        let script = vec![LlmResponse {
+            content: Some("should not be reached".into()),
+            ..Default::default()
+        }];
+        let mut a = agent_with(script);
+        a.vision = Some(false);
+        let err = a
+            .run_task_with_images("look", images_for(&dir), |_| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::VisionUnsupported { .. }), "{err}");
+
+        // ... while an unset flag sends them
+        let mut b = agent_with(vec![LlmResponse {
+            content: Some("seen".into()),
+            ..Default::default()
+        }]);
+        b.vision = None;
+        assert!(b
+            .run_task_with_images("look", images_for(&dir), |_| {})
+            .await
+            .is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn images_for(dir: &std::path::Path) -> Vec<crate::llm::ImagePart> {
+        let (images, _) = expand_image_refs("@shot.png", dir);
+        images
+    }
+
+    #[test]
+    fn image_media_types_are_a_whitelist() {
+        assert_eq!(image_media_type("a.PNG"), Some("image/png"));
+        assert_eq!(image_media_type("a.jpeg"), Some("image/jpeg"));
+        assert_eq!(image_media_type("a.webp"), Some("image/webp"));
+        assert_eq!(image_media_type("a.gif"), Some("image/gif"));
+        assert_eq!(image_media_type("a.pdf"), None);
+        assert_eq!(image_media_type("noext"), None);
     }
 
     #[test]

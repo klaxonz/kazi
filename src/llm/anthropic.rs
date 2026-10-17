@@ -107,12 +107,28 @@ impl AnthropicProvider {
                 Message {
                     role: Role::User,
                     content,
+                    images,
                     ..
                 } => {
-                    out.push(json!({
-                        "role": "user",
-                        "content": [{"type": "text", "text": content.as_deref().unwrap_or("")}],
-                    }));
+                    // text block first, then one image block per attachment;
+                    // Anthropic takes base64 source objects, not data URLs
+                    let mut blocks: Vec<Value> = Vec::new();
+                    if let Some(text) = content.as_deref() {
+                        if !text.is_empty() || images.is_empty() {
+                            blocks.push(json!({"type": "text", "text": text}));
+                        }
+                    }
+                    for img in images {
+                        blocks.push(json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": img.media_type,
+                                "data": img.data_base64,
+                            },
+                        }));
+                    }
+                    out.push(json!({"role": "user", "content": blocks}));
                     i += 1;
                 }
                 Message {
@@ -487,6 +503,48 @@ mod tests {
         assert_eq!(
             body["max_tokens"], 8192,
             "a preset overrides the 4096 default"
+        );
+    }
+
+    #[test]
+    fn images_become_base64_source_blocks() {
+        let img = crate::llm::ImagePart::new("image/png", b"PNGDATA");
+        let msgs = vec![
+            crate::llm::Message::user_with_images("look at this", vec![img]),
+            crate::llm::Message::assistant("seen"),
+        ];
+        let (_, wire) = AnthropicProvider::wire(&msgs);
+        let blocks = wire[0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "look at this");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], "UE5HREFUQQ==");
+    }
+
+    #[test]
+    fn image_only_message_still_has_content() {
+        // a pasted screenshot with no text must not produce an empty content
+        // array (the API rejects it)
+        let img = crate::llm::ImagePart::new("image/webp", b"x");
+        let msgs = vec![crate::llm::Message::user_with_images("  ", vec![img])];
+        let (_, wire) = AnthropicProvider::wire(&msgs);
+        let blocks = wire[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "image");
+    }
+
+    #[test]
+    fn old_messages_without_images_still_serialize() {
+        // sessions written before 0.20 have no `images` key at all
+        let json = serde_json::json!({"role": "user", "content": "hi"});
+        let msg: Message = serde_json::from_value(json).unwrap();
+        assert!(msg.images.is_empty());
+        let back = serde_json::to_value(&msg).unwrap();
+        assert!(
+            back.get("images").is_none(),
+            "empty images stay out of the JSON"
         );
     }
 

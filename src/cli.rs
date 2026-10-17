@@ -465,6 +465,17 @@ async fn run_once(
         agent
     };
 
+    // `@image.png` travels as a message part; text attachments are already
+    // expanded into `task` by the caller
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let (images, image_notes) = crate::agent::expand_image_refs(task, &cwd);
+    for note in &image_notes {
+        eprintln!("{YELLOW}warning:{RESET} {note}");
+    }
+    if !images.is_empty() && fmt == OutputFmt::Text {
+        eprintln!("{DIM}attaching {} image(s){RESET}", images.len());
+    }
+
     let mut events: Vec<AgentEvent> = Vec::new();
     let mut on_event: Box<dyn FnMut(AgentEvent)> = match fmt {
         OutputFmt::Text => Box::new(|e| console::render_event(&e)),
@@ -472,7 +483,9 @@ async fn run_once(
     };
 
     let started = std::time::Instant::now();
-    let result = agent.run_task(task, &mut on_event).await;
+    let result = agent
+        .run_task_with_images(task, images, &mut on_event)
+        .await;
     let elapsed = started.elapsed();
     // the event collector holds `events`; release it before assembling output
     drop(on_event);

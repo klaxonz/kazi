@@ -56,6 +56,12 @@ provider = "deepseek"
 # type: "openai"  -> any OpenAI-compatible endpoint (OpenAI, DeepSeek, Kimi, Qwen, gateways...)
 # type: "anthropic" -> Anthropic Claude Messages API
 # type: "ollama"  -> local Ollama via its OpenAI-compatible endpoint
+#
+# vision: whether this provider's models accept images (@screenshot.png).
+# Unset = send them and let the provider decide; false = refuse locally with a
+# clear error instead of spending a round on a certain rejection; true = same
+# as unset, but documents the intent.
+# vision = true
 
 [providers.deepseek]
 type = "openai"

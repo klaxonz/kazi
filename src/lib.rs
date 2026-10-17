@@ -44,9 +44,11 @@
 //! | [`agent`] | the loop ([`agent::Agent`]), history trimming, sessions, TUI  |
 //! | [`config`]| TOML config with provider precedence + env-key resolution     |
 //! | [`diff`]  | line diff used by tool cards and `--output json`              |
+//! | [`base64`]| the one encoding both the clipboard and image attachments need |
 
 pub mod agent;
 pub mod auth;
+pub mod base64;
 pub mod cli;
 pub mod config;
 pub mod diff;

@@ -17,7 +17,9 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 pub use retry::RetryProvider;
-pub use types::{LlmRequest, LlmResponse, Message, Role, StreamEvent, ToolCall, ToolSpec, Usage};
+pub use types::{
+    ImagePart, LlmRequest, LlmResponse, Message, Role, StreamEvent, ToolCall, ToolSpec, Usage,
+};
 
 /// Which wire protocol a configured provider speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
