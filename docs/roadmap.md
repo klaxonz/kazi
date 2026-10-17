@@ -11,8 +11,10 @@
 > **0.20 实际交付**:§5.6 的图片附件(`@x.png` → user 消息的 image part,两条 wire 各自编码,
 > `[providers.*] vision = false` 在请求前拒绝)。
 > **0.21 实际交付**:§6 的背景作业(`run_command background=true`、`job_output`/`job_kill`、
-> `/jobs`、页脚计数、Windows 进程树 kill)。§6 的其余项(MCP resources/prompts、
-> fetch_url 返回附件、全文索引)仍未开工。
+> `/jobs`、页脚计数、Windows 进程树 kill)。
+> **0.22 实际交付**:§6 的 MCP 补全(`mcp_resources` / `mcp_prompts` 两个只读工具、
+> 两条 transport 都实现 `resources/*` 与 `prompts/*`、`/mcp` 概览)。
+> §6 的其余项(`fetch_url` 直接返回附件、全文索引 + 正则 `/find`)仍未开工。
 
 ## 1. 现状:0.18 的 kazi 是什么
 

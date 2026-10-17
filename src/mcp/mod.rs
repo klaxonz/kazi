@@ -12,6 +12,7 @@
 pub mod bridge;
 pub mod client;
 pub mod http;
+pub mod resources;
 
 use std::process::Stdio;
 use std::sync::Arc;
@@ -30,14 +31,100 @@ pub use http::HttpMcpSession;
 /// Per-call ceiling for `tools/call` (server-side work can be slow).
 pub const MCP_CALL_TIMEOUT_SECS: u64 = 60;
 
+/// One resource a server advertises (a file, a database row, a document).
+#[derive(Debug, Clone)]
+pub struct ResourceInfo {
+    pub uri: String,
+    pub name: String,
+    pub description: String,
+    pub mime_type: Option<String>,
+}
+
+/// One prompt template a server advertises.
+#[derive(Debug, Clone)]
+pub struct PromptInfo {
+    pub name: String,
+    pub description: String,
+    /// Declared argument names (the model fills them when calling).
+    pub arguments: Vec<String>,
+}
+
+/// Render a `prompts/get` result as readable text for the model.
+pub(crate) fn render_prompt(result: &Value) -> String {
+    let mut out = String::new();
+    if let Some(d) = result["description"].as_str().filter(|d| !d.is_empty()) {
+        out.push_str(d);
+        out.push('\n');
+    }
+    if let Some(messages) = result["messages"].as_array() {
+        for m in messages {
+            let role = m["role"].as_str().unwrap_or("user");
+            let content = &m["content"];
+            let text = content["text"]
+                .as_str()
+                .or_else(|| content.as_str())
+                .unwrap_or("");
+            out.push_str(&format!("[{role}] {text}\n"));
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// Sessions of every server that initialised, so resources and prompts can be
+/// addressed by nickname after the tools were bridged.
+pub struct McpRegistry {
+    pub servers: Vec<(String, Arc<dyn McpSession>)>,
+}
+
+impl McpRegistry {
+    pub fn names(&self) -> Vec<&str> {
+        self.servers.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    pub fn session(&self, server: &str) -> Option<&Arc<dyn McpSession>> {
+        self.servers
+            .iter()
+            .find(|(n, _)| n == server)
+            .map(|(_, s)| s)
+    }
+}
+
 /// One established MCP session, regardless of transport. stdio (subprocess
 /// pipes) and Streamable HTTP (remote servers) both implement this — the
-/// tool bridge and the loader only see these three calls.
+/// tool bridge and the loader only see these five calls.
 #[async_trait]
 pub trait McpSession: Send + Sync {
     async fn initialize(&self) -> Result<(), McpError>;
     async fn list_tools(&self) -> Result<Vec<(String, String, Value)>, McpError>;
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolCallOut, McpError>;
+
+    /// Resource support is optional per spec: a server that answers
+    /// `resources/*` with "method not found" simply gets this default, and the
+    /// tool says so instead of failing the whole session.
+    async fn list_resources(&self) -> Result<Vec<ResourceInfo>, McpError> {
+        Err(McpError::Protocol(
+            "this MCP server exposes no resources".to_string(),
+        ))
+    }
+
+    async fn read_resource(&self, _uri: &str) -> Result<String, McpError> {
+        Err(McpError::Protocol(
+            "this MCP server exposes no resources".to_string(),
+        ))
+    }
+
+    /// Prompt templates, same optionality as resources.
+    async fn list_prompts(&self) -> Result<Vec<PromptInfo>, McpError> {
+        Err(McpError::Protocol(
+            "this MCP server exposes no prompts".to_string(),
+        ))
+    }
+
+    async fn get_prompt(&self, _name: &str, _arguments: Value) -> Result<String, McpError> {
+        Err(McpError::Protocol(
+            "this MCP server exposes no prompts".to_string(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -51,19 +138,43 @@ impl McpSession for McpClient {
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolCallOut, McpError> {
         McpClient::call_tool(self, name, arguments).await
     }
+    async fn list_resources(&self) -> Result<Vec<ResourceInfo>, McpError> {
+        McpClient::list_resources(self).await
+    }
+    async fn read_resource(&self, uri: &str) -> Result<String, McpError> {
+        McpClient::read_resource(self, uri).await
+    }
+    async fn list_prompts(&self) -> Result<Vec<PromptInfo>, McpError> {
+        McpClient::list_prompts(self).await
+    }
+    async fn get_prompt(&self, name: &str, arguments: Value) -> Result<String, McpError> {
+        McpClient::get_prompt(self, name, arguments).await
+    }
 }
 
-/// Spawn every configured server and collect their bridged tools.
+/// Spawn every configured server and collect their bridged tools, plus the
+/// resource/prompt tools when at least one server came up.
 pub async fn load_mcp_tools(
     cfg: &crate::config::McpCfg,
     call_timeout: Duration,
 ) -> Vec<Arc<dyn crate::tools::Tool>> {
     let mut out: Vec<Arc<dyn crate::tools::Tool>> = Vec::new();
+    let mut servers: Vec<(String, Arc<dyn McpSession>)> = Vec::new();
     for (nick, entry) in &cfg.servers {
         match load_one(nick, entry, call_timeout).await {
-            Ok(tools) => out.extend(tools),
+            Ok((tools, session)) => {
+                out.extend(tools);
+                servers.push((nick.clone(), session));
+            }
             Err(e) => eprintln!("[mcp] server {nick:?} skipped: {e}"),
         }
+    }
+    if !servers.is_empty() {
+        let registry = Arc::new(McpRegistry { servers });
+        out.push(Arc::new(resources::McpResources {
+            registry: registry.clone(),
+        }));
+        out.push(Arc::new(resources::McpPrompts { registry }));
     }
     out
 }
@@ -72,7 +183,7 @@ async fn load_one(
     nick: &str,
     entry: &crate::config::McpServerEntry,
     call_timeout: Duration,
-) -> Result<Vec<Arc<dyn crate::tools::Tool>>, McpError> {
+) -> Result<(Vec<Arc<dyn crate::tools::Tool>>, Arc<dyn McpSession>), McpError> {
     // Transport selection: `url` → streamable HTTP; otherwise a local
     // subprocess is spawned over stdio. Both produce the same `McpSession`.
     let (session, child): (Arc<dyn McpSession>, Option<Arc<Child>>) = if let Some(url) = &entry.url
@@ -102,7 +213,7 @@ async fn load_one(
             child: child.clone(),
         }));
     }
-    Ok(out)
+    Ok((out, session))
 }
 
 /// Spawn a local MCP server process and connect it over stdio.
@@ -199,6 +310,44 @@ mod tests {
                         {"name": "hang", "description": "Never replies", "inputSchema": {"type": "object", "properties": {}}}
                     ]}
                 }),
+                Some("resources/list") => json!({
+                    "jsonrpc": "2.0", "id": v["id"].clone(),
+                    "result": {"resources": [{
+                        "uri": "file:///README.md",
+                        "name": "readme",
+                        "description": "the project readme",
+                        "mimeType": "text/markdown"
+                    }]}
+                }),
+                Some("resources/read") => json!({
+                    "jsonrpc": "2.0", "id": v["id"].clone(),
+                    "result": {"contents": [{
+                        "uri": v["params"]["uri"].clone(),
+                        "mimeType": "text/markdown",
+                        "text": "# readme body"
+                    }]}
+                }),
+                Some("prompts/list") => json!({
+                    "jsonrpc": "2.0", "id": v["id"].clone(),
+                    "result": {"prompts": [{
+                        "name": "summarize",
+                        "description": "Summarize a file",
+                        "arguments": [{"name": "path", "required": true}]
+                    }]}
+                }),
+                Some("prompts/get") => json!({
+                    "jsonrpc": "2.0", "id": v["id"].clone(),
+                    "result": {
+                        "description": "Summarize a file",
+                        "messages": [{
+                            "role": "user",
+                            "content": {"type": "text", "text": format!(
+                                "summarize {}",
+                                v["params"]["arguments"]["path"].as_str().unwrap_or("?")
+                            )}
+                        }]
+                    }
+                }),
                 Some("tools/call") => match v["params"]["name"].as_str() {
                     Some("echo") => json!({
                         "jsonrpc": "2.0", "id": v["id"].clone(),
@@ -263,6 +412,98 @@ mod tests {
             reviewer: None,
             jobs: None,
         }
+    }
+
+    #[tokio::test]
+    async fn resources_and_prompts_round_trip() {
+        let client = connect();
+        client.initialize().await.unwrap();
+        let resources = client.list_resources().await.expect("resources/list");
+        assert_eq!(resources[0].uri, "file:///README.md");
+        assert_eq!(resources[0].mime_type.as_deref(), Some("text/markdown"));
+        let body = client
+            .read_resource("file:///README.md")
+            .await
+            .expect("resources/read");
+        assert_eq!(body, "# readme body");
+
+        let prompts = client.list_prompts().await.expect("prompts/list");
+        assert_eq!(prompts[0].name, "summarize");
+        assert_eq!(prompts[0].arguments, vec!["path".to_string()]);
+        let rendered = client
+            .get_prompt("summarize", json!({"path": "src/main.rs"}))
+            .await
+            .expect("prompts/get");
+        assert!(rendered.contains("summarize src/main.rs"), "{rendered}");
+        assert!(rendered.contains("[user]"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn servers_without_support_say_so() {
+        // the default trait methods: a server that never implements resources
+        // must not look like an empty list
+        struct ToolsOnly;
+        #[async_trait]
+        impl McpSession for ToolsOnly {
+            async fn initialize(&self) -> Result<(), McpError> {
+                Ok(())
+            }
+            async fn list_tools(&self) -> Result<Vec<(String, String, Value)>, McpError> {
+                Ok(vec![])
+            }
+            async fn call_tool(&self, _n: &str, _a: Value) -> Result<ToolCallOut, McpError> {
+                Err(McpError::Protocol("none".into()))
+            }
+        }
+        let session: Arc<dyn McpSession> = Arc::new(ToolsOnly);
+        let err = session.list_resources().await.unwrap_err();
+        assert!(err.to_string().contains("no resources"), "{err}");
+        let err = session.list_prompts().await.unwrap_err();
+        assert!(err.to_string().contains("no prompts"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn resource_and_prompt_tools_address_servers_by_nick() {
+        let client = connect();
+        client.initialize().await.unwrap();
+        let registry = Arc::new(McpRegistry {
+            servers: vec![("echo".to_string(), client)],
+        });
+        let ctx = tool_ctx();
+
+        let resources = resources::McpResources {
+            registry: registry.clone(),
+        };
+        let listing = resources
+            .run(&json!({"server": "echo"}), &ctx)
+            .await
+            .unwrap();
+        assert!(listing.contains("file:///README.md"), "{listing}");
+        assert!(listing.contains("the project readme"), "{listing}");
+        let body = resources
+            .run(&json!({"server": "echo", "uri": "file:///README.md"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(body, "# readme body");
+
+        let prompts = resources::McpPrompts { registry };
+        let listing = prompts.run(&json!({"server": "echo"}), &ctx).await.unwrap();
+        assert!(listing.contains("summarize (path)"), "{listing}");
+        let rendered = prompts
+            .run(
+                &json!({"server": "echo", "name": "summarize", "arguments": {"path": "a.rs"}}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(rendered.contains("summarize a.rs"), "{rendered}");
+
+        // an unknown nickname lists what is configured instead of guessing
+        let err = prompts
+            .run(&json!({"server": "nope"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.0.contains("configured: echo"), "{}", err.0);
     }
 
     #[tokio::test]

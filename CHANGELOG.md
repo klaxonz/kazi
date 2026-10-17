@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: MINOR = feature batch, PATCH = fixes only — see docs/VERSIONING.md).
 
+## [0.22.0] - 2026-10-17
+
+MCP servers stop being tool-only: their resources and prompt templates are now
+reachable, and `/mcp` says what each server actually brought.
+
+### Added
+
+- **`mcp_resources { server [, uri] }`**: list a server's resources (uri, name,
+  mime type, description) or read one. Text content is returned; binary `blob`
+  content is described ("N base64 chars, mime …") rather than dumped into the
+  context. Payloads are capped at 64k chars with a visible truncation note.
+- **`mcp_prompts { server [, name, arguments] }`**: list the server's prompt
+  templates with their argument names, or render one (role-prefixed text).
+- Both are read-only tools (no approval), registered only when at least one
+  server initialised, and they address servers by their config nickname.
+- **`/mcp`** in the TUI: every configured server with its transport
+  (`stdio <command…>` / `http <url>`), the built-in tools it bridged, and a note
+  when the resource/prompt tools are available.
+- `McpSession` grew `list_resources` / `read_resource` / `list_prompts` /
+  `get_prompt` with default implementations, so a server that does not implement
+  the optional capabilities answers "this MCP server exposes no resources"
+  instead of looking empty. Both transports (stdio JSON-RPC and Streamable
+  HTTP) implement them for real.
+
+### Tests
+
+`cargo test` — 282 passing (was 279): resources/prompts round-trip over the
+in-process duplex server, the optional-capability defaults, and the two tools
+addressing servers by nickname (including the unknown-nickname error listing
+what is configured).
+
 ## [0.21.0] - 2026-10-17
 
 Long-running processes stop blocking the agent: a dev server or watch task now

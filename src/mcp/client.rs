@@ -142,6 +142,84 @@ impl McpClient {
         Ok(ToolCallOut { text, is_error })
     }
 
+    /// Resources this server advertises (optional in the protocol).
+    pub async fn list_resources(&self) -> Result<Vec<super::ResourceInfo>, McpError> {
+        let result = self.request("resources/list", json!({})).await?;
+        let list = result["resources"].as_array().ok_or_else(|| {
+            McpError::Protocol("resources/list returned no resources array".into())
+        })?;
+        Ok(list
+            .iter()
+            .map(|r| super::ResourceInfo {
+                uri: r["uri"].as_str().unwrap_or("").to_string(),
+                name: r["name"].as_str().unwrap_or("").to_string(),
+                description: r["description"].as_str().unwrap_or("").to_string(),
+                mime_type: r["mimeType"].as_str().map(str::to_string),
+            })
+            .collect())
+    }
+
+    /// Read one resource. Text content is returned as-is; binary (`blob`)
+    /// content is described rather than inlined — dumping base64 into the
+    /// model's context helps nobody.
+    pub async fn read_resource(&self, uri: &str) -> Result<String, McpError> {
+        let result = self.request("resources/read", json!({"uri": uri})).await?;
+        let contents = result["contents"].as_array().ok_or_else(|| {
+            McpError::Protocol("resources/read returned no contents array".into())
+        })?;
+        let mut out = String::new();
+        for c in contents {
+            if let Some(text) = c["text"].as_str() {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(text);
+            } else if let Some(blob) = c["blob"].as_str() {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&format!(
+                    "[binary resource {}: {} base64 chars, mime {}]",
+                    c["uri"].as_str().unwrap_or(uri),
+                    blob.len(),
+                    c["mimeType"].as_str().unwrap_or("unknown")
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Prompt templates this server advertises.
+    pub async fn list_prompts(&self) -> Result<Vec<super::PromptInfo>, McpError> {
+        let result = self.request("prompts/list", json!({})).await?;
+        let list = result["prompts"]
+            .as_array()
+            .ok_or_else(|| McpError::Protocol("prompts/list returned no prompts array".into()))?;
+        Ok(list
+            .iter()
+            .map(|p| super::PromptInfo {
+                name: p["name"].as_str().unwrap_or("").to_string(),
+                description: p["description"].as_str().unwrap_or("").to_string(),
+                arguments: p["arguments"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x["name"].as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    /// Render one prompt template.
+    pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<String, McpError> {
+        let result = self
+            .request("prompts/get", json!({"name": name, "arguments": arguments}))
+            .await?;
+        Ok(super::render_prompt(&result))
+    }
+
     async fn request(&self, method: &str, params: Value) -> Result<Value, McpError> {
         let id = self.id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();

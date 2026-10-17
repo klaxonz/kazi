@@ -3262,6 +3262,61 @@ async fn run_command(
             };
             screen.show_text(text);
         }
+        "mcp" => {
+            let names = match slot.lock().await.as_ref() {
+                Some(a) => a.registry().names(),
+                None => {
+                    screen.show_text(BUSY_TEXT);
+                    return None;
+                }
+            };
+            let mut out = String::new();
+            if sess.cfg.mcp.servers.is_empty() {
+                out.push_str("no MCP servers configured — add [mcp.servers.<nick>] to config.toml");
+            } else {
+                out.push_str(&format!("MCP servers ({})\n", sess.cfg.mcp.servers.len()));
+                for (nick, entry) in &sess.cfg.mcp.servers {
+                    let transport = match (&entry.url, &entry.command) {
+                        (Some(url), _) => format!("http {url}"),
+                        (None, Some(cmd)) => {
+                            let args = if entry.args.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" {}", entry.args.join(" "))
+                            };
+                            format!("stdio {cmd}{args}")
+                        }
+                        (None, None) => "misconfigured (no url, no command)".to_string(),
+                    };
+                    let bridged: Vec<&String> = names
+                        .iter()
+                        .filter(|n| n.starts_with(&format!("mcp_{nick}_")))
+                        .collect();
+                    out.push_str(&format!(
+                        "  {nick}\n    {transport}\n    {} tool(s){}\n",
+                        bridged.len(),
+                        if bridged.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                ": {}",
+                                bridged
+                                    .iter()
+                                    .filter_map(|n| n.rsplit_once('_').map(|(_, last)| last))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        }
+                    ));
+                }
+                if names.iter().any(|n| n == "mcp_resources") {
+                    out.push_str(
+                        "  resources/prompts: the model can call mcp_resources / mcp_prompts\n",
+                    );
+                }
+            }
+            screen.show_text(out.trim_end());
+        }
         "export" => {
             let text = match slot.lock().await.as_ref() {
                 Some(a) => export_session(a, sess, arg),

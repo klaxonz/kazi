@@ -1076,6 +1076,12 @@ const COMMANDS: &[CmdSpec] = &[
         arg: ArgKind::No,
     },
     CmdSpec {
+        name: "/mcp",
+        args: "",
+        help: "MCP servers: transport, bridged tools, resources/prompts tooling",
+        arg: ArgKind::No,
+    },
+    CmdSpec {
         name: "/status",
         args: "",
         help: "provider, model, rounds, usage",

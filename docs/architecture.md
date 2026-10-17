@@ -375,6 +375,15 @@ staging.take() → Reviewer::review(cwd, changes)
 3. **超时不杀,只报告**。`tools.command_timeout_secs` 对后台作业只是「跑太久了」
    的提示(模型会收到 `job_kill` 的建议),因为它的语义是前台调用的墙钟上限。
 
+### 12.6 MCP 的可选能力
+
+MCP 把 `resources` 和 `prompts` 标成可选能力,所以 `McpSession` 的这四个方法有**默认实现**:
+返回「这个 server 不提供 resources」而不是空列表。好处是——一个只暴露 tools 的 server
+(a) 不会被当成坏 server,(b) 模型不会把「空」误读成「确实没有资源」。两个 transport
+(stdio JSON-RPC 与 Streamable HTTP)各自实现了真实的 `resources/list|read` 与
+`prompts/list|get`;聚合层 `McpRegistry` 按配置昵称寻址,于是只有**两个**新工具
+(`mcp_resources` / `mcp_prompts`)而不是每个 server 各两个。
+
 ## 13. 为什么不用框架
 
 现有的 agent 框架 (LangChain/rig/Swarm…) 提供的是**包装**,购买的是接入速度,

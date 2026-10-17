@@ -160,7 +160,7 @@ Slash commands: `/help [command]` (overlay, or one command's usage), `/new`,
 `/diff [n]`, `/queue [clear|drop <n>]`, `/auth`, `/theme`, `/details`,
 `/export [path]`, `/copy [all|tool [n]|diff [n]|code [n]]`, `/retry`,
 `/effort [fast|balanced|deep]`, `/cost [reset]`, `/pin [n|off]`, `/find <text>`,
-`/jobs [id|kill <id>]`, `/exit`.
+`/jobs [id|kill <id>]`, `/mcp`, `/exit`.
 Every finished task autosaves, so quitting mid-task never costs you the session;
 `/undo` restores the files the last task changed; `/rename` repoints autosave
 and keeps the old file. While a task runs, the commands that only read the
@@ -287,6 +287,8 @@ Override anything per call: `--provider <nick>` `--model <name>`
 | `job_output` | status + output tail of a background job                |
 | `job_kill`   | stop a background job (process tree included)           |
 | `fetch_url`  | https GET → text; uncompressed PDF text extracted       |
+| `mcp_resources` | list/read an MCP server's resources (when configured) |
+| `mcp_prompts`   | list/render an MCP server's prompt templates          |
 
 Agents fail lucidly on purpose: every error text is fed back to the model (`is_error`),
 which usually corrects its next call — that's how the loop learns.
@@ -319,6 +321,20 @@ initialize logs a warning and is skipped, never blocking the rest.
 
 Both transports serve tool calls **concurrently** (routed by JSON-RPC id), so
 a single server can answer several calls from one model round at once.
+
+Servers can also expose **resources** (files, rows, documents) and **prompt
+templates**; those are bridged as two extra tools once at least one server
+comes up:
+
+- `mcp_resources { server }` lists them, `mcp_resources { server, uri }` reads
+  one (text is returned; binary `blob` content is described, not inlined);
+- `mcp_prompts { server }` lists templates with their arguments,
+  `mcp_prompts { server, name, arguments }` renders one.
+
+Both are read-only and unapproved, like every other inspection tool. A server
+that does not implement `resources/*` or `prompts/*` says so instead of
+looking empty — MCP marks both capabilities optional. `/mcp` prints each
+configured server with its transport and the tools it bridged.
 
 ## Reliability & bookkeeping
 
