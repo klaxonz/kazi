@@ -1081,6 +1081,26 @@ impl Screen {
                     );
                 }
             }
+            AgentEvent::Hook {
+                event,
+                command,
+                ok,
+                preview,
+            } => {
+                self.flush_streaming();
+                self.push_notice(
+                    if ok { Level::Info } else { Level::Warn },
+                    format!(
+                        "{event} hook {}{}",
+                        if ok { "ok" } else { "failed" },
+                        if preview.trim().is_empty() {
+                            format!(" — {command}")
+                        } else {
+                            format!(" — {preview}")
+                        }
+                    ),
+                );
+            }
             AgentEvent::AutoCompactStarted => {
                 self.push_notice(Level::Info, "auto-compacting the context …")
             }
@@ -3317,6 +3337,35 @@ async fn run_command(
         "tools" => {
             let text = match slot.lock().await.as_ref() {
                 Some(a) => a.registry().catalog(),
+                None => BUSY_TEXT.to_string(),
+            };
+            screen.show_text(text);
+        }
+        "hooks" => {
+            let text = match slot.lock().await.as_ref() {
+                Some(a) => {
+                    let hooks = a.hooks();
+                    if hooks.is_empty() {
+                        "no hooks configured — [[hooks]] in config.toml can gate pre_tool, observe post_tool / post_task"
+                            .to_string()
+                    } else {
+                        let mut out = format!("hooks ({})\n", hooks.len());
+                        for h in &hooks.list {
+                            let expiry = format!(" · {}s", h.timeout.as_secs());
+                            out.push_str(&format!(
+                                "  {:<10} {}{}\n    {}\n",
+                                h.event,
+                                if h.deny_on_failure { "deny" } else { "warn" },
+                                expiry,
+                                h.command
+                            ));
+                        }
+                        out.push_str(
+                            "  (pre_tool: non-zero exit refuses the call; the others only report)",
+                        );
+                        out
+                    }
+                }
                 None => BUSY_TEXT.to_string(),
             };
             screen.show_text(text);

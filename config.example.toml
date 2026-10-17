@@ -52,6 +52,17 @@ provider = "deepseek"
 # url = "https://mcp.example.com/mcp"
 # api_key_env = "EXAMPLE_TOKEN"
 
+# [[hooks]]
+# Project commands around tool calls and tasks. Each gets one JSON object on
+# stdin (event, tool, args, cwd, ...) and answers with its exit code.
+# event: "pre_tool" (non-zero exit REFUSES the call), "post_tool" (advisory,
+# after a call), "post_task" (advisory, after the final answer).
+# [[hooks]]
+# event = "pre_tool"
+# command = ".kazi/hooks/guard.sh"
+# timeout_secs = 10
+# on_failure = "deny"              # deny (default for pre_tool) | warn
+
 # [tools]
 # sandbox_root = "D:/Code"         # if set, file tools stay inside this root; leave the line commented to disable
 # command_timeout_secs = 120       # per run_command call

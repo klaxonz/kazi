@@ -16,6 +16,7 @@
 pub mod console;
 pub mod context;
 pub mod custom;
+pub mod hooks;
 pub mod instructions;
 pub mod session;
 pub mod skills;
@@ -430,6 +431,14 @@ pub enum AgentEvent {
         diff: Option<String>,
         elapsed_ms: u64,
     },
+    /// A project hook ran (post_tool / post_task). Advisory unless it is the
+    /// pre_tool gate, which refuses before a call instead.
+    Hook {
+        event: String,
+        command: String,
+        ok: bool,
+        preview: String,
+    },
     /// Auto-compact kicking in between rounds (proactive, at 80% budget).
     AutoCompactStarted,
     /// Post-edit feedback command finished (`agent.feedback_command`).
@@ -500,6 +509,8 @@ pub struct Agent {
     instructions: instructions::Instructions,
     /// Skills found on disk (`/skills`, and the `use_skill` tool behind them).
     skills: Arc<Vec<skills::Skill>>,
+    /// `[[hooks]]` from config: pre_tool can refuse, the rest are advisory.
+    hooks: hooks::Hooks,
 }
 
 impl Agent {
@@ -555,6 +566,7 @@ impl Agent {
             vision: None,
             instructions: instructions::Instructions::default(),
             skills: Arc::new(Vec::new()),
+            hooks: hooks::Hooks::default(),
         }
     }
 
@@ -615,6 +627,11 @@ impl Agent {
     /// Skills discovered for this session (the catalog behind `use_skill`).
     pub fn skills(&self) -> &[skills::Skill] {
         &self.skills
+    }
+
+    /// Configured hooks (`/hooks` shows them).
+    pub fn hooks(&self) -> &hooks::Hooks {
+        &self.hooks
     }
 
     pub fn max_rounds(&self) -> u32 {
@@ -819,6 +836,7 @@ impl Agent {
         agent.vision = cfg.providers.get(&agent.nick).and_then(|e| e.vision);
         agent.instructions = instructions;
         agent.skills = skills;
+        agent.hooks = hooks::Hooks::from_cfg(cfg);
         agent.nick = nick;
         agent.auth_hint = auth_hint;
         agent
@@ -1071,6 +1089,29 @@ impl Agent {
             if !resp.has_tool_calls() {
                 let text = resp.text_or_empty().to_string();
                 self.history.push(Message::assistant(text.clone()));
+                // post_task hooks are advisory: they run, get reported, and
+                // never change the answer that already exists
+                if !self.hooks.is_empty() {
+                    let runs = self
+                        .hooks
+                        .after(
+                            "post_task",
+                            &self.ctx.cwd,
+                            serde_json::json!({
+                                "ok": true,
+                                "answer": crate::tools::clip_line(&text, 2000),
+                            }),
+                        )
+                        .await;
+                    for run in runs {
+                        on_event(AgentEvent::Hook {
+                            event: run.event,
+                            command: run.command,
+                            ok: run.ok,
+                            preview: run.output,
+                        });
+                    }
+                }
                 return Ok(text);
             }
 
@@ -1099,6 +1140,33 @@ impl Agent {
                 .collect();
             let mut pending: Vec<(usize, ToolCall)> = Vec::new();
             for (i, call) in calls.iter().enumerate() {
+                // project policy first: a pre_tool hook may refuse before the
+                // human is even asked (the hook IS the project's own gate)
+                if !self.hooks.is_empty() {
+                    if let Some(reason) = self
+                        .hooks
+                        .pre_tool(&self.ctx.cwd, &call.name, &call.arguments)
+                        .await
+                    {
+                        let denied = ToolOutcome::err(reason);
+                        on_event(AgentEvent::ToolStart {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            summary: crate::tools::call_summary(call),
+                        });
+                        on_event(AgentEvent::ToolEnd {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            is_error: true,
+                            preview: denied.first_line_preview(160),
+                            output: event_output(&denied.text),
+                            diff: None,
+                            elapsed_ms: 0,
+                        });
+                        verdicts[i] = Some((denied, 0));
+                        continue;
+                    }
+                }
                 if let Some(summary) = self.registry.approval_summary(call, &self.ctx) {
                     on_event(AgentEvent::ToolStart {
                         id: call.id.clone(),
@@ -1172,6 +1240,31 @@ impl Agent {
                                 diff,
                                 elapsed_ms,
                             });
+                            // advisory hooks see what happened; their output is
+                            // reported, never used to undo the call
+                            if !self.hooks.is_empty() {
+                                let runs = self
+                                    .hooks
+                                    .after(
+                                        "post_tool",
+                                        &self.ctx.cwd,
+                                        serde_json::json!({
+                                            "tool": calls[i].name,
+                                            "args": calls[i].arguments,
+                                            "is_error": outcome.is_error,
+                                            "preview": outcome.first_line_preview(200),
+                                        }),
+                                    )
+                                    .await;
+                                for run in runs {
+                                    on_event(AgentEvent::Hook {
+                                        event: run.event,
+                                        command: run.command,
+                                        ok: run.ok,
+                                        preview: run.output,
+                                    });
+                                }
+                            }
                             verdicts[i] = Some((outcome, elapsed_ms));
                             remaining -= 1;
                         }

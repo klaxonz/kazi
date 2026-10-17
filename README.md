@@ -160,7 +160,8 @@ Slash commands: `/help [command]` (overlay, or one command's usage), `/new`,
 `/diff [n]`, `/queue [clear|drop <n>]`, `/auth`, `/theme`, `/details`,
 `/export [path]`, `/copy [all|tool [n]|diff [n]|code [n]]`, `/retry`,
 `/effort [fast|balanced|deep]`, `/cost [reset]`, `/pin [n|off]`, `/find <text>`,
-`/jobs [id|kill <id>]`, `/mcp`, `/skills [name]`, `/instructions`, `/exit`.
+`/jobs [id|kill <id>]`, `/mcp`, `/skills [name]`, `/instructions`, `/hooks`,
+`/exit`.
 Every finished task autosaves, so quitting mid-task never costs you the session;
 `/undo` restores the files the last task changed; `/rename` repoints autosave
 and keeps the old file. While a task runs, the commands that only read the
@@ -327,6 +328,28 @@ task; the model loads the body with `use_skill` when the task actually
 matches, and `/skills` (`/skills release` prints the procedure) is the same
 list for you. Bodies are capped at 32 KiB, a nearer skill overrides a farther
 one with the same name, and the directory name is the skill's identity.
+
+## Hooks
+
+A project can put its own policy around the agent — CI rules, a secret scanner,
+"no writes to vendor/" — without forking kazi:
+
+```toml
+[[hooks]]
+event = "pre_tool"            # pre_tool | post_tool | post_task
+command = ".kazi/hooks/guard.sh"
+timeout_secs = 10
+on_failure = "deny"           # deny (default for pre_tool) or warn
+```
+
+The hook gets one JSON object on stdin — `event`, `tool`, `args`, `cwd`
+after a call, `is_error`/`preview` or the task's `ok`/`answer` — and
+signals with its exit code. A non-zero **pre_tool** refuses the call: the model
+sees the hook's output as the reason and adapts, the human is never asked to
+approve something the project already vetoed. `post_tool` and
+`post_task` are advisory (their output is reported, never used to undo
+work), and a hook that times out counts as a failure. `/hooks` shows what is
+configured and whether each one denies or warns.
 
 ## Built-in tools
 

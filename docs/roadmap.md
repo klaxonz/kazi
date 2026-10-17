@@ -20,7 +20,9 @@
 > front-matter、`$ARGUMENTS`/`$1..$9`、进补全与 `/help`、`kazi run` 同步展开)。
 > **0.24 实际交付**:0.21 主题的**技能**(§6：目录只放 name + description,正文由
 > `use_skill` 按需加载,/skills 查看,32 KiB 上限、近者优先)。
-> 剩下的 0.21 主题项:**hook**、**profile**、**`kazi::prelude` 冻结**。
+> **0.25 实际交付**:0.21 主题的 **hook**(`[[hooks]]` 的 pre_tool 拒绝 / post_tool /
+> post_task 报告,stdin JSON + 退出码,超时算失败,/hooks 查看)。
+> 剩下的 0.21 主题项:**profile**、**`kazi::prelude` 冻结**。
 
 ## 1. 现状:0.18 的 kazi 是什么
 

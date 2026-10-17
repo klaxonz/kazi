@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: MINOR = feature batch, PATCH = fixes only — see docs/VERSIONING.md).
 
+## [0.25.0] - 2026-10-17
+
+Hooks: the project can gate and observe the agent from its own scripts.
+
+### Added
+
+- **`[[hooks]]`** with `event = "pre_tool" | "post_tool" | "post_task"`,
+  `command`, `timeout_secs` and `on_failure = "deny" | "warn"`. Each hook gets one
+  JSON object on stdin (event, tool, args, cwd, plus is_error/preview after a
+  call or ok/answer after a task) and answers with its exit code.
+- A non-zero **pre_tool** refuses the call *before* the human is asked: the model
+  gets the hook's output as the denial reason ("refused by the project's
+  pre_tool hook (…): …") and adapts, exactly like a user denial.
+- **post_tool / post_task** are advisory: their output is reported as a
+  `~ event` notice in the TUI and a line in headless mode, and can never undo
+  work. A hook that times out counts as a failure.
+- `/hooks` lists every configured hook with its policy (deny/warn), timeout
+  and command, or explains the syntax when none exist.
+- Unknown events and empty commands are skipped with a warning at startup rather
+  than silently ignored or fatal.
+
+### Tests
+
+`cargo test` — 302 passing (was 298): a failing pre_tool refuses (with its
+output as the reason), a passing one allows, `on_failure = "warn"` never denies,
+advisory hooks report their output, and invalid entries are skipped.
+
 ## [0.24.1] - 2026-10-17
 
 ### Fixed

@@ -931,6 +931,15 @@ pub fn render_event(ev: &AgentEvent) {
             let (sym, col) = if *ok { ("ok", GREEN) } else { ("x", RED) };
             println!("\n{col}>> feedback {sym}{RESET} {DIM}`{command}` {preview}{RESET}");
         }
+        AgentEvent::Hook {
+            event,
+            command,
+            ok,
+            preview,
+        } => {
+            let (sym, col) = if *ok { ("ok", GREEN) } else { ("x", YELLOW) };
+            println!("\n{col}~ {event} {sym}{RESET} {DIM}{command} {preview}{RESET}");
+        }
         AgentEvent::RoundDone { .. } => {} // run stays quiet on round progress
     }
 }
@@ -1092,6 +1101,12 @@ const COMMANDS: &[CmdSpec] = &[
         args: "[name]",
         help: "list project skills, or print one's procedure",
         arg: ArgKind::Flag,
+    },
+    CmdSpec {
+        name: "/hooks",
+        args: "",
+        help: "project hooks (pre_tool / post_tool / post_task) and their policies",
+        arg: ArgKind::No,
     },
     CmdSpec {
         name: "/status",

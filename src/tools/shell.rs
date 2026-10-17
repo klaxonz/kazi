@@ -217,13 +217,13 @@ pub(crate) fn build_command(cmd: &str, dir: &std::path::Path) -> Command {
 /// CREATE_NO_WINDOW avoids console flashes for spawned processes.
 /// (Platform-gated: the attribute exists only on Windows.)
 #[cfg(windows)]
-fn no_console_window(c: &mut Command) {
+pub(crate) fn no_console_window(c: &mut Command) {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let _ = c.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[cfg(not(windows))]
-fn no_console_window(_c: &mut Command) {}
+pub(crate) fn no_console_window(_c: &mut Command) {}
 
 fn truncate_lossy(bytes: &[u8], cap: usize) -> String {
     let s = String::from_utf8_lossy(bytes);

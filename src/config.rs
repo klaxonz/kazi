@@ -58,6 +58,20 @@ pub struct Config {
     pub usage: UsageCfg,
     /// nickname → entry; BTreeMap keeps stable ordering for errors and `first`.
     pub providers: BTreeMap<String, ProviderEntry>,
+    /// `[[hooks]]`: project commands around tool calls and tasks.
+    pub hooks: Vec<HookCfg>,
+}
+
+/// One `[[hooks]]` entry.
+#[derive(Debug, Deserialize, Default, Clone, PartialEq, Eq)]
+#[serde(default)]
+pub struct HookCfg {
+    /// `pre_tool` | `post_tool` | `post_task`.
+    pub event: String,
+    pub command: String,
+    pub timeout_secs: Option<u64>,
+    /// `deny` (default for pre_tool) or `warn`.
+    pub on_failure: Option<String>,
 }
 
 /// `[ui]`: look and default verbosity of the full-screen TUI.
