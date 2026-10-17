@@ -3,3 +3,5 @@
 /config.toml
 Cargo.lock.bak
 *.log
+# tool session state — not project code
+/.commandcode/

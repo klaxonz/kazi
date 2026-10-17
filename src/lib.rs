@@ -44,6 +44,7 @@
 //! | [`config`]| TOML config with provider precedence + env-key resolution     |
 
 pub mod agent;
+pub mod auth;
 pub mod cli;
 pub mod config;
 pub mod llm;

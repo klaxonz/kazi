@@ -154,7 +154,7 @@ impl Config {
         }
     }
 
-    fn default_key_env(kind: ProviderKind) -> Option<&'static str> {
+    pub(crate) fn default_key_env(kind: ProviderKind) -> Option<&'static str> {
         match kind {
             ProviderKind::OpenAiCompat => Some("OPENAI_API_KEY"),
             ProviderKind::Anthropic => Some("ANTHROPIC_API_KEY"),
@@ -162,9 +162,11 @@ impl Config {
         }
     }
 
-    /// Resolve the API key for a provider entry from the environment.
-    /// Deliberately separate from [`Config::resolve`]: embedders plug their own
-    /// key source; the CLI uses this for early, actionable failures.
+    /// Resolve the API key for a provider entry. Precedence: environment
+    /// variable (`api_key_env` / kind default) first, then the local
+    /// credential store (`kazi auth`), then an actionable error. Deliberately
+    /// separate from [`Config::resolve`]: embedders plug their own key source;
+    /// the CLI uses this for early, actionable failures.
     pub fn api_key_for(&self, nick: &str) -> Result<Option<String>, ConfigError> {
         let entry = self
             .providers
@@ -183,16 +185,26 @@ impl Config {
                 false,
             ),
         };
-        match std::env::var(&env_name) {
-            Ok(v) if !v.trim().is_empty() => Ok(Some(v)),
-            _ => Err(ConfigError::BadProvider {
-                nick: nick.to_string(),
-                msg: format!(
-                    "environment variable {env_name} is not set{} — export it, or use a provider with a key",
-                    if configured { " (api_key_env in config)" } else { "" }
-                ),
-            }),
+        if let Ok(v) = std::env::var(&env_name) {
+            if !v.trim().is_empty() {
+                return Ok(Some(v));
+            }
         }
+        // env miss → fall back to the local credential store (`kazi auth`)
+        if let Ok(store) = crate::auth::load() {
+            if let Some(key) = store.keys.get(nick) {
+                if !key.trim().is_empty() {
+                    return Ok(Some(key.clone()));
+                }
+            }
+        }
+        Err(ConfigError::BadProvider {
+            nick: nick.to_string(),
+            msg: format!(
+                "environment variable {env_name} is not set{} and no stored key — export it, or run: kazi auth set {nick}",
+                if configured { " (api_key_env in config)" } else { "" }
+            ),
+        })
     }
 
     /// Resolve the provider nick + concrete settings for a run.
@@ -248,6 +260,16 @@ impl Config {
                 api_key: None,
             },
         })
+    }
+
+    /// Public kind lookup for a configured nickname (e.g. `kazi auth` uses
+    /// it to skip ollama providers, which need no key).
+    pub fn kind_of_nick(&self, nick: &str) -> Result<ProviderKind, ConfigError> {
+        let entry = self
+            .providers
+            .get(nick)
+            .ok_or_else(|| ConfigError::Unknown(nick.to_string(), self.nicks().join(", ")))?;
+        Self::kind_of(nick, entry)
     }
 
     /// All nicknames, for `/provider` and error messages.

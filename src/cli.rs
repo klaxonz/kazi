@@ -94,6 +94,12 @@ pub enum Command {
     /// List configured providers
     #[command(name = "providers")]
     Providers,
+    /// Manage locally stored API keys (`<data-dir>/kazi/auth.json`)
+    #[command(name = "auth")]
+    Auth {
+        #[command(subcommand)]
+        cmd: Option<AuthCmd>,
+    },
     /// List built-in tools
     #[command(name = "tools")]
     Tools,
@@ -113,6 +119,27 @@ pub enum Command {
         session: String,
         /// Output path (default: `<session>.md` in the working directory)
         out: Option<PathBuf>,
+    },
+}
+
+/// Manage locally stored API keys (environment variables always win).
+#[derive(Subcommand, Debug)]
+pub enum AuthCmd {
+    /// Store the key for a provider (reads the value from an argument,
+    /// stdin, or — interactively — a hidden prompt)
+    Set {
+        /// Provider nickname from config (see `kazi providers`)
+        provider: String,
+        /// The key itself; omit to paste it (hidden prompt or stdin pipe)
+        #[arg(value_name = "KEY")]
+        key: Option<String>,
+    },
+    /// Show which providers have a stored key (values are never printed)
+    List,
+    /// Remove the stored key for a provider
+    Remove {
+        /// Provider nickname (exact or unambiguous prefix)
+        provider: String,
     },
 }
 
@@ -141,6 +168,7 @@ pub async fn execute(cli: Cli) -> anyhow::Result<u8> {
         }
         Some(Command::Config { init }) => config_cmd(init),
         Some(Command::Providers) => providers_cmd(cli.config.as_deref()),
+        Some(Command::Auth { cmd }) => auth_cmd(cmd, cli.config.as_deref()),
         Some(Command::Tools) => tools_cmd(),
         Some(Command::Sessions) => sessions_cmd(),
         Some(Command::Rm { session }) => rm_cmd(&session),
@@ -158,6 +186,19 @@ async fn chat(
     // always get the line REPL unless --tui is forced.
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let want_tui = !args.no_tui && (args.tui || interactive);
+    // On a real terminal a missing key should not hard-exit: offer to store
+    // one (like claude/codex onboarding). Non-interactive paths keep the
+    // fail-fast contract.
+    let nick = match cfg.resolve(args.provider.as_deref(), args.model.as_deref()) {
+        Ok(r) => r.nick,
+        Err(e) => anyhow::bail!("{e}"),
+    };
+    if let Err(e) = cfg.api_key_for(&nick) {
+        if !interactive {
+            return Err(e.into());
+        }
+        onboarding_offer(&cfg, &nick, e)?;
+    }
     let mode = startup_mode(&cfg, args);
     if want_tui {
         return tui::chat_loop_with(
@@ -266,6 +307,12 @@ async fn run_once(
 ) -> anyhow::Result<u8> {
     let (cfg, _) = config::load(cfg_path)?;
     let mode = startup_mode(&cfg, args);
+    // `run` is the scripting/CI path: fail fast with an actionable message
+    // instead of agent-construction warnings + a mid-stream 401.
+    let nick = cfg
+        .resolve(args.provider.as_deref(), args.model.as_deref())?
+        .nick;
+    cfg.api_key_for(&nick)?;
     let agent =
         Agent::default_cli_mode(&cfg, args.provider.as_deref(), args.model.as_deref(), mode)
             .await?;
@@ -380,17 +427,260 @@ fn config_cmd(init: bool) -> anyhow::Result<u8> {
 fn providers_cmd(cfg_path: Option<&Path>) -> anyhow::Result<u8> {
     let (cfg, path) = config::load(cfg_path)?;
     println!("{DIM}config: {}{RESET}", path.display());
+    let store = crate::auth::load().ok();
     for (nick, entry) in &cfg.providers {
         let model = entry
             .model
             .as_deref()
             .unwrap_or("(no model set: pass --model)");
+        let key = match cfg.kind_of_nick(nick) {
+            Ok(crate::llm::ProviderKind::Ollama) => "no key needed".to_string(),
+            Ok(kind) => {
+                let env_name = entry
+                    .api_key_env
+                    .clone()
+                    .or_else(|| {
+                        config::Config::default_key_env(kind).map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                let env_ok = std::env::var(&env_name)
+                    .map(|v| !v.trim().is_empty())
+                    .unwrap_or(false);
+                let stored = store
+                    .as_ref()
+                    .map(|s| s.keys.contains_key(nick))
+                    .unwrap_or(false);
+                if env_ok {
+                    format!("{DIM}key: {env_name} ✓{RESET}")
+                } else if stored {
+                    format!("{DIM}key: stored (kazi auth){RESET}")
+                } else {
+                    format!("{YELLOW}key: missing — export {env_name} or `kazi auth set {nick}`{RESET}")
+                }
+            }
+            Err(_) => String::new(),
+        };
         println!(
-            "{CYAN}{nick:<14}{RESET} type={} model={model}",
+            "{CYAN}{nick:<14}{RESET} type={} model={model}  {key}",
             entry.r#type
         );
     }
     Ok(0)
+}
+
+/// `kazi auth`: manage locally stored API keys. Values are never echoed back.
+fn auth_cmd(cmd: Option<AuthCmd>, cfg_path: Option<&Path>) -> anyhow::Result<u8> {
+    let cmd = cmd.unwrap_or(AuthCmd::List);
+    match cmd {
+        AuthCmd::List => {
+            let store = crate::auth::load()?;
+            if store.keys.is_empty() {
+                println!("no stored keys yet — add one with: {CYAN}kazi auth set <provider>{RESET}");
+                return Ok(0);
+            }
+            let path = crate::auth::auth_path()?;
+            println!("{DIM}stored keys (env vars still win): {}{RESET}", path.display());
+            for nick in store.keys.keys() {
+                println!("  {CYAN}{nick}{RESET}");
+            }
+            Ok(0)
+        }
+        AuthCmd::Set { provider, key } => {
+            let (cfg, _) = config::load(cfg_path)?;
+            let nick = resolve_provider_nick(&cfg, &provider)?;
+            let kind = cfg
+                .kind_of_nick(&nick)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if kind == crate::llm::ProviderKind::Ollama {
+                println!("`{nick}` is an ollama provider — it needs no API key");
+                return Ok(0);
+            }
+            let value = match key {
+                Some(k) => k,
+                None => read_secret()?,
+            };
+            let value = value.trim().to_string();
+            if value.is_empty() {
+                println!("{RED}empty key — nothing stored{RESET}");
+                return Ok(1);
+            }
+            let path = crate::auth::store(&nick, &value)?;
+            println!("stored key for {CYAN}{nick}{RESET} -> {}", path.display());
+            println!("{DIM}env vars still take precedence when both are set{RESET}");
+            Ok(0)
+        }
+        AuthCmd::Remove { provider } => {
+            let (cfg, _) = config::load(cfg_path)?;
+            let nick = resolve_provider_nick(&cfg, &provider)?;
+            match crate::auth::remove(&nick) {
+                Ok(true) => {
+                    println!("removed stored key for {CYAN}{nick}{RESET}");
+                    Ok(0)
+                }
+                Ok(false) => {
+                    println!("no stored key for `{nick}`");
+                    Ok(1)
+                }
+                Err(e) => {
+                    println!("{RED}cannot remove: {e}{RESET}");
+                    Ok(1)
+                }
+            }
+        }
+    }
+}
+
+/// Providers get prefix resolution like sessions; exact wins.
+fn resolve_provider_nick(cfg: &config::Config, name: &str) -> anyhow::Result<String> {
+    if cfg.providers.contains_key(name) {
+        return Ok(name.to_string());
+    }
+    let matches: Vec<String> = cfg
+        .nicks()
+        .into_iter()
+        .filter(|n| n.starts_with(name))
+        .collect();
+    match matches.len() {
+        1 => Ok(matches.into_iter().next().expect("len == 1")),
+        0 => anyhow::bail!(
+            "unknown provider `{name}` — configured are: {}",
+            cfg.nicks().join(", ")
+        ),
+        _ => anyhow::bail!(
+            "ambiguous provider prefix `{name}` — matches: {}",
+            matches.join(", ")
+        ),
+    }
+}
+
+/// Read a secret without echoing: hidden prompt on a terminal, plain read
+/// from piped stdin (scripts), trimmed.
+fn read_secret() -> anyhow::Result<String> {
+    if std::io::stdin().is_terminal() {
+        // hidden prompt without pulling in a password crate:termios on unix,
+        // console mode on windows
+        print!("paste key (hidden), Enter to confirm: ");
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        let mut buf = String::new();
+        read_line_hidden(&mut buf)?;
+        println!();
+        Ok(buf)
+    } else {
+        let mut buf = String::new();
+        std::io::stdin().read_line(&mut buf)?;
+        Ok(buf)
+    }
+}
+
+/// One line of input with terminal echo disabled, platform-appropriate.
+fn read_line_hidden(out: &mut String) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        // least-bad portable option: read via console mode toggle
+        use windows_hidden::*;
+        let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        let mut mode = 0;
+        unsafe { GetConsoleMode(handle, &mut mode) };
+        unsafe { SetConsoleMode(handle, mode & !ENABLE_ECHO_INPUT) };
+        let reader = std::io::stdin();
+        reader.read_line(out)?;
+        unsafe { SetConsoleMode(handle, mode) };
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        // termios echo toggle, no external crate
+        use std::os::fd::AsRawFd;
+        let fd = std::io::stdin().as_raw_fd();
+        let mut t: libc_termios = unsafe { std::mem::zeroed() };
+        unsafe { tcgetattr(fd, &mut t) };
+        let saved = t;
+        t.c_lflag &= !ECHO;
+        unsafe { tcsetattr(fd, TCSANOW, &t) };
+        let r = std::io::stdin().read_line(out);
+        unsafe { tcsetattr(fd, TCSANOW, &saved) };
+        r?;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+mod windows_hidden {
+    // MINIMAL Win32 console API surface (no windows crate dependency)
+    pub const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6u32 as i32 as u32;
+    pub const ENABLE_ECHO_INPUT: u32 = 0x0004;
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn GetStdHandle(n: u32) -> isize;
+        pub fn GetConsoleMode(h: isize, mode: *mut u32) -> i32;
+        pub fn SetConsoleMode(h: isize, mode: u32) -> i32;
+    }
+}
+
+#[cfg(not(windows))]
+mod libc_termios_shim {
+    // termios via libc types re-declared locally to avoid a dependency
+    #[repr(C)]
+    pub struct Termios {
+        pub c_iflag: u32,
+        pub c_oflag: u32,
+        pub c_cflag: u32,
+        pub c_lflag: u32,
+        pub c_line: u8,
+        pub c_cc: [u8; 32],
+        pub c_ispeed: u32,
+        pub c_ospeed: u32,
+    }
+    extern "C" {
+        pub fn tcgetattr(fd: i32, t: *mut Termios) -> i32;
+        pub fn tcsetattr(fd: i32, act: i32, t: *const Termios) -> i32;
+    }
+}
+#[cfg(not(windows))]
+use libc_termios_shim::*;
+#[cfg(not(windows))]
+const ECHO: u32 = 0o000010;
+#[cfg(not(windows))]
+const TCSANOW: i32 = 0;
+
+/// Interactive offer when the default provider has no key: store it now
+/// (recommended), export instructions, or just proceed (the session will
+/// fail on first request). Never shown for ollama (needs no key).
+fn onboarding_offer(
+    cfg: &config::Config,
+    nick: &str,
+    err: config::ConfigError,
+) -> anyhow::Result<()> {
+    println!("{YELLOW}warning: {err}{RESET}");
+    let needs_key = cfg
+        .kind_of_nick(nick)
+        .map(|k| k != crate::llm::ProviderKind::Ollama)
+        .unwrap_or(true);
+    if !needs_key {
+        return Ok(());
+    }
+    print!("store an API key for `{nick}` now? [Y/n] ");
+    use std::io::Write;
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    match line.trim().to_lowercase().as_str() {
+        "" | "y" | "yes" => {
+            let value = read_secret()?;
+            let value = value.trim();
+            if value.is_empty() {
+                println!("{YELLOW}empty key — skipped{RESET}");
+            } else {
+                match crate::auth::store(nick, value) {
+                    Ok(path) => println!("stored key for {CYAN}{nick}{RESET} -> {}", path.display()),
+                    Err(e) => println!("{RED}cannot store key: {e}{RESET}"),
+                }
+            }
+        }
+        _ => println!("{DIM}skipped — export the env var before first use{RESET}"),
+    }
+    Ok(())
 }
 
 fn tools_cmd() -> anyhow::Result<u8> {

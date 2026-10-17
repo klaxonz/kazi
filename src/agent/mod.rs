@@ -446,7 +446,10 @@ impl Agent {
     ) -> anyhow::Result<Self> {
         let resolved = cfg.resolve(provider, model_override)?;
         let mut settings = resolved.settings;
-        settings.api_key = cfg.api_key_for(&resolved.nick)?;
+        match cfg.api_key_for(&resolved.nick) {
+            Ok(key) => settings.api_key = key,
+            Err(e) => eprintln!("warning: {e} — will fail on first request if the provider needs a key"),
+        }
         let inner_provider = crate::llm::build_provider(&settings)?;
         let wrapped: Arc<dyn Provider> = Arc::new(crate::llm::RetryProvider::new(
             inner_provider,
