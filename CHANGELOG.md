@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-10-17
+
+### Fixed
+
+- `kazi --yolo` (and the other engine flags: `--provider`, `--model`,
+  `--resume`, `--permission-mode`, `--no-tui`, `--tui`) now work on the bare
+  invocation instead of failing with "unexpected argument". Bare `kazi` really
+  is `kazi chat` now, flags included. Combining bare flags with a subcommand
+  (`kazi --yolo chat`) is rejected explicitly rather than silently ignored.
+
 ## [0.14.0] - 2026-10-17
 
 ### Added

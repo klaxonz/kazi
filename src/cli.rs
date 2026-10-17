@@ -21,12 +21,17 @@ const RESET: &str = "\x1b[0m";
     name = "kazi",
     version,
     about = "A tiny, from-scratch AI agent for your terminal",
-    after_help = "Providers are configured in config.toml — see `kazi config`."
+    after_help = "Providers are configured in config.toml — see `kazi config`.",
+    args_conflicts_with_subcommands = true
 )]
 pub struct Cli {
     /// Path to the config file (default: platform config dir)
     #[arg(long, global = true, help_heading = "Config")]
     pub config: Option<PathBuf>,
+    /// Flags for the bare invocation (`kazi` == `kazi chat`), so `kazi --yolo`
+    /// works without naming the subcommand.
+    #[command(flatten)]
+    pub engine: EngineArgs,
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -123,7 +128,7 @@ pub enum OutputFmt {
 /// Dispatch; returns the process exit code.
 pub async fn execute(cli: Cli) -> anyhow::Result<u8> {
     match cli.command {
-        None => chat(&EngineArgs::default(), None, cli.config.as_deref()).await,
+        None => chat(&cli.engine, None, cli.config.as_deref()).await,
         Some(Command::Chat { topic, args }) => chat(&args, topic, cli.config.as_deref()).await,
         Some(Command::Run { task, args, output }) => {
             run_once(
@@ -174,6 +179,56 @@ async fn chat(
         args.resume.clone(),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_invocation_accepts_engine_flags() {
+        // the reported gap: `kazi --yolo` must work without a subcommand
+        let cli = Cli::try_parse_from(["kazi", "--yolo"]).expect("--yolo parses bare");
+        assert!(cli.command.is_none());
+        assert!(cli.engine.yolo);
+
+        let cli = Cli::try_parse_from(["kazi", "--permission-mode", "read-only"]).unwrap();
+        assert_eq!(cli.engine.permission_mode.as_deref(), Some("read-only"));
+
+        let cli = Cli::try_parse_from(["kazi", "--model", "x", "--no-tui"]).unwrap();
+        assert_eq!(cli.engine.model.as_deref(), Some("x"));
+        assert!(cli.engine.no_tui);
+
+        // the subcommand form keeps working
+        let cli = Cli::try_parse_from(["kazi", "chat", "--yolo"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Chat { args, .. }) if args.yolo));
+
+        // mixing bare flags WITH a subcommand is an error, never ignored
+        assert!(Cli::try_parse_from(["kazi", "--yolo", "chat"]).is_err());
+    }
+
+    #[test]
+    fn startup_mode_precedence() {
+        use crate::tools::PermissionMode as Mode;
+        let cfg = crate::config::Config::default();
+
+        let mut args = EngineArgs::default();
+        assert_eq!(startup_mode(&cfg, &args), Mode::Edit, "default");
+
+        args.yolo = true;
+        assert_eq!(
+            startup_mode(&cfg, &args),
+            Mode::Yolo,
+            "--yolo wins over config"
+        );
+
+        args.permission_mode = Some("read-only".to_string());
+        assert_eq!(
+            startup_mode(&cfg, &args),
+            Mode::ReadOnly,
+            "--permission-mode wins over --yolo"
+        );
+    }
 }
 
 /// Startup permission mode: `--permission-mode` wins, then `--yolo`, then
