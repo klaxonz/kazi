@@ -79,8 +79,11 @@ alternate-screen support.
 TUI keys: `↑/↓` input history, `←/→ Home/End Ctrl+A/E/U/K/W` line editing,
 `/` opens the command dropdown and `Tab` completes, `PgUp/PgDn` or the mouse
 wheel to scroll (`Ctrl+Home/End` jump), `Esc` interrupts a running task (and
-quits when idle), `Ctrl+C` quits, `/undo` restores the files the last task
-changed, `/help` lists all of it.
+quits when idle), `Ctrl+C` quits. The TUI runs the **same slash commands** as
+the line REPL — `/new`, `/compact`, `/resume`, `/provider`, `/model`,
+`/permission`, `/status`, `/tools`, `/undo`, `/context` — so there is no
+second-class front-end. `/undo` restores the files the last task changed and
+`/help` prints the table plus the key bindings.
 
 Every task run checkpoints the files it is about to modify (newest 20 kept),
 so `/undo` is a one-keystroke safety net after an aggressive edit.

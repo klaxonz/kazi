@@ -38,8 +38,8 @@ const GREEN: Color = Color::Green;
 const RED: Color = Color::Red;
 const YELLOW: Color = Color::Yellow;
 
-/// Keys and commands the TUI itself answers (the full command set lives in
-/// the line REPL, `kazi --no-tui`).
+/// Key bindings printed by `/help` (the command list itself is shared with
+/// the line REPL — one table, both front-ends).
 const TUI_HELP: &[&str] = &[
     "keys: Enter submit · Esc interrupt (idle: quit) · Ctrl+C quit",
     "↑/↓ input history · Ctrl+A/E/U/K/W edit · Ctrl+L clear transcript",
@@ -47,8 +47,6 @@ const TUI_HELP: &[&str] = &[
     "PgUp/PgDn or mouse wheel scroll · Ctrl+Home top · Ctrl+End bottom",
     "Shift+Tab cycles permission mode (read-only → yolo → edit)",
     "@file in a task attaches the file's contents",
-    "commands here: /undo · /context · /help",
-    "full set (/new, /model, /provider, /compact, /resume …): kazi --no-tui",
 ];
 
 /// Approval request travelling from the agent thread to the UI loop.
@@ -810,6 +808,8 @@ pub async fn chat_loop_with(
     };
     // Channel-based approval: the agent asks, the UI loop answers by key.
     let (ask_tx, ask_rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalAsk>();
+    // kept for agents rebuilt inside the TUI (/provider, /model)
+    let ask_tx_rebuild = ask_tx.clone();
     let approver: std::sync::Arc<dyn Approver> = if mode == crate::tools::PermissionMode::Yolo {
         std::sync::Arc::new(crate::tools::AutoApprover)
     } else {
@@ -844,15 +844,26 @@ pub async fn chat_loop_with(
         }
     }
 
-    let save = |agent: &Agent| {
-        let _ = super::session::save(
-            &session_name,
-            agent.history.system.as_deref(),
-            &agent.history.msgs,
-        );
+    let save = |name: &str, agent: &Agent| {
+        let _ = super::session::save(name, agent.history.system.as_deref(), &agent.history.msgs);
+    };
+    let sess = SessionState {
+        cfg: cfg.clone(),
+        provider: provider.clone(),
+        model: model.clone(),
+        session_name: session_name.clone(),
     };
 
-    match chat_loop_tui(agent, session_name.clone(), save, ask_rx).await {
+    match chat_loop_tui(
+        agent,
+        session_name.clone(),
+        save,
+        ask_rx,
+        sess,
+        ask_tx_rebuild,
+    )
+    .await
+    {
         Ok(code) => {
             println!("\x1b[2msession saved -> {session_name}\x1b[0m");
             Ok(code)
@@ -864,14 +875,25 @@ pub async fn chat_loop_with(
     }
 }
 
+/// Mutable session view the in-TUI slash commands act on: `/provider`,
+/// `/model` and `/new` change what the next save and rebuild use.
+pub struct SessionState {
+    pub cfg: crate::config::Config,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub session_name: String,
+}
+
 /// Run the TUI chat loop. `chat_loop_tui` owns its terminal; stdout is
-/// restored on every return path. Returns unchanged session data reduction —
-/// persistence continues to live in repl.rs.
+/// restored on every return path. `on_session_save` receives the CURRENT
+/// session name (in-TUI `/new` may have changed it) plus the agent.
 pub async fn chat_loop_tui(
     agent: Agent,
     session_name: String,
-    on_session_save: impl Fn(&Agent),
+    on_session_save: impl Fn(&str, &Agent),
     mut approvals: tokio::sync::mpsc::UnboundedReceiver<ApprovalAsk>,
+    mut sess: SessionState,
+    ask_tx: tokio::sync::mpsc::UnboundedSender<ApprovalAsk>,
 ) -> anyhow::Result<u8> {
     let provider_desc = agent.provider().describe();
     let max_rounds = agent.max_rounds();
@@ -887,7 +909,7 @@ pub async fn chat_loop_tui(
     screen.mode = permission.get();
     screen.push(
         LineKind::Dim,
-        "type a task and press Enter (empty line = same task again) — Esc quits".to_string(),
+        "type a task and press Enter · / for commands · Esc quits".to_string(),
     );
 
     let res = tui_inner(
@@ -897,6 +919,8 @@ pub async fn chat_loop_tui(
         &on_session_save,
         &mut approvals,
         &permission,
+        &mut sess,
+        &ask_tx,
     )
     .await;
 
@@ -910,18 +934,277 @@ pub async fn chat_loop_tui(
     res.map(|_| if quit_clean { 0 } else { 1 })
 }
 
+/// Append multi-line text to the transcript, one line per row.
+fn push_lines(screen: &mut Screen, text: impl AsRef<str>) {
+    for line in text.as_ref().lines() {
+        screen.push(LineKind::Dim, line.to_string());
+    }
+}
+
+const BUSY_TEXT: &str = "the agent is busy — try again when the task finishes";
+
+/// Answer one slash command typed inside the TUI. Same command set as the
+/// line REPL (they share `repl`'s text builders); the output lands in the
+/// transcript and `/provider`, `/model`, `/new` may replace the agent.
+#[allow(clippy::too_many_arguments)]
+async fn run_command(
+    cmdline: &str,
+    screen: &mut Screen,
+    slot: &std::sync::Arc<tokio::sync::Mutex<Option<Agent>>>,
+    sess: &mut SessionState,
+    ask_tx: &tokio::sync::mpsc::UnboundedSender<ApprovalAsk>,
+    permission: &crate::tools::Permission,
+    save: &(impl Fn(&str, &Agent) + ?Sized),
+) {
+    use super::repl;
+    use crate::tools::PermissionMode as Mode;
+    let (verb, arg) = cmdline
+        .split_once(' ')
+        .map(|(a, b)| (a, b.trim()))
+        .unwrap_or((cmdline, ""));
+
+    match verb {
+        "" => {} // a bare `/`
+        "help" => {
+            push_lines(screen, repl::help_text());
+            for line in TUI_HELP {
+                screen.push(LineKind::Dim, line.to_string());
+            }
+        }
+        "undo" => {
+            let text = match slot.lock().await.as_ref() {
+                Some(a) => repl::undo_text(a),
+                None => BUSY_TEXT.to_string(),
+            };
+            push_lines(screen, text);
+        }
+        "context" => {
+            let text = match slot.lock().await.as_ref() {
+                Some(a) => repl::context_report(a),
+                None => BUSY_TEXT.to_string(),
+            };
+            push_lines(screen, text);
+        }
+        "status" => {
+            let text = match slot.lock().await.as_ref() {
+                Some(a) => repl::status_text(a),
+                None => BUSY_TEXT.to_string(),
+            };
+            push_lines(screen, text);
+        }
+        "tools" => {
+            let text = match slot.lock().await.as_ref() {
+                Some(a) => a.registry().catalog(),
+                None => BUSY_TEXT.to_string(),
+            };
+            push_lines(screen, text);
+        }
+        "new" | "clear" => {
+            let topic = if verb == "new" && !arg.is_empty() {
+                Some(arg)
+            } else {
+                None
+            };
+            let mut guard = slot.lock().await;
+            let Some(a) = guard.as_mut() else {
+                push_lines(screen, BUSY_TEXT);
+                return;
+            };
+            let (name, note) = repl::start_new_session(a, topic);
+            sess.session_name = name.clone();
+            screen.session_name = name;
+            push_lines(
+                screen,
+                if verb == "clear" {
+                    format!("history cleared — {note}")
+                } else {
+                    note
+                },
+            );
+        }
+        "compact" => {
+            let mut guard = slot.lock().await;
+            let text = match guard.as_mut() {
+                Some(a) => repl::compact_text(a).await,
+                None => BUSY_TEXT.to_string(),
+            };
+            drop(guard);
+            push_lines(screen, text);
+        }
+        "resume" => {
+            if arg.is_empty() {
+                push_lines(screen, repl::sessions_text());
+            } else {
+                let mut guard = slot.lock().await;
+                let text = match guard.as_mut() {
+                    Some(a) => repl::resume_text(a, arg).await,
+                    None => BUSY_TEXT.to_string(),
+                };
+                drop(guard);
+                push_lines(screen, text);
+            }
+        }
+        "provider" => {
+            if arg.is_empty() {
+                push_lines(screen, repl::providers_text(&sess.cfg));
+            } else {
+                rebuild_agent(
+                    screen,
+                    slot,
+                    sess,
+                    ask_tx,
+                    permission,
+                    Some(arg.to_string()),
+                    sess.model.clone(),
+                )
+                .await;
+            }
+        }
+        "model" => {
+            if arg.is_empty() {
+                let cur = match slot.lock().await.as_ref() {
+                    Some(a) => a.provider().describe(),
+                    None => BUSY_TEXT.to_string(),
+                };
+                push_lines(
+                    screen,
+                    format!("current: {cur}\n{}", repl::usage_for("/model")),
+                );
+            } else {
+                rebuild_agent(
+                    screen,
+                    slot,
+                    sess,
+                    ask_tx,
+                    permission,
+                    sess.provider.clone(),
+                    Some(arg.to_string()),
+                )
+                .await;
+            }
+        }
+        "permission" => {
+            let requested = if arg.is_empty() {
+                None
+            } else {
+                Mode::parse(arg)
+            };
+            match requested {
+                Some(m) => {
+                    permission.set(m);
+                    screen.mode = m;
+                    push_lines(
+                        screen,
+                        format!("permission mode -> {} ({})", m.as_str(), mode_note(m)),
+                    );
+                }
+                None if !arg.is_empty() => push_lines(screen, repl::usage_for("/permission")),
+                None => push_lines(
+                    screen,
+                    format!(
+                        "permission mode: {} ({})",
+                        permission.get().as_str(),
+                        mode_note(permission.get())
+                    ),
+                ),
+            }
+        }
+        "yolo" => {
+            let next = match arg {
+                "" => {
+                    if permission.get() == Mode::Yolo {
+                        Mode::Edit
+                    } else {
+                        Mode::Yolo
+                    }
+                }
+                "on" | "1" | "true" => Mode::Yolo,
+                "off" | "0" | "false" => Mode::Edit,
+                _ => {
+                    push_lines(screen, repl::usage_for("/yolo"));
+                    return;
+                }
+            };
+            permission.set(next);
+            screen.mode = next;
+            push_lines(
+                screen,
+                format!("permission mode: {} ({})", next.as_str(), mode_note(next)),
+            );
+        }
+        "exit" | "quit" => {
+            // the same as Esc when idle: save happens on the way out
+            let guard = slot.lock().await;
+            if let Some(a) = guard.as_ref() {
+                save(&sess.session_name, a);
+            }
+            drop(guard);
+            screen.quit = true;
+        }
+        other => push_lines(screen, repl::unknown_command_text(&format!("/{other}"))),
+    }
+}
+
+fn mode_note(mode: crate::tools::PermissionMode) -> &'static str {
+    match mode {
+        crate::tools::PermissionMode::ReadOnly => "inspect only",
+        crate::tools::PermissionMode::Edit => "writes allowed, commands gated",
+        crate::tools::PermissionMode::Yolo => "no prompts",
+    }
+}
+
+/// Rebuild the agent for `/provider` and `/model`: a fresh provider, the
+/// same permission cell (so Shift+Tab stays in sync) and the same approval
+/// channel. The conversation is dropped, exactly like the line REPL does.
+#[allow(clippy::too_many_arguments)]
+async fn rebuild_agent(
+    screen: &mut Screen,
+    slot: &std::sync::Arc<tokio::sync::Mutex<Option<Agent>>>,
+    sess: &mut SessionState,
+    ask_tx: &tokio::sync::mpsc::UnboundedSender<ApprovalAsk>,
+    permission: &crate::tools::Permission,
+    provider: Option<String>,
+    model: Option<String>,
+) {
+    let approver: std::sync::Arc<dyn Approver> =
+        std::sync::Arc::new(TuiApprover::new(ask_tx.clone()));
+    let built = Agent::default_cli_with_approver(
+        &sess.cfg,
+        provider.as_deref(),
+        model.as_deref(),
+        approver,
+        permission.get(),
+    )
+    .await;
+    match built {
+        Ok(mut agent) => {
+            agent.ctx.permission = permission.clone();
+            let desc = agent.provider().describe();
+            sess.provider = provider;
+            sess.model = model;
+            screen.provider_desc = desc.clone();
+            *slot.lock().await = Some(agent);
+            push_lines(screen, format!("switched -> {desc}"));
+        }
+        Err(e) => push_lines(screen, format!("switch failed: {e}")),
+    }
+}
+
 /// Inner loop: agent tasks run in a spawned tokio task and stream their
 /// events through an mpsc channel; the UI loop `select!`s between terminal
 /// input and incoming events, so the screen keeps redrawing (streaming
 /// deltas land live) and Esc stays responsive even while a task runs.
 /// Esc during a busy task aborts the TUI but the task result is still saved.
+#[allow(clippy::too_many_arguments)]
 async fn tui_inner(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     screen: &mut Screen,
     agent: Agent,
-    on_session_save: &(impl Fn(&Agent) + ?Sized),
+    on_session_save: &(impl Fn(&str, &Agent) + ?Sized),
     approvals: &mut tokio::sync::mpsc::UnboundedReceiver<ApprovalAsk>,
     permission: &crate::tools::Permission,
+    sess: &mut SessionState,
+    ask_tx: &tokio::sync::mpsc::UnboundedSender<ApprovalAsk>,
 ) -> anyhow::Result<Option<Agent>> {
     // Agent handoff: the runner task owns the agent while a task runs (the
     // engine needs `&mut`), then parks it back here for the next task and
@@ -1025,51 +1308,18 @@ async fn tui_inner(
                     }
                     KeyCode::Enter if !screen.busy => {
                         if let Some(task) = screen.take_input() {
-                            // minimal in-TUI command set; anything else starting
-                            // with '/' is reported instead of being sent as a task
+                            // a leading `/` is a command, never a task
                             if let Some(cmdline) = task.strip_prefix('/') {
-                                match cmdline.trim().to_lowercase().as_str() {
-                                    "undo" => {
-                                        let cp = shared_agent
-                                            .lock()
-                                            .await
-                                            .as_ref()
-                                            .and_then(|a| a.ctx.checkpointing.clone());
-                                        let msg = match cp {
-                                            Some(cp) => match cp.undo_latest() {
-                                                Ok(Some(n)) => {
-                                                    format!("undo: restored {n} file(s)")
-                                                }
-                                                Ok(None) => "undo: nothing to restore".to_string(),
-                                                Err(e) => format!("undo failed: {e}"),
-                                            },
-                                            None => "undo unavailable in this build".to_string(),
-                                        };
-                                        screen.push(LineKind::Dim, msg);
-                                    }
-                                    "help" => {
-                                        for line in TUI_HELP {
-                                            screen.push(LineKind::Dim, *line);
-                                        }
-                                    }
-                                    "context" => {
-                                        let report = shared_agent
-                                            .lock()
-                                            .await
-                                            .as_ref()
-                                            .map(super::repl::context_report);
-                                        for line in report
-                                            .unwrap_or_else(|| "context unavailable".to_string())
-                                            .lines()
-                                        {
-                                            screen.push(LineKind::Dim, line.to_string());
-                                        }
-                                    }
-                                    other => screen.push(
-                                        LineKind::Warn,
-                                        format!("unknown command /{other} — /help for keys (full command set in `kazi --no-tui`)"),
-                                    ),
-                                }
+                                run_command(
+                                    cmdline.trim(),
+                                    screen,
+                                    &shared_agent,
+                                    sess,
+                                    ask_tx,
+                                    permission,
+                                    on_session_save,
+                                )
+                                .await;
                                 screen.scroll_to_bottom();
                                 continue;
                             }
@@ -1170,7 +1420,7 @@ async fn tui_inner(
     let returned = shared_agent.lock().await.take();
     if let Some(agent) = &returned {
         if screen.lines.len() > 1 {
-            on_session_save(agent);
+            on_session_save(&sess.session_name, agent);
         }
     }
     Ok(returned)
@@ -1506,5 +1756,87 @@ mod tests {
         let ask2 = rx.recv().await.expect("second ask");
         ask2.reply.send(Decision::Deny).expect("ui replies");
         assert_eq!(task2.await.unwrap(), Decision::Deny);
+    }
+
+    /// An agent over a script-less mock provider: enough for commands that
+    /// never talk to the model.
+    fn stub_agent() -> Agent {
+        let provider: std::sync::Arc<dyn crate::llm::Provider> =
+            std::sync::Arc::new(crate::llm::mock::MockProvider::new(vec![]));
+        let ctx = crate::tools::ToolCtx {
+            cwd: std::env::temp_dir(),
+            sandbox_root: None,
+            timeout: std::time::Duration::from_secs(5),
+            output_limit: 4096,
+            allow_commands: vec![],
+            approver: std::sync::Arc::new(crate::tools::AutoApprover),
+            checkpointing: None,
+            todos: None,
+            permission: crate::tools::Permission::default(),
+            subagent: None,
+        };
+        Agent::with_parallel(
+            provider,
+            crate::tools::ToolRegistry::builtin(),
+            ctx,
+            Some("system".into()),
+            3,
+            1_000,
+            2,
+        )
+    }
+
+    #[tokio::test]
+    async fn tui_commands_cover_the_shared_command_set() {
+        let slot = std::sync::Arc::new(tokio::sync::Mutex::new(Some(stub_agent())));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalAsk>();
+        let mut sess = SessionState {
+            cfg: crate::config::Config::default(),
+            provider: None,
+            model: None,
+            session_name: "sess".to_string(),
+        };
+        let mut screen = Screen::new("stub-provider", "sess", 5);
+        let perm = crate::tools::Permission::default();
+        let save = |_: &str, _: &Agent| {};
+
+        for cmd in [
+            "help",
+            "status",
+            "context",
+            "tools",
+            "undo",
+            "permission",
+            "permission read-only",
+            "yolo",
+            "compact",
+            "resume",
+            "definitely-not-a-command",
+            "new demo",
+        ] {
+            run_command(cmd, &mut screen, &slot, &mut sess, &tx, &perm, &save).await;
+        }
+
+        let text = screen
+            .lines
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("show this help"), "help:\n{text}");
+        assert!(text.contains("provider/model:"), "status:\n{text}");
+        assert!(text.contains("context estimate"), "context:\n{text}");
+        assert!(
+            text.contains("permission mode -> read-only"),
+            "permission set:\n{text}"
+        );
+        assert!(text.contains("permission mode: yolo"), "yolo:\n{text}");
+        assert!(text.contains("unknown command"), "unknown:\n{text}");
+        assert!(text.contains("new session -> demo"), "new:\n{text}");
+        assert_eq!(
+            sess.session_name, "demo",
+            "session switched for later saves"
+        );
+        assert_eq!(perm.get(), crate::tools::PermissionMode::Yolo);
     }
 }

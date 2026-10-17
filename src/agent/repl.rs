@@ -46,6 +46,108 @@ pub fn undo_last_task(agent: &Agent) -> std::io::Result<Option<usize>> {
     }
 }
 
+/// `/undo` — text both front-ends print.
+pub fn undo_text(agent: &Agent) -> String {
+    match undo_last_task(agent) {
+        Ok(Some(n)) => format!("restored {n} file(s) from the last task's checkpoint"),
+        Ok(None) => "nothing to undo (no checkpointed task yet)".to_string(),
+        Err(e) => format!("undo failed: {e}"),
+    }
+}
+
+/// `/status` — provider, budget, usage, history size.
+pub fn status_text(agent: &Agent) -> String {
+    let u = agent.usage();
+    format!(
+        "provider/model: {}\nround budget:   {}\nest. context:   {} tokens\nusage(task):    in {} / out {} tokens\nmessages:       {}",
+        agent.provider().describe(),
+        agent.max_rounds(),
+        agent.history.estimate_tokens(),
+        u.input_tokens.unwrap_or(0),
+        u.output_tokens.unwrap_or(0),
+        agent.history.msgs_len()
+    )
+}
+
+/// `/resume` with no argument: what is stored.
+pub fn sessions_text() -> String {
+    let have = session::list();
+    if have.is_empty() {
+        "no stored sessions yet — sessions save automatically after each task".to_string()
+    } else {
+        format!(
+            "stored sessions: {}\n{}",
+            have.join(", "),
+            usage_for("/resume")
+        )
+    }
+}
+
+/// `/resume <prefix>`: load a stored session into the agent.
+pub async fn resume_text(agent: &mut Agent, prefix: &str) -> String {
+    match session::resolve(prefix) {
+        Some(name) => match super::session::load(&name) {
+            Ok(file) => {
+                let sys = file.system.or_else(|| agent.history.system.clone());
+                agent.history = History::new(sys);
+                agent.history.msgs = file.messages;
+                let count = agent.history.msgs_len();
+                format!("loaded {name} ({count} messages)")
+            }
+            Err(e) => format!("resume failed: {e}"),
+        },
+        None => {
+            let have = session::list().join(", ");
+            format!("no stored session matches `{prefix}` (stored: {have})")
+        }
+    }
+}
+
+/// `/compact` — squeeze the dropped turns into a system-prompt summary.
+pub async fn compact_text(agent: &mut Agent) -> String {
+    match agent.compact().await {
+        Ok(note) => format!("{note} (est. {} tokens)", agent.history.estimate_tokens()),
+        Err(e) => format!("compact failed: {e}"),
+    }
+}
+
+/// Usage hint for a command name (`/resume <prefix>` style), for both UIs.
+pub fn usage_for(verb: &str) -> String {
+    match spec_of(verb) {
+        Some(spec) => usage_line(spec),
+        None => format!("unknown command `{verb}`"),
+    }
+}
+
+/// `/provider` with no argument: what is configured.
+pub fn providers_text(cfg: &Config) -> String {
+    format!(
+        "configured providers: {}\n{}",
+        cfg.nicks().join(", "),
+        usage_for("/provider")
+    )
+}
+
+/// `/new` and `/clear`: reset the history and pick a fresh autosave target.
+/// Returns `(session name, note)` — callers store the name themselves.
+pub fn start_new_session(agent: &mut Agent, topic: Option<&str>) -> (String, String) {
+    agent.reset();
+    let name = pick_session_name(topic);
+    let note = format!("new session -> {name}");
+    (name, note)
+}
+
+/// The "unknown command" answer, with typo suggestions.
+pub fn unknown_command_text(verb: &str) -> String {
+    let near = did_you_mean(verb);
+    let hint = if near.is_empty() {
+        "see /help".to_string()
+    } else {
+        format!("did you mean {}?", near.join(", "))
+    };
+    format!("unknown command `{verb}` — {hint}")
+}
+
 /// `/context`: where the estimated tokens go right now.
 pub fn context_report(agent: &Agent) -> String {
     let h = &agent.history;
@@ -296,8 +398,9 @@ fn spec_of(verb: &str) -> Option<&'static CmdSpec> {
     COMMANDS.iter().find(|c| c.name == verb)
 }
 
-/// Rendered command table (`/help` output and the startup banner share this).
-fn help_text() -> String {
+/// Rendered command table (`/help` output, the startup banner and the TUI
+/// share this).
+pub fn help_text() -> String {
     let mut out = String::from("commands:\n");
     for c in COMMANDS {
         let cmd = if c.args.is_empty() {
@@ -621,18 +724,6 @@ impl LiveAgent {
     fn describe(&self) -> String {
         self.agent.provider().describe()
     }
-    fn status(&self) -> String {
-        let u = self.agent.usage();
-        format!(
-            "provider/model: {}\nround budget:   {}\nest. context:   {} tokens\nusage(task):    in {} / out {} tokens\nmessages:       {}",
-            self.describe(),
-            self.agent.max_rounds(),
-            self.agent.history.estimate_tokens(),
-            u.input_tokens.unwrap_or(0),
-            u.output_tokens.unwrap_or(0),
-            self.agent.history.msgs_len()
-        )
-    }
     fn history(&self) -> &History {
         &self.agent.history
     }
@@ -875,74 +966,35 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
 
     match (verb, arg) {
         ("/help", _) => println!("{}", help_text()),
-        ("/undo", _) => match undo_last_task(&live.agent) {
-            Ok(Some(n)) => println!("restored {n} file(s) from the last task's checkpoint"),
-            Ok(None) => println!("nothing to undo (no checkpointed task yet)"),
-            Err(e) => println!("{RED}undo failed: {e}{RESET}"),
-        },
+        ("/undo", _) => println!("{}", undo_text(&live.agent)),
         ("/context", _) => println!("{}", context_report(&live.agent)),
         ("/exit", _) | ("/quit", _) => return Flow::Exit,
         ("/clear", _) => {
-            // clear + repoint autosave: the old file can never be rewritten
-            let name = pick_session_name(None);
+            let (name, note) = start_new_session(&mut live.agent, None);
             *state.session_name_mut() = name;
-            live.agent.reset();
-            println!(
-                "{GREEN}history cleared{RESET} — autosave now -> {}",
-                state.session_name
-            );
+            println!("{GREEN}history cleared{RESET} — {note}");
         }
         ("/new", topic) => {
-            let name = pick_session_name(if topic.is_empty() { None } else { Some(topic) });
+            let (name, note) = start_new_session(
+                &mut live.agent,
+                if topic.is_empty() { None } else { Some(topic) },
+            );
             *state.session_name_mut() = name;
-            live.agent.reset();
-            println!("new session -> {}", state.session_name);
+            println!("{note}");
         }
-        ("/compact", _) => match live.agent.compact().await {
-            Ok(note) => {
-                println!(
-                    "{note} (est. {} tokens)",
-                    live.agent.history.estimate_tokens()
-                );
-            }
-            Err(e) => println!("{RED}compact failed: {e}{RESET}"),
-        },
-        ("/status", _) => println!("{}", live.status()),
+        ("/compact", _) => println!("{}", compact_text(&mut live.agent).await),
+        ("/status", _) => println!("{}", status_text(&live.agent)),
         ("/tools", _) => println!("{}", live.agent.registry().catalog()),
         ("/resume", prefix) => {
             if prefix.is_empty() {
-                let have = session::list();
-                if have.is_empty() {
-                    println!(
-                        "no stored sessions yet — sessions save automatically after each task"
-                    );
-                } else {
-                    println!(
-                        "stored sessions: {}\n{}",
-                        have.join(", "),
-                        usage_line(spec_of("/resume").unwrap())
-                    );
-                }
+                println!("{}", sessions_text());
             } else {
-                match session::resolve(prefix) {
-                    Some(n) => match load_session(live, &n) {
-                        Ok(count) => println!("loaded {n} ({count} messages)"),
-                        Err(e) => println!("{RED}resume failed: {e}{RESET}"),
-                    },
-                    None => {
-                        let have = session::list().join(", ");
-                        println!("{RED}no stored session matches `{prefix}`{RESET}{DIM} (stored: {have}){RESET}");
-                    }
-                }
+                println!("{}", resume_text(&mut live.agent, prefix).await);
             }
         }
         ("/provider", nick) => {
             if nick.is_empty() {
-                println!(
-                    "configured providers: {}\n{}",
-                    state.cfg.nicks().join(", "),
-                    usage_line(spec_of("/provider").unwrap())
-                );
+                println!("{}", providers_text(&state.cfg));
             } else {
                 let mut next = state.clone();
                 next.provider = Some(nick.to_string());
@@ -957,11 +1009,7 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
         }
         ("/model", m) => {
             if m.is_empty() {
-                println!(
-                    "current: {}\n{}",
-                    live.describe(),
-                    usage_line(spec_of("/model").unwrap())
-                );
+                println!("current: {}\n{}", live.describe(), usage_for("/model"));
             } else {
                 let mut next = state.clone();
                 next.model = Some(m.to_string());
@@ -1062,15 +1110,7 @@ async fn handle_command(cmd: &str, state: &mut ChatState, live: &mut LiveAgent) 
                 }
             }
         }
-        _ => {
-            let near = did_you_mean(verb);
-            let hint = if near.is_empty() {
-                "see /help".to_string()
-            } else {
-                format!("did you mean {}?", near.join(", "))
-            };
-            println!("{YELLOW}unknown command `{verb}`{RESET}{DIM} — {hint}{RESET}");
-        }
+        _ => println!("{YELLOW}{}{RESET}", unknown_command_text(verb)),
     }
     Flow::Continue
 }

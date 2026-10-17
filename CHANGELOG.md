@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-17
+
+### Added
+
+- **The TUI speaks the full command set.** `/new`, `/clear`, `/compact`,
+  `/resume`, `/provider`, `/model`, `/permission`, `/yolo`, `/status`,
+  `/tools`, `/undo`, `/context` and `/help` now work inside the TUI exactly as
+  they do in the line REPL — same table, same text (both front-ends call the
+  same builders in `repl`). `/provider` and `/model` rebuild the agent in
+  place while keeping the permission cell and the approval channel, so
+  Shift+Tab and command prompts stay in sync; `/new` repoints the session the
+  next save writes to.
+
+### Fixed
+
+- Commands that exist in the REPL no longer answer "unknown command" in the
+  TUI (previously only `/undo`, `/context` and `/help` were wired up).
+
 ## [0.13.1] - 2026-10-17
 
 ### Fixed
