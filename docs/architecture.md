@@ -354,6 +354,27 @@ staging.take() → Reviewer::review(cwd, changes)
   `kazi run` 和 `--output json` 用同一份数字,`agent.max_usd_per_task` 在轮与轮
   之间中断(`AgentError::BudgetExceeded`,历史保留)。
 
+### 12.5 后台作业:所有权在会话,不在某一轮
+
+`run_command { background: true }` 把进程交给会话级的 `JobTable`(存在 `ToolCtx` 里,
+随 clone 共享),立刻返回 job id。表里每个 `Job` 有:
+
+- 一个 256 KiB 的输出环形缓冲(stdout/stderr 两个 drain task 写同一个缓冲);
+- 一个 `try_wait` 轮询的 waiter(所以 `kill` 能拿同一把锁,而不是把 `Child` 移走);
+- 状态机 `Running / Exited(code) / Killed / Failed`。
+
+关键取舍:
+
+1. **jobs 跟着会话走**。provider/model 重建会 clone `ToolCtx`,表还是同一张;
+   只有最后一个引用消失(进程退出)时 `Drop` 才 kill 剩下的子进程 —— 不留孤儿
+   server。
+2. **Windows 的进程树**。`cmd /C server` 的子进程不属于 shell 的句柄,只 kill
+   shell 会留下占着端口的 server;所以 `job_kill` 在 Windows 上再补一发
+   `taskkill /PID <pid> /T /F`。测试里用单进程的 `powershell Start-Sleep` 而不是
+   `ping`,正是为了不把「孙进程还活着」误判成测试慢。
+3. **超时不杀,只报告**。`tools.command_timeout_secs` 对后台作业只是「跑太久了」
+   的提示(模型会收到 `job_kill` 的建议),因为它的语义是前台调用的墙钟上限。
+
 ## 13. 为什么不用框架
 
 现有的 agent 框架 (LangChain/rig/Swarm…) 提供的是**包装**,购买的是接入速度,

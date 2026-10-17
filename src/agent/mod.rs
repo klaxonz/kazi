@@ -1354,6 +1354,7 @@ mod tests {
             subagent: None,
             staged: None,
             reviewer: None,
+            jobs: None,
         }
     }
 
@@ -2111,6 +2112,7 @@ mod tests {
             subagent: None,
             staged: None,
             reviewer: None,
+            jobs: None,
         };
         let script = vec![
             LlmResponse {

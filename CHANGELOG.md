@@ -6,6 +6,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: MINOR = feature batch, PATCH = fixes only — see docs/VERSIONING.md).
 
+## [0.21.0] - 2026-10-17
+
+Long-running processes stop blocking the agent: a dev server or watch task now
+gets a job id, a capped output tail, and a way to be stopped — tree included.
+
+### Added
+
+- **Background jobs**: `run_command { background: true }` starts the command
+  detached and returns a job id immediately instead of occupying the round until
+  `tools.command_timeout_secs`. Output (stdout + stderr, arrival order) is kept
+  in a 256 KiB tail.
+- **`job_output` / `job_kill` tools**: status, cwd, byte count and the last N
+  lines of a job; killing stops the whole process tree on Windows
+  (`taskkill /T`), because `cmd /C server` leaves the server alive when only the
+  shell is killed — the exact leak the tool exists to prevent.
+- **`/jobs [id|kill <id>]`** in the TUI: list every job with status and elapsed
+  time, read one's tail, stop one. It works while a task is running (the job
+  table is shared, not owned by the agent slot) and the footer shows
+  `N jobs running`.
+- Jobs belong to the session: a provider/model switch keeps them, `/clear`
+  leaves them alone, and leaving kazi stops whatever is still running.
+  Headless `kazi run` says which jobs it stopped on the way out.
+
+### Changed
+
+- `run_command`'s approval summary now marks a background request
+  (`(background: it keeps running after this round)`) so the prompt is never
+  mistaken for a quick command.
+- A job that outlives `tools.command_timeout_secs` is reported as running too
+  long instead of being killed silently (the model is told to `job_kill` it).
+
+### Tests
+
+`cargo test` — 279 passing (was 276): output capture and exit codes, killing a
+long-running job (and refusing to kill twice), and the output cap keeping the
+newest bytes.
+
 ## [0.20.0] - 2026-10-17
 
 Images become a first-class attachment — the last 0.19 roadmap item, split out

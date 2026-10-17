@@ -487,6 +487,16 @@ async fn run_once(
         .run_task_with_images(task, images, &mut on_event)
         .await;
     let elapsed = started.elapsed();
+    // jobs die with this process: say so instead of letting a "started a
+    // server" task read as if it were still up after kazi exited
+    if let Some(jobs) = &agent.ctx.jobs {
+        let running = jobs.running();
+        if running > 0 {
+            eprintln!(
+                "{YELLOW}note:{RESET} {running} background job(s) were still running and are stopped now (headless 'kazi run' does not outlive its jobs)"
+            );
+        }
+    }
     // the event collector holds `events`; release it before assembling output
     drop(on_event);
     let usage = agent.usage();

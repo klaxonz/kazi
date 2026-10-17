@@ -160,7 +160,7 @@ Slash commands: `/help [command]` (overlay, or one command's usage), `/new`,
 `/diff [n]`, `/queue [clear|drop <n>]`, `/auth`, `/theme`, `/details`,
 `/export [path]`, `/copy [all|tool [n]|diff [n]|code [n]]`, `/retry`,
 `/effort [fast|balanced|deep]`, `/cost [reset]`, `/pin [n|off]`, `/find <text>`,
-`/exit`.
+`/jobs [id|kill <id>]`, `/exit`.
 Every finished task autosaves, so quitting mid-task never costs you the session;
 `/undo` restores the files the last task changed; `/rename` repoints autosave
 and keeps the old file. While a task runs, the commands that only read the
@@ -231,6 +231,16 @@ rounds instead of blowing a budget. Prompt caching is on for the Anthropic wire
 or a `[agent.presets.*]` entry): temperature, output budget and reasoning
 effort, written back to `config.toml` and shown next to the model name.
 
+**Background jobs** are for the things that never finish: say "start the dev server"
+and the model calls `run_command` with `background: true`, getting a job id back
+immediately instead of blocking the round (and timing out). `job_output` polls its
+tail, `job_kill` stops it — including the process tree, so a server spawned through
+`cmd /C` really dies. `/jobs` lists them from the TUI (`/jobs <id>` shows output,
+`/jobs kill <id>` stops one) and the footer shows how many are running. Jobs live as
+long as the session: a provider switch keeps them, and leaving kazi stops what is
+still running. In headless `kazi run` they are stopped when the run ends, and it
+says so.
+
 Set `agent.feedback_command` (say `cargo clippy --all-targets -- -D warnings`)
 and kazi runs it after every round that changed files, feeding the output back
 to the model so it fixes its own mistakes before answering. The `delegate`
@@ -273,7 +283,9 @@ Override anything per call: `--provider <nick>` `--model <name>`
 | `write_file` | create/overwrite, makes parent directories              |
 | `delete_file`| one file, checkpointed for `/undo`, `dry_run` available  |
 | `move_file`  | rename/move, no clobber unless `overwrite = true`       |
-| `run_command`| shell command — **approval-gated** (below)              |
+| `run_command`| shell command — **approval-gated** (below); `background: true` returns a job id |
+| `job_output` | status + output tail of a background job                |
+| `job_kill`   | stop a background job (process tree included)           |
 | `fetch_url`  | https GET → text; uncompressed PDF text extracted       |
 
 Agents fail lucidly on purpose: every error text is fed back to the model (`is_error`),

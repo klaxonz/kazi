@@ -9,8 +9,10 @@
 > 审阅模式(§5.2)、档位(§5.3)、成本/缓存(§5.4)、上下文(/pin + 三段 + 摘要 schema,
 > §5.5)、工具面(`delete_file` / `move_file` / PDF 文本,§5.6)、会话检索(§5.7)。
 > **0.20 实际交付**:§5.6 的图片附件(`@x.png` → user 消息的 image part,两条 wire 各自编码,
-> `[providers.*] vision = false` 在请求前拒绝)。0.20 的其余项(后台作业、MCP
-> resources/prompts)仍未开工。
+> `[providers.*] vision = false` 在请求前拒绝)。
+> **0.21 实际交付**:§6 的背景作业(`run_command background=true`、`job_output`/`job_kill`、
+> `/jobs`、页脚计数、Windows 进程树 kill)。§6 的其余项(MCP resources/prompts、
+> fetch_url 返回附件、全文索引)仍未开工。
 
 ## 1. 现状:0.18 的 kazi 是什么
 

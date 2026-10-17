@@ -1064,6 +1064,12 @@ const COMMANDS: &[CmdSpec] = &[
         arg: ArgKind::No,
     },
     CmdSpec {
+        name: "/jobs",
+        args: "[id|kill <id>]",
+        help: "background jobs: list, show one's output, or stop it",
+        arg: ArgKind::Flag,
+    },
+    CmdSpec {
         name: "/tools",
         args: "",
         help: "list built-in tools (+ MCP servers)",
@@ -1357,6 +1363,7 @@ pub fn works_while_busy(verb: &str) -> bool {
             | "/queue"
             | "/cost"
             | "/find"
+            | "/jobs"
     )
 }
 
@@ -1564,6 +1571,7 @@ mod tests {
             subagent: None,
             staged: None,
             reviewer: None,
+            jobs: None,
         };
         let mut agent = Agent::new(
             provider,

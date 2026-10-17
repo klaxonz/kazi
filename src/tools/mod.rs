@@ -10,6 +10,7 @@ pub mod checkpoint;
 pub mod fetch;
 pub mod file;
 pub mod glob;
+pub mod jobs;
 pub mod patch;
 pub mod pdf;
 pub mod search;
@@ -104,6 +105,9 @@ pub struct ToolCtx {
     pub staged: Option<Arc<checkpoint::Staging>>,
     /// Who decides on a staged changeset (review mode only).
     pub reviewer: Option<Arc<dyn Reviewer>>,
+    /// Background jobs of this session (shared across clones, killed when the
+    /// last reference drops). `None` in bare library tests.
+    pub jobs: Option<Arc<jobs::JobTable>>,
 }
 
 impl ToolCtx {
@@ -429,6 +433,7 @@ pub fn tool_ctx(
         // start staging without a rebuild. `reviewing()` gates on the mode.
         staged: Some(Arc::new(checkpoint::Staging::new())),
         reviewer: Some(Arc::new(AutoReviewer) as Arc<dyn Reviewer>),
+        jobs: Some(jobs::JobTable::new()),
     }
 }
 
@@ -560,7 +565,19 @@ pub fn call_summary(call: &ToolCall) -> String {
             clip_line(text("from"), 40),
             clip_line(text("to"), 40)
         ),
-        "run_command" => clip_line(&one_line(text("command")), 100),
+        "run_command" => {
+            let bg = a
+                .get("background")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            format!(
+                "{}{}",
+                clip_line(&one_line(text("command")), 100),
+                if bg { " (background)" } else { "" }
+            )
+        }
+        "job_output" => format!("#{}", a.get("id").and_then(Value::as_u64).unwrap_or(0)),
+        "job_kill" => format!("#{}", a.get("id").and_then(Value::as_u64).unwrap_or(0)),
         "fetch_url" => clip_line(text("url"), 100),
         "todo_write" => {
             let n = a
@@ -631,6 +648,8 @@ impl ToolRegistry {
             .register(Arc::new(file::MoveFile))
             .register(Arc::new(shell::RunCommand))
             .register(Arc::new(fetch::FetchUrl))
+            .register(Arc::new(jobs::JobOutput))
+            .register(Arc::new(jobs::JobKill))
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -709,7 +728,9 @@ mod tests {
                 "delete_file",
                 "move_file",
                 "run_command",
-                "fetch_url"
+                "fetch_url",
+                "job_output",
+                "job_kill"
             ]
         );
         for spec in reg.specs() {
@@ -842,6 +863,7 @@ mod tests {
             subagent: None,
             staged: None,
             reviewer: None,
+            jobs: None,
         }
     }
 }

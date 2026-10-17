@@ -884,6 +884,8 @@ struct Screen {
     )>,
     /// USD so far in the current task (`None` = the model has no price entry).
     task_cost: Option<f64>,
+    /// Background jobs still running, refreshed each frame for the footer.
+    jobs_running: usize,
     /// Session-wide USD, accumulated as tasks finish.
     session_cost: f64,
     /// Whether any round this session was actually priced.
@@ -956,6 +958,7 @@ impl Screen {
             cache_read: 0,
             preset: "balanced".to_string(),
             pin_count: 0,
+            jobs_running: 0,
             changeset_reply: None,
             task_cost: None,
             session_cost: 0.0,
@@ -1875,6 +1878,16 @@ impl Screen {
         );
 
         let mut right: Vec<Span> = Vec::new();
+        if self.jobs_running > 0 {
+            right.push(Span::styled(
+                format!(
+                    "{} job{} running  ",
+                    self.jobs_running,
+                    if self.jobs_running == 1 { "" } else { "s" }
+                ),
+                Style::default().fg(theme.accent),
+            ));
+        }
         if !self.queued.is_empty() {
             right.push(Span::styled(
                 format!("{} queued  ", self.queued.len()),
@@ -2312,6 +2325,7 @@ pub async fn chat_loop_with_config(
         model: model.clone(),
         session_name: session_name.clone(),
         config_file,
+        jobs: agent.ctx.jobs.clone(),
     };
 
     match chat_loop_tui(
@@ -2348,6 +2362,10 @@ pub struct SessionState {
     pub session_name: String,
     /// Where `cfg` came from, so `/theme` and `/details` can be remembered.
     pub config_file: Option<std::path::PathBuf>,
+    /// The session's background jobs. A clone of the agent's table, kept here
+    /// so `/jobs` works while a task holds the agent (and so a provider
+    /// rebuild, which clones the context, keeps the same table).
+    pub jobs: Option<Arc<crate::tools::jobs::JobTable>>,
 }
 
 /// Best-effort persistence of one `[ui]` setting. Returns "" when there is no
@@ -2548,6 +2566,70 @@ async fn run_command(
                             format!("/{arg}")
                         };
                         screen.show_text(console::unknown_command_text(&verb));
+                    }
+                }
+            }
+        }
+        "jobs" => {
+            let Some(table) = sess.jobs.clone() else {
+                screen.show_text("background jobs are not available in this session");
+                return None;
+            };
+            let mut parts = arg.split_whitespace();
+            match (parts.next(), parts.next()) {
+                (Some("kill"), Some(id)) => match id.parse::<u64>() {
+                    Ok(id) if table.kill(id) => {
+                        screen.push_notice(Level::Warn, format!("job #{id} killed"))
+                    }
+                    Ok(id) => screen.show_text(format!(
+                        "job #{id} is not running (see /jobs for the current state)"
+                    )),
+                    Err(_) => screen.show_text(console::usage_for("/jobs")),
+                },
+                (Some(id), None) => match id.parse::<u64>() {
+                    Ok(id) => match table.get(id) {
+                        Some(job) => {
+                            let (tail, truncated) = job.tail(60);
+                            let mut out = format!(
+                                "#{} {}\ncommand: {}\ncwd: {}\noutput ({} bytes{}):\n{}",
+                                job.id,
+                                job.status().label(),
+                                job.command,
+                                job.cwd.display(),
+                                job.output_len(),
+                                if truncated { ", last 60 lines" } else { "" },
+                                if tail.trim().is_empty() {
+                                    "(no output yet)"
+                                } else {
+                                    &tail
+                                }
+                            );
+                            if job.status().is_running() {
+                                out.push_str("\n  (/jobs kill <id> stops it)");
+                            }
+                            screen.show_text(out);
+                        }
+                        None => screen.show_text(format!("no job #{id}")),
+                    },
+                    Err(_) => screen.show_text(console::usage_for("/jobs")),
+                },
+                _ => {
+                    let jobs = table.list();
+                    if jobs.is_empty() {
+                        screen.show_text(
+                            "no background jobs yet — the model starts them with run_command background=true",
+                        );
+                    } else {
+                        let mut out = format!(
+                            "background jobs ({} running of {}):\n",
+                            table.running(),
+                            jobs.len()
+                        );
+                        for job in &jobs {
+                            out.push_str(&format!("  {}\n", crate::tools::jobs::describe(job)));
+                        }
+                        out.push_str("  (/jobs <id> shows output · /jobs kill <id> stops one)");
+                        screen.show_text(out);
                     }
                 }
             }
@@ -3588,6 +3670,8 @@ async fn tui_inner(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     while !screen.quit {
+        // cheap enough per frame (a handful of jobs) and always current
+        screen.jobs_running = sess.jobs.as_ref().map(|t| t.running()).unwrap_or(0);
         let _ = terminal.draw(|f| screen.draw(f));
 
         tokio::select! {
@@ -4908,6 +4992,7 @@ mod tests {
                 model: None,
                 session_name: "sess".to_string(),
                 config_file: None,
+                jobs: None,
             };
             let mut screen = test_screen();
             let perm = crate::tools::Permission::default();
@@ -5441,6 +5526,7 @@ mod tests {
             subagent: None,
             staged: None,
             reviewer: None,
+            jobs: None,
         };
         Agent::with_parallel(
             provider,
@@ -5463,6 +5549,7 @@ mod tests {
             model: None,
             session_name: "sess".to_string(),
             config_file: None,
+            jobs: None,
         };
         let mut screen = test_screen();
         let perm = crate::tools::Permission::default();
@@ -5584,6 +5671,7 @@ mod tests {
                 model: None,
                 session_name: "old-name".to_string(),
                 config_file: None,
+                jobs: None,
             };
             let mut screen = test_screen();
             let perm = crate::tools::Permission::default();
@@ -5651,6 +5739,7 @@ mod tests {
                 model: None,
                 session_name: "sess".to_string(),
                 config_file: Some(path.clone()),
+                jobs: None,
             };
             let mut screen = test_screen();
             let perm = crate::tools::Permission::default();
@@ -5713,6 +5802,7 @@ mod tests {
                 model: None,
                 session_name: "sess".to_string(),
                 config_file: None,
+                jobs: None,
             };
             let mut screen = test_screen();
             screen.last_task = Some("fix the test".into());

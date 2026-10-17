@@ -67,14 +67,15 @@ impl Tool for RunCommand {
         "run_command"
     }
     fn description(&self) -> &str {
-        "Execute a shell command (Windows `cmd /C`, Unix `sh -c`). Non-allowlisted commands require user approval; a declined command means: do not retry it, propose another way. Do not use for plain file operations your tools cover."
+        "Execute a shell command (Windows `cmd /C`, Unix `sh -c`). Non-allowlisted commands require user approval; a declined command means: do not retry it, propose another way. Set background=true for a long-running process (dev server, watch task): it returns a job id immediately and job_output / job_kill manage it. Do not use for plain file operations your tools cover."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Full command line, e.g. `cargo test --lib`"},
-                "cwd": {"type": "string", "description": "Optional working directory (default: launch directory)"}
+                "cwd": {"type": "string", "description": "Optional working directory (default: launch directory)"},
+                "background": {"type": "boolean", "description": "Run detached and return a job id (default false). Use job_output to poll it."}
             },
             "required": ["command"]
         })
@@ -102,7 +103,19 @@ impl Tool for RunCommand {
             .and_then(Value::as_str)
             .map(|d| ctx.cwd.join(d))
             .unwrap_or_else(|| ctx.cwd.clone());
-        Some(format!("$ {cmd}\n  cwd: {}", cwd.display()))
+        let background = args
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        Some(format!(
+            "$ {cmd}\n  cwd: {}{}",
+            cwd.display(),
+            if background {
+                "\n  (background: it keeps running after this round)"
+            } else {
+                ""
+            }
+        ))
     }
 
     async fn run(&self, args: &Value, ctx: &ToolCtx) -> Result<String, ToolError> {
@@ -128,6 +141,26 @@ impl Tool for RunCommand {
             None => ctx.cwd.clone(),
         };
         // NOTE: approval already happened (engine pre-flight / allowlist).
+        if args
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let Some(table) = &ctx.jobs else {
+                return Err(ToolError::new(
+                    "background jobs are not available in this configuration",
+                ));
+            };
+            let job = table
+                .spawn(&cmd, &dir, ctx.timeout)
+                .map_err(|e| ToolError::new(format!("cannot start `{cmd}`: {e}")))?;
+            return Ok(format!(
+                "started background job #{}: {cmd}\n  cwd: {}\n  Use job_output with id {} to read its tail, job_kill to stop it (the TUI lists it under /jobs).",
+                job.id,
+                dir.display(),
+                job.id
+            ));
+        }
         let mut c = build_command(&cmd, &dir);
         c.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
