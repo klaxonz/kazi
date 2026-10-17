@@ -6,6 +6,101 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: MINOR = feature batch, PATCH = fixes only — see docs/VERSIONING.md).
 
+## [0.18.0] - 2026-10-17
+
+The workspace becomes comfortable to drive: a real composer, mouse support
+everywhere it matters, a diff reader, a session preview, and commands that keep
+working while the agent is busy.
+
+### Added
+
+- **Composer undo/redo** (`Ctrl+Z`, `Ctrl+Y` / `Ctrl+Shift+Z`), coalesced by
+  editing run so a sentence undoes as a sentence, not one character at a time.
+  `Ctrl+←/→` moves by word, `Ctrl+Delete` kills the next word, and
+  `Ctrl+Backspace` kills the previous one.
+- **Click-to-caret**: clicking anywhere in the input box puts the caret on that
+  character (wrapped rows and CJK widths included), instead of only appending.
+- **Argument completion**: `Tab` now completes `/provider`, `/model`,
+  `/resume`, `/permission`, `/yolo`, `/details`, `/compact` and `/theme` values,
+  extending a shared prefix or listing the candidates when they fork.
+- **Diff viewer** (`/diff [n]`): the newest `write_file`/`apply_patch` diff
+  opens full-screen with hunk colours, line numbers, scrolling and `c` to copy.
+- **Sessions preview pane**: on wide terminals the browser shows the selected
+  session's working directory, message count and the tail of the conversation,
+  so five `chat-*` files are no longer indistinguishable.
+- **Mouse in modals**: the wheel moves the list cursor (or scrolls help/diff) and
+  a click selects a row in the palette, picker, session browser and search.
+  Right-clicking a transcript entry copies it.
+- **Queue and approval management**: `/queue` lists queued follow-ups and
+  supports `clear` / `drop <n>`; `/allow` lists the session's "always" command
+  approvals and clears them.
+- **`/plan`** prints the full todo checklist (the header band only has room for
+  five rows). `/rename <name>` repoints autosave at a new session name and writes
+  a snapshot, keeping the old file.
+- **`/copy` targets**: `all`, `tool [n]`, `diff [n]` and `code [n]` join the
+  default last-answer behaviour, so command output, patches and fenced code no
+  longer need manual selection.
+- **Two more themes**, `nord` and `solarized`, in `/theme`, `[ui] theme` and the
+  `Ctrl+T` cycle (now dark → light → nord → solarized → mono).
+- **Approval safety hints**: destructive shapes (`rm -rf`, `git reset --hard`,
+  `curl … | sh`, `sudo`, …) get a red warning line, and long commands scroll
+  with `PgUp/PgDn` inside the prompt instead of being clipped.
+- **`[ui] bell`** rings the terminal when a task ends (off by default).
+- **`/theme` and `/details` are remembered.** Changing them (or `Ctrl+T` /
+  `Ctrl+O`) rewrites the `[ui]` key in `config.toml` in place — comments and
+  layout survive — so the choice applies to the next launch. A session without
+  a config file (library embedder) simply says nothing about saving.
+- **Ghost completion**: while a unique slash command is half-typed, its dim
+  remainder is shown after the caret (`/he` renders `/help`), so `Tab` is
+  discoverable before it is pressed.
+- **`/usage`** reports this run's token totals (in/out/total and finished
+  tasks; a resumed history's earlier usage is not counted) and `reset` clears
+  them; `/status` prints the same totals.
+- **Search highlight and repeat**: jumping to a transcript hit paints that entry
+  with the selection colours until the next keystroke, and `F3` / `Shift+F3`
+  walk the hits again without reopening `Ctrl+F`.
+- **Attachment feedback**: `@file` references are echoed (`attaching @a.rs,
+  @b.rs`) when the task starts, so an attachment is never silently dropped.
+- **`/help <command>`** prints one command's usage and description; bare
+  `/help` still opens the full scrollable overlay.
+- **`kazi run`** ends a text run with `done in 3.4s · tokens in N / out M` on
+  stderr (JSON output already carried `usage`), so a CI log says how long the
+  task took without changing the scriptable stdout.
+- **Clipboard falls back to OSC 52** over SSH (or with `KAZI_OSC52=1`) when no
+  local tool (`clip`/`pbcopy`/`wl-copy`/`xclip`/`xsel`) exists, so `/copy` and
+  right-click copy work in remote sessions too.
+- **Busy-mode commands**: `/help`, `/theme`, `/details`, `/permission`, `/yolo`,
+  `/allow`, `/plan`, `/status`, `/usage`, `/context`, `/sessions`, `/copy`,
+  `/diff` and `/queue` act immediately while a task runs; `/status` and
+  `/context` answer from live screen state instead of saying "busy".
+- **Better running/idle feedback**: the header says `cancelling…` after Esc, the
+  footer shows the last task duration, and scrolled-up readers see `↓ N new`
+  instead of losing their place silently.
+- **`F1`** opens the help overlay from anywhere without a modal.
+
+### Changed
+
+- `Ctrl+T` / `/theme` now cycle five themes; `nord`, `arctic`, `solarized`,
+  `solarised` and `solar` are accepted names, and the `/theme` usage line lists
+  them instead of only the original three.
+- The library gained `kazi::agent::tui::chat_loop_with_config(..., config_file)`;
+  `chat_loop_with` keeps its old signature and passes `None`, so existing
+  embedders keep compiling.
+- `/copy` help and the command table document the new targets; the help overlay
+  and footer advertise `F1`, word motions and mouse copy.
+- `kazi sessions` data is unchanged; the richer preview is TUI-only (no file
+  format change).
+
+### Fixed
+
+- **`Tab` on a unique command prefix inserted the prefix plus a space** (for
+  example `/he `), so Enter ran an unknown command instead of completing
+  `/help`. It now completes the real command name.
+- Deleting a session from the browser refreshed the list but not the preview
+  pane, which could keep showing the file that was just deleted.
+- The transcript no longer offers a "scrolled" hint without saying that new
+  output arrived; the counter resets when you jump back to the tail.
+
 ## [0.17.0] - 2026-10-17
 
 The TUI stops being a scrolling log and becomes a workspace: rendered answers,

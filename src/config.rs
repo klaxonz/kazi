@@ -66,6 +66,8 @@ pub struct UiCfg {
     pub theme: Option<String>,
     /// Start with full tool output expanded (`Ctrl+O` toggles at runtime).
     pub details: Option<bool>,
+    /// Ring the terminal bell when a task finishes (default false).
+    pub bell: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -130,6 +132,9 @@ pub struct ProviderEntry {
     /// Optional list of model ids this provider offers, shown by the
     /// `/model` picker (merged with whatever the endpoint reports live).
     pub models: Option<Vec<String>>,
+    /// The endpoint needs no credential (local gateways such as Ollama,
+    /// LM Studio, or Magpie). Skips the key lookup and error.
+    pub no_auth: Option<bool>,
 }
 
 /// (config, its path) so the CLI can tell users where things came from.
@@ -177,6 +182,21 @@ impl Config {
         }
     }
 
+    /// Local gateways often accept any/no credential. `no_auth = true` on the
+    /// provider entry (or the ollama kind) means "do not look for a key".
+    pub fn is_keyless(entry: &ProviderEntry) -> bool {
+        entry.no_auth.unwrap_or(false) || entry.r#type.trim().eq_ignore_ascii_case("ollama")
+    }
+
+    /// Whether this provider needs a credential at all (false for ollama and
+    /// entries marked `no_auth = true`).
+    pub fn needs_auth(&self, nick: &str) -> bool {
+        self.providers
+            .get(nick)
+            .map(|e| !Self::is_keyless(e))
+            .unwrap_or(true)
+    }
+
     /// Resolve the API key for a provider entry. Precedence: environment
     /// variable (`api_key_env` / kind default) first, then the local
     /// credential store (`kazi auth`), then an actionable error. Deliberately
@@ -188,7 +208,7 @@ impl Config {
             .get(nick)
             .ok_or_else(|| ConfigError::Unknown(nick.to_string(), self.nicks().join(", ")))?;
         let kind = Self::kind_of(nick, entry)?;
-        if kind == ProviderKind::Ollama {
+        if kind == ProviderKind::Ollama || Self::is_keyless(entry) {
             return Ok(None);
         }
         let (env_name, configured) = match &entry.api_key_env {
@@ -340,9 +360,9 @@ impl Config {
     }
 
     /// The first configured provider whose key is already usable (env or
-    /// stored; ollama counts as keyless-usable), skipping `exclude`. Used by
-    /// first-run onboarding so a launch does not re-ask for a provider that is
-    /// already ready.
+    /// stored; ollama/keyless providers count as usable), skipping `exclude`.
+    /// Used by first-run onboarding so a launch does not re-ask for a provider
+    /// that is already ready.
     pub fn first_provider_with_key(&self, exclude: Option<&str>) -> Option<String> {
         self.nicks()
             .into_iter()
@@ -409,6 +429,52 @@ pub fn set_default_provider(path: &Path, nick: &str, model: Option<&str>) -> std
         }
     }
 
+    let mut out = lines.join("\n");
+    out.push('\n');
+    std::fs::write(path, out)
+}
+
+/// Rewrite `<path>` so the `[ui]` key carries `value` (a TOML literal, e.g.
+/// `"nord"` or `true`). Line-based like [`set_default_provider`], so the user's
+/// comments and ordering survive; a missing `[ui]` table is appended.
+pub fn set_ui_setting(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
+    let text = std::fs::read_to_string(path)?;
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let ui_start = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("[ui]"));
+    match ui_start {
+        Some(start) => {
+            let end = lines
+                .iter()
+                .enumerate()
+                .skip(start + 1)
+                .find(|(_, l)| l.trim_start().starts_with('['))
+                .map(|(i, _)| i)
+                .unwrap_or(lines.len());
+            let existing = lines
+                .iter()
+                .enumerate()
+                .take(end)
+                .skip(start + 1)
+                .find(|(_, l)| {
+                    let t = l.trim_start();
+                    !t.starts_with('#') && t.split('=').next().unwrap_or("").trim() == key
+                })
+                .map(|(i, _)| i);
+            match existing {
+                Some(i) => lines[i] = format!("{key} = {value}"),
+                None => lines.insert(start + 1, format!("{key} = {value}")),
+            }
+        }
+        None => {
+            if lines.last().map(|l| !l.trim().is_empty()).unwrap_or(false) {
+                lines.push(String::new());
+            }
+            lines.push("[ui]".to_string());
+            lines.push(format!("{key} = {value}"));
+        }
+    }
     let mut out = lines.join("\n");
     out.push('\n');
     std::fs::write(path, out)
@@ -521,12 +587,14 @@ model = "m2"
 
     #[test]
     fn ui_section_parses_and_defaults() {
-        let c = cfg("[ui]\ntheme = \"light\"\ndetails = true\n");
+        let c = cfg("[ui]\ntheme = \"light\"\ndetails = true\nbell = true\n");
         assert_eq!(c.ui.theme.as_deref(), Some("light"));
         assert_eq!(c.ui.details, Some(true));
+        assert_eq!(c.ui.bell, Some(true));
         let default: Config = toml::from_str("").unwrap();
         assert!(default.ui.theme.is_none());
         assert!(default.ui.details.is_none());
+        assert!(default.ui.bell.is_none(), "no surprise bells by default");
         assert!(EXAMPLE_TOML.contains("[ui]"));
     }
 
@@ -590,6 +658,60 @@ model = "m2"
         set_default_provider(&path, "z", None).unwrap();
         let parsed: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(parsed.provider.as_deref(), Some("z"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keyless_gateway_needs_no_credential() {
+        let c = cfg(
+            "[providers.magpie]\ntype = \"openai\"\nbase_url = \"http://127.0.0.1:3425/v1\"\nmodel = \"m\"\nno_auth = true",
+        );
+        assert!(!c.needs_auth("magpie"));
+        assert_eq!(c.api_key_for("magpie").unwrap(), None);
+        assert_eq!(c.first_provider_with_key(None).as_deref(), Some("magpie"));
+        // the model catalog path uses the same resolution
+        assert_eq!(c.settings_for_nick("magpie").unwrap().api_key, None);
+
+        let normal =
+            cfg("[providers.p]\ntype = \"openai\"\napi_key_env = \"KAZI_TEST_NO_SUCH_KEY_123\"");
+        std::env::remove_var("KAZI_TEST_NO_SUCH_KEY_123");
+        assert!(normal.needs_auth("p"));
+        assert!(
+            normal.api_key_for("p").is_err(),
+            "a real key is still required"
+        );
+    }
+
+    #[test]
+    fn set_ui_setting_creates_and_updates_the_table() {
+        let dir = std::env::temp_dir().join(format!("kazi-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        // 1) no [ui] at all: the table is appended, existing content intact
+        std::fs::write(&path, "# hello\nprovider = \"a\"\n").unwrap();
+        set_ui_setting(&path, "theme", "\"nord\"").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# hello") && text.contains("[ui]"), "{text}");
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.ui.theme.as_deref(), Some("nord"));
+
+        // 2) an existing key is replaced in place, a new one inserted above
+        set_ui_setting(&path, "theme", "\"light\"").unwrap();
+        set_ui_setting(&path, "bell", "true").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("theme =").count(), 1, "{text}");
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.ui.theme.as_deref(), Some("light"));
+        assert_eq!(parsed.ui.bell, Some(true));
+
+        // 3) a commented-out key is not treated as present
+        std::fs::write(&path, "[ui]\n# theme = \"dark\"\ndetails = false\n").unwrap();
+        set_ui_setting(&path, "theme", "\"solarized\"").unwrap();
+        let parsed: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed.ui.theme.as_deref(), Some("solarized"));
+        assert_eq!(parsed.ui.details, Some(false));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

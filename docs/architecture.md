@@ -267,13 +267,25 @@ AgentEvent ──► Transcript (Entry: User/Assistant/Tool/Notice/Rule)
   宽字符按显示宽度处理,未知语法原样保留。
 - **highlight.rs** 是逐行 tokenizer(关键字/字符串/注释/数字/函数/JSON key,
   含跨行块注释),零依赖。
-- **theme.rs** 把颜色和字形集中管理(`dark`/`light`/`mono`,`KAZI_ASCII`),
-  `Ctrl+T` 或 `[ui] theme` 切换。
-- **overlay.rs** 是模态层:命令面板(模糊匹配)、帮助、会话浏览、转录搜索、
-  provider/model 选择器、审批框。打开时独占键盘,永不占用布局行。
-- 每次绘制把「屏幕行 → Entry 下标」记进 `hit_owner`,鼠标点击据此展开/收起
-  对应的工具卡片。滚动条、上下文仪表、plan 面板、输入框和 footer 都是同一帧
-  布局的一部分;终端过小时按优先级先砍 plan/footer 再砍输入框,绝不越界绘制。
+- **theme.rs** 把颜色和字形集中管理(`dark`/`light`/`nord`/`solarized`/`mono`,
+  `KAZI_ASCII`),`Ctrl+T` 或 `[ui] theme` 切换;切换后用
+  `config.rs::set_ui_setting` 按行回写 `[ui]`(注释与排版保留),所以下次启动
+  保持同一外观;`/details` 同理。没有 config 文件(库内嵌)时只改当前会话。
+- **overlay.rs** 是模态层:命令面板(模糊匹配)、帮助、会话浏览(宽屏带预览
+  面板)、转录搜索、diff 阅读器、provider/model 选择器、审批框。打开时独占
+  键盘,永不占用布局行;列表把可见行区间交给事件循环,所以滚轮/点击与键盘
+  共用同一套游标。
+- **编辑器**(`tui.rs::Input`)自己维护按「编辑段」合并的 undo/redo、按词移动、
+  软换行与点击命中(`caret_at_visual` 与 `visual_rows` 共用 `wrap_ranges`,保证
+  点击位置和实际绘制的行一致);命令只写了一半时在光标后画暗色 ghost 补全。
+- 转录搜索命中后跳转的 Entry 会用选中色高亮一帧(下一次按键清除);`/usage`
+  的会话累计 token 由 `finish_task_usage` 在每个任务结束时并入总量。
+- 每次绘制把「屏幕行 → Entry 下标」记进 `hit_owner`,点击据此展开/收起对应
+  卡片,右键复制该条;输入框、列表和 diff 各自的命中矩形同理。滚动条、上下文
+  仪表、plan 面板、输入框和 footer 都是同一帧布局的一部分;终端过小时按优先级
+  先砍 plan/footer 再砍输入框,绝不越界绘制。
+- 任务运行期间 agent 被移出共享槽,命令按「是否需要 agent」分流:只读 UI 的
+  `/status`、`/context`、`/plan`、`/allow`、`/diff` 等立即执行,其余提示稍后。
 
 ### 事件里的工具信息
 

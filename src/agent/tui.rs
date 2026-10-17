@@ -51,7 +51,7 @@ use super::{Agent, AgentEvent};
 use crate::tools::{Approver, Decision, PermissionMode};
 use overlay::{Help, Overlay, Palette, Picker, PickerKind, Search, Sessions};
 use theme::{Theme, ThemeName};
-use transcript::{Level, Transcript};
+use transcript::{Level, SearchHit, Transcript};
 
 /// Approval request travelling from the agent task to the UI loop.
 pub struct ApprovalAsk {
@@ -133,8 +133,37 @@ impl Approver for TuiApprover {
 // editor
 // ---------------------------------------------------------------------------
 
+/// Where the composer was last drawn, so a mouse click can put the caret at
+/// the clicked character instead of only at the end.
+#[derive(Debug, Clone, Copy)]
+struct InputHit {
+    area: Rect,
+    /// Wrap width used for the drawn rows.
+    budget: usize,
+    /// First visual row shown in the box.
+    first: usize,
+    /// Width of the `❯ ` prompt (only on the first visible row).
+    prompt: usize,
+}
+
+/// One undo step: the whole buffer plus caret. A task is normally short, so
+/// cloning the text is cheaper (and far less bug-prone) than an op log.
+#[derive(Debug, Clone)]
+struct Snapshot {
+    text: String,
+    cursor: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditKind {
+    Type,
+    Delete,
+    Other,
+}
+
 /// Multi-line editor state: text + a char-indexed caret + recallable history
-/// (↑/↓), with readline-style shortcuts (Ctrl+A/E/U/K/W).
+/// (↑/↓), with readline-style shortcuts (Ctrl+A/E/U/K/W), word-wise motions
+/// (Ctrl+←/→), and an undo stack (Ctrl+Z / Ctrl+Y).
 #[derive(Default)]
 struct Input {
     text: String,
@@ -144,9 +173,17 @@ struct Input {
     /// `Some(i)` while browsing history; the live draft is stashed meanwhile.
     hist_pos: Option<usize>,
     draft: String,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    /// Timestamp/kind of the last snapshot, so a run of keystrokes undoes as
+    /// one step instead of one character at a time.
+    last_edit: Option<(std::time::Instant, EditKind)>,
 }
 
 impl Input {
+    const UNDO_CAP: usize = 200;
+    const COALESCE: std::time::Duration = std::time::Duration::from_millis(600);
+
     fn byte_of(&self, ci: usize) -> usize {
         self.text
             .char_indices()
@@ -159,25 +196,59 @@ impl Input {
         self.text.chars().count()
     }
 
-    fn insert(&mut self, ch: char) {
+    /// Snapshot the buffer before a mutation. Consecutive edits of the same
+    /// kind within [`Self::COALESCE`] share the previous snapshot, so typing a
+    /// sentence (or holding backspace) is one undo step.
+    fn checkpoint(&mut self, kind: EditKind) {
+        let now = std::time::Instant::now();
+        let coalesce = self
+            .last_edit
+            .map(|(at, prev)| prev == kind && now.duration_since(at) <= Self::COALESCE)
+            .unwrap_or(false);
+        self.last_edit = Some((now, kind));
+        if coalesce {
+            return;
+        }
+        self.undo.push(Snapshot {
+            text: self.text.clone(),
+            cursor: self.cursor,
+        });
+        if self.undo.len() > Self::UNDO_CAP {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    /// Movement ends the current typing run, so the next edit is its own step.
+    fn break_group(&mut self) {
+        self.last_edit = None;
+    }
+
+    fn insert_raw(&mut self, ch: char) {
         let b = self.byte_of(self.cursor);
         self.text.insert(b, ch);
         self.cursor += 1;
     }
 
+    fn insert(&mut self, ch: char) {
+        self.checkpoint(EditKind::Type);
+        self.insert_raw(ch);
+    }
+
     /// Insert a pasted block at the caret; CRLF/CR normalize to `\n` so a
     /// multi-line paste lands as ONE task.
     fn insert_str(&mut self, text: &str) {
+        self.checkpoint(EditKind::Type);
         let mut after_cr = false;
         for ch in text.chars() {
             match ch {
                 '\r' => {
-                    self.insert('\n');
+                    self.insert_raw('\n');
                     after_cr = true;
                 }
                 '\n' if after_cr => after_cr = false,
                 c => {
-                    self.insert(c);
+                    self.insert_raw(c);
                     after_cr = false;
                 }
             }
@@ -185,9 +256,11 @@ impl Input {
     }
 
     fn set_text(&mut self, text: String) {
+        self.checkpoint(EditKind::Other);
         self.text = text;
         self.cursor = self.chars_len();
         self.hist_pos = None;
+        self.break_group();
     }
 
     fn clear(&mut self) {
@@ -195,12 +268,16 @@ impl Input {
         self.cursor = 0;
         self.hist_pos = None;
         self.draft.clear();
+        self.undo.clear();
+        self.redo.clear();
+        self.break_group();
     }
 
     fn backspace(&mut self) {
         if self.cursor == 0 {
             return;
         }
+        self.checkpoint(EditKind::Delete);
         let b = self.byte_of(self.cursor - 1);
         self.text.remove(b);
         self.cursor -= 1;
@@ -210,41 +287,86 @@ impl Input {
         if self.cursor >= self.chars_len() {
             return;
         }
+        self.checkpoint(EditKind::Delete);
         let b = self.byte_of(self.cursor);
         self.text.remove(b);
     }
 
     fn left(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
+        self.break_group();
     }
 
     fn right(&mut self) {
         if self.cursor < self.chars_len() {
             self.cursor += 1;
         }
+        self.break_group();
+    }
+
+    fn is_word(ch: char) -> bool {
+        ch.is_alphanumeric() || ch == '_'
+    }
+
+    /// Move to the start of the previous word (Ctrl+←).
+    fn word_left(&mut self) {
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut i = self.cursor.min(chars.len());
+        while i > 0 && !Self::is_word(chars[i - 1]) {
+            i -= 1;
+        }
+        while i > 0 && Self::is_word(chars[i - 1]) {
+            i -= 1;
+        }
+        self.cursor = i;
+        self.break_group();
+    }
+
+    /// Move to the start of the next word (Ctrl+→).
+    fn word_right(&mut self) {
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut i = self.cursor.min(chars.len());
+        while i < chars.len() && Self::is_word(chars[i]) {
+            i += 1;
+        }
+        while i < chars.len() && !Self::is_word(chars[i]) {
+            i += 1;
+        }
+        self.cursor = i;
+        self.break_group();
     }
 
     fn home(&mut self) {
         self.cursor = 0;
+        self.break_group();
     }
 
     fn end(&mut self) {
         self.cursor = self.chars_len();
+        self.break_group();
     }
 
     fn kill_to_start(&mut self) {
+        self.checkpoint(EditKind::Other);
         let b = self.byte_of(self.cursor);
         self.text.drain(..b);
         self.cursor = 0;
+        self.break_group();
     }
 
     fn kill_to_end(&mut self) {
+        self.checkpoint(EditKind::Other);
         let b = self.byte_of(self.cursor);
         self.text.truncate(b);
+        self.break_group();
     }
 
-    /// Delete the whitespace-delimited word before the caret.
+    /// Delete the word before the caret (Ctrl+W).
     fn delete_word(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        self.checkpoint(EditKind::Delete);
         let chars: Vec<char> = self.text.chars().collect();
         let mut i = self.cursor.min(chars.len());
         while i > 0 && chars[i - 1].is_whitespace() {
@@ -258,8 +380,58 @@ impl Input {
         self.cursor = i;
     }
 
+    /// Delete the word after the caret (Ctrl+Delete).
+    fn delete_word_forward(&mut self) {
+        if self.cursor >= self.chars_len() {
+            return;
+        }
+        self.checkpoint(EditKind::Delete);
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut end = self.cursor.min(chars.len());
+        while end < chars.len() && !Self::is_word(chars[end]) {
+            end += 1;
+        }
+        while end < chars.len() && Self::is_word(chars[end]) {
+            end += 1;
+        }
+        let (bs, be) = (self.byte_of(self.cursor), self.byte_of(end));
+        self.text.replace_range(bs..be, "");
+    }
+
     fn newline(&mut self) {
-        self.insert('\n');
+        self.checkpoint(EditKind::Other);
+        self.insert_raw('\n');
+        self.break_group();
+    }
+
+    fn undo(&mut self) -> bool {
+        let Some(snap) = self.undo.pop() else {
+            return false;
+        };
+        self.redo.push(Snapshot {
+            text: self.text.clone(),
+            cursor: self.cursor,
+        });
+        self.text = snap.text;
+        self.cursor = snap.cursor.min(self.chars_len());
+        self.hist_pos = None;
+        self.break_group();
+        true
+    }
+
+    fn redo(&mut self) -> bool {
+        let Some(snap) = self.redo.pop() else {
+            return false;
+        };
+        self.undo.push(Snapshot {
+            text: self.text.clone(),
+            cursor: self.cursor,
+        });
+        self.text = snap.text;
+        self.cursor = snap.cursor.min(self.chars_len());
+        self.hist_pos = None;
+        self.break_group();
+        true
     }
 
     fn line_count(&self) -> usize {
@@ -281,48 +453,18 @@ impl Input {
             } else {
                 None
             };
-            if lchars.is_empty() {
-                rows.push(String::new());
-                if caret_local == Some(0) {
-                    caret = (rows.len() - 1, 0);
-                }
-            } else {
-                let mut i = 0usize;
-                while i < lchars.len() {
-                    let mut end = i;
-                    let mut w = 0usize;
-                    while end < lchars.len() {
-                        let cw = UnicodeWidthChar::width(lchars[end]).unwrap_or(0);
-                        if w + cw > budget {
-                            break;
-                        }
-                        w += cw;
-                        end += 1;
+            let ranges = wrap_ranges(&lchars, budget);
+            for &(start, end) in &ranges {
+                let text: String = lchars[start..end].iter().collect();
+                rows.push(text);
+                if let Some(cl) = caret_local {
+                    if cl >= start && cl <= end {
+                        let col = lchars[start..cl]
+                            .iter()
+                            .map(|c| UnicodeWidthChar::width(*c).unwrap_or(0))
+                            .sum();
+                        caret = (rows.len() - 1, col);
                     }
-                    if end == i {
-                        end = i + 1; // a single glyph wider than the box
-                    }
-                    // break at a space when there is one in the window
-                    let break_at = (i + 1..end)
-                        .rev()
-                        .find(|&k| lchars[k] == ' ')
-                        .unwrap_or(end);
-                    let text: String = lchars[i..break_at].iter().collect();
-                    rows.push(text);
-                    if let Some(cl) = caret_local {
-                        if cl >= i && cl <= break_at {
-                            let col = lchars[i..cl]
-                                .iter()
-                                .map(|c| UnicodeWidthChar::width(*c).unwrap_or(0))
-                                .sum();
-                            caret = (rows.len() - 1, col);
-                        }
-                    }
-                    i = if break_at < lchars.len() && lchars[break_at] == ' ' {
-                        break_at + 1
-                    } else {
-                        break_at
-                    };
                 }
             }
             // a caret after trailing spaces belongs to the end of the last row
@@ -337,6 +479,42 @@ impl Input {
             rows.push(String::new());
         }
         (rows, caret.0, caret.1)
+    }
+
+    /// Char index under a clicked visual `(row, column)`, using the same wrap
+    /// rules as [`Self::visual_rows`]. Columns past the end of a row land on
+    /// its last character.
+    fn caret_at_visual(&self, target_row: usize, col: usize, budget: usize) -> Option<usize> {
+        let budget = budget.max(1);
+        let mut row = 0usize;
+        let mut base = 0usize;
+        for line in self.text.split('\n') {
+            let lchars: Vec<char> = line.chars().collect();
+            for &(start, end) in &wrap_ranges(&lchars, budget) {
+                if row == target_row {
+                    let mut idx = start;
+                    let mut width = 0usize;
+                    while idx < end {
+                        let cw = UnicodeWidthChar::width(lchars[idx]).unwrap_or(0);
+                        if width + cw > col {
+                            break;
+                        }
+                        width += cw;
+                        idx += 1;
+                    }
+                    return Some(base + idx);
+                }
+                row += 1;
+            }
+            base += lchars.len() + 1;
+        }
+        None
+    }
+
+    fn set_cursor(&mut self, idx: usize) {
+        self.cursor = idx.min(self.chars_len());
+        self.hist_pos = None;
+        self.break_group();
     }
 
     /// (first char, one-past-last char) of the caret's display line.
@@ -490,6 +668,8 @@ struct PendingApproval {
     /// `r` was pressed: the next Enter denies with the typed reason.
     reason_mode: bool,
     reason: String,
+    /// First body row shown (long commands are scrollable).
+    scroll: usize,
 }
 
 /// Everything needed to render one screenful.
@@ -501,20 +681,39 @@ struct Screen {
     max_context: u64,
     transcript: Transcript,
     input: Input,
+    /// Ring the terminal bell when a task ends (`[ui] bell = true`).
+    bell: bool,
     /// The model's plan checklist: (content, status) pairs.
     todos: Vec<(String, String)>,
     rounds: u32,
     tokens_in: u64,
     tokens_out: u64,
+    /// Session-wide totals across finished tasks (+, not overwritten per task).
+    total_in: u64,
+    total_out: u64,
+    tasks_done: u32,
     est_tokens: u64,
     /// Transcript scroll: lines above the bottom (0 = follow the tail).
     scroll: std::cell::Cell<usize>,
+    /// New rows that arrived while the reader was scrolled up.
+    new_lines: std::cell::Cell<usize>,
+    /// Entry the transcript search jumped to; highlighted until the next key.
+    highlight: std::cell::Cell<Option<usize>>,
+    /// Hits of the last transcript search, so `F3` repeats it.
+    search_hits: std::cell::RefCell<Vec<SearchHit>>,
+    search_pos: std::cell::Cell<usize>,
     last_total: std::cell::Cell<usize>,
     /// Rows of the last frame's conversation area, for click hit-testing.
     body_area: std::cell::Cell<Rect>,
+    /// Composer geometry of the last frame, for click-to-caret.
+    input_hit: std::cell::Cell<Option<InputHit>>,
     body_width: std::cell::Cell<u16>,
     hit_owner: std::cell::RefCell<Vec<usize>>,
     started: std::cell::Cell<Option<std::time::Instant>>,
+    /// Duration of the last completed task (shown in the footer).
+    last_elapsed: std::cell::Cell<Option<std::time::Duration>>,
+    /// Esc was pressed and the task is still winding down.
+    cancelling: bool,
     spinner: std::cell::Cell<usize>,
     busy: bool,
     /// Follow-ups typed while a task runs; started automatically when it ends.
@@ -523,6 +722,10 @@ struct Screen {
     last_task: Option<String>,
     pending_approval: Option<PendingApproval>,
     overlay: Option<Overlay>,
+    /// Clickable list area of the open overlay (mouse hit-testing).
+    overlay_hit: std::cell::Cell<Option<overlay::Hit>>,
+    /// Approximate inner height of the open modal (scroll bounds).
+    overlay_body: std::cell::Cell<u16>,
     /// Highlighted row of the inline `/` dropdown.
     cmd_sel: std::cell::Cell<usize>,
     mode: PermissionMode,
@@ -555,23 +758,36 @@ impl Screen {
             max_context,
             transcript,
             input,
+            bell: false,
             todos: Vec::new(),
             rounds: 0,
             tokens_in: 0,
             tokens_out: 0,
+            total_in: 0,
+            total_out: 0,
+            tasks_done: 0,
             est_tokens: 0,
             scroll: std::cell::Cell::new(0),
+            new_lines: std::cell::Cell::new(0),
+            highlight: std::cell::Cell::new(None),
+            search_hits: std::cell::RefCell::new(Vec::new()),
+            search_pos: std::cell::Cell::new(0),
             last_total: std::cell::Cell::new(0),
             body_area: std::cell::Cell::new(Rect::new(0, 0, 0, 0)),
+            input_hit: std::cell::Cell::new(None),
             body_width: std::cell::Cell::new(80),
             hit_owner: std::cell::RefCell::new(Vec::new()),
             started: std::cell::Cell::new(None),
+            last_elapsed: std::cell::Cell::new(None),
+            cancelling: false,
             spinner: std::cell::Cell::new(0),
             busy: false,
             queued: VecDeque::new(),
             last_task: None,
             pending_approval: None,
             overlay: None,
+            overlay_hit: std::cell::Cell::new(None),
+            overlay_body: std::cell::Cell::new(20),
             cmd_sel: std::cell::Cell::new(0),
             mode: PermissionMode::Edit,
             theme,
@@ -660,25 +876,76 @@ impl Screen {
         self.transcript.push_user(task);
         self.last_task = Some(task.to_string());
         self.busy = true;
+        self.cancelling = false;
+        self.highlight.set(None);
         self.started.set(Some(std::time::Instant::now()));
         self.spinner.set(0);
         self.scroll_to_bottom();
     }
 
+    /// Fold the finished task's per-round counters into the session totals.
+    fn finish_task_usage(&mut self) {
+        self.total_in = self.total_in.saturating_add(self.tokens_in);
+        self.total_out = self.total_out.saturating_add(self.tokens_out);
+        self.tasks_done = self.tasks_done.saturating_add(1);
+        self.tokens_in = 0;
+        self.tokens_out = 0;
+    }
+
+    /// `/usage` report: this run's totals plus the running task when busy.
+    fn usage_report(&self) -> String {
+        let total = self.total_in.saturating_add(self.total_out);
+        let mut out = format!(
+            "session usage (this run) — {} finished task(s)\n  tokens: in {} · out {} · total {}",
+            self.tasks_done, self.total_in, self.total_out, total
+        );
+        if self.busy {
+            out.push_str(&format!(
+                "\n  running task: in {} · out {}",
+                self.tokens_in, self.tokens_out
+            ));
+        }
+        out
+    }
+
     fn scroll_up(&self, n: usize) {
         self.scroll.set(self.scroll.get().saturating_add(n));
+        self.new_lines.set(0);
     }
 
     fn scroll_down(&self, n: usize) {
         self.scroll.set(self.scroll.get().saturating_sub(n));
+        if self.scroll.get() == 0 {
+            self.new_lines.set(0);
+        }
     }
 
     fn scroll_to_bottom(&self) {
         self.scroll.set(0);
+        self.new_lines.set(0);
     }
 
     fn scroll_to_top(&self) {
         self.scroll.set(usize::MAX); // clamped in draw()
+    }
+
+    /// Remember a completed search so `F3` / `Shift+F3` can walk it again.
+    fn remember_search(&self, hits: Vec<SearchHit>, pos: usize) {
+        self.search_pos.set(pos);
+        *self.search_hits.borrow_mut() = hits;
+    }
+
+    /// Entry of the next (`delta > 0`) or previous hit, wrapping around.
+    fn step_search(&self, delta: isize) -> Option<usize> {
+        let hits = self.search_hits.borrow();
+        if hits.is_empty() {
+            return None;
+        }
+        let len = hits.len() as isize;
+        let cur = (self.search_pos.get().min(hits.len() - 1)) as isize;
+        let next = (cur + delta).rem_euclid(len) as usize;
+        self.search_pos.set(next);
+        Some(hits[next].entry)
     }
 
     /// Put the viewport at the top of one transcript entry (search jump).
@@ -716,6 +983,29 @@ impl Screen {
             .set((cur + delta).rem_euclid(len as isize) as usize);
     }
 
+    /// TAB in command position: complete a unique prefix, extend a shared
+    /// prefix, or move through the ambiguous candidates.
+    fn complete_command_input(&mut self) -> bool {
+        if super::console::pending_command(&self.input.text).is_none() {
+            return false;
+        }
+        let hints = self.command_hints();
+        if hints.len() == 1 {
+            // complete to the full name; keep a trailing space only when the
+            // command wants an argument (so Enter never runs a truncated name)
+            let row = &hints[0].0;
+            let name = row.split_whitespace().next().unwrap_or(row).to_string();
+            let wants_arg = row.split_whitespace().nth(1).is_some();
+            self.input
+                .set_text(if wants_arg { format!("{name} ") } else { name });
+        } else if let Some(done) = super::console::command_completion(&self.input.text) {
+            self.input.set_text(done);
+        } else if hints.len() > 1 {
+            self.move_command_sel(1);
+        }
+        true
+    }
+
     /// Enter/Tab resolution of a half-typed command: the unique match, or the
     /// row the dropdown is highlighting.
     fn resolve_command_input(&self) -> Option<String> {
@@ -733,10 +1023,122 @@ impl Screen {
         Some(name)
     }
 
+    /// TAB completion for the first argument of a slash command. Returns a
+    /// note when several choices share no longer prefix (the UI lists them).
+    fn complete_argument(
+        &mut self,
+        cfg: &crate::config::Config,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> Option<String> {
+        let line = self.input.text.clone();
+        let comp = super::console::arg_completions(cfg, &line, provider, model)
+            .or_else(|| theme_arg_completion(&line));
+        let (start, candidates) = comp?;
+        let typed = line.get(start..).unwrap_or("");
+        if candidates.len() == 1 {
+            let mut next = line[..start].to_string();
+            next.push_str(&candidates[0]);
+            next.push(' ');
+            self.input.set_text(next);
+            return None;
+        }
+        let common = super::console::common_prefix(&candidates);
+        if common.len() > typed.len() {
+            let mut next = line[..start].to_string();
+            next.push_str(&common);
+            self.input.set_text(next);
+            return None;
+        }
+        let mut note = format!(
+            "matches: {}",
+            candidates
+                .iter()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if candidates.len() > 8 {
+            note.push_str(&format!(" … +{} more", candidates.len() - 8));
+        }
+        Some(note)
+    }
+
+    /// Mouse click inside the open list overlay: move the selection to the
+    /// clicked row. Returns `true` when the click was consumed.
+    fn overlay_click(&mut self, row: u16) -> bool {
+        let Some(hit) = self.overlay_hit.get() else {
+            return false;
+        };
+        let Some(ov) = self.overlay.as_mut() else {
+            return false;
+        };
+        if row < hit.area.y || row >= hit.area.y.saturating_add(hit.area.height) {
+            return false;
+        }
+        let offset = (row - hit.area.y) as usize;
+        if offset >= hit.shown {
+            return false;
+        }
+        let idx = hit.start + offset;
+        match ov {
+            Overlay::Palette(p) => p.cursor = idx,
+            Overlay::Picker(p) => p.cursor = idx,
+            Overlay::Sessions(s) => {
+                s.cursor = idx;
+                s.confirm_delete = None;
+                s.refresh_preview();
+            }
+            Overlay::Search(s) => s.cursor = idx,
+            Overlay::Help(_) | Overlay::Diff(_) => return false,
+        }
+        true
+    }
+
+    /// Mouse wheel while a modal is open: lists move their cursor, the long
+    /// viewers scroll. The transcript behind the overlay stays put.
+    fn overlay_scroll(&mut self, delta: isize, body_height: u16) {
+        let Some(ov) = self.overlay.as_mut() else {
+            return;
+        };
+        match ov {
+            Overlay::Palette(p) => p.move_cursor(delta),
+            Overlay::Picker(p) => p.move_cursor(delta),
+            Overlay::Sessions(s) => {
+                s.move_cursor(delta);
+            }
+            Overlay::Search(s) => s.move_cursor(delta),
+            Overlay::Help(h) => {
+                let max = overlay::help_lines(self.theme)
+                    .len()
+                    .saturating_sub(body_height as usize);
+                h.scroll = (h.scroll.min(max) as isize + delta * 3).clamp(0, max as isize) as usize;
+            }
+            Overlay::Diff(d) => d.scroll_by(delta * 3, body_height as usize),
+        }
+    }
+
     fn input_rows(&self, width: u16) -> u16 {
         // grow with the *wrapped* row count (a long single-line task wraps)
         let budget = width.saturating_sub(4).max(4) as usize;
         (self.input.visual_rows(budget).0.len().clamp(1, 6) as u16) + 2
+    }
+
+    /// The dim remainder of a unique slash command, drawn after the caret so
+    /// the command is discoverable before `Tab` is pressed.
+    fn ghost_completion(&self) -> Option<String> {
+        if self.busy
+            || self.overlay.is_some()
+            || self.pending_approval.is_some()
+            || self.input.cursor != self.input.chars_len()
+        {
+            return None;
+        }
+        let text = &self.input.text;
+        super::console::pending_command(text)?;
+        let done = super::console::command_completion(text)?;
+        (done.len() > text.len()).then(|| done[text.len()..].to_string())
     }
 
     // -- drawing ----------------------------------------------------------
@@ -793,10 +1195,17 @@ impl Screen {
                 &pending.ask.summary,
                 pending.reason_mode,
                 &pending.reason,
+                pending.scroll,
             );
+            self.overlay_hit.set(None);
         } else if let Some(ov) = &self.overlay {
-            overlay::draw(f, area, self.theme, ov);
+            // the modal's inner body is roughly the screen minus its chrome;
+            // scroll handlers only need a bound, not an exact rect
+            self.overlay_body.set(area.height.saturating_sub(6));
+            let hit = overlay::draw(f, area, self.theme, ov);
+            self.overlay_hit.set(hit);
         } else {
+            self.overlay_hit.set(None);
             self.draw_command_hints(f, input);
         }
     }
@@ -887,22 +1296,32 @@ impl Screen {
             ),
             Style::default().fg(theme.dim),
         ));
+        if !self.busy {
+            if let Some(d) = self.last_elapsed.get() {
+                spans.push(Span::styled(
+                    format!("last {:.1}s  ", d.as_secs_f64()),
+                    Style::default().fg(theme.faint),
+                ));
+            }
+        }
         if self.busy {
             let secs = self
                 .started
                 .get()
                 .map(|t| t.elapsed().as_secs())
                 .unwrap_or(0);
-            spans.push(Span::styled(
+            let activity = if self.cancelling {
+                format!("{} cancelling…  ", theme.spinner(self.spinner.get()))
+            } else {
                 format!(
                     "{} {}s  r{}/{}  ",
                     theme.spinner(self.spinner.get()),
                     secs,
                     self.rounds,
                     self.max_rounds
-                ),
-                Style::default().fg(theme.accent),
-            ));
+                )
+            };
+            spans.push(Span::styled(activity, Style::default().fg(theme.accent)));
             spans.push(Span::styled(
                 format!("↑{} ↓{} ", self.tokens_in, self.tokens_out),
                 Style::default().fg(theme.faint),
@@ -978,6 +1397,8 @@ impl Screen {
         let grew = total.saturating_sub(self.last_total.replace(total));
         if grew > 0 && self.scroll.get() > 0 {
             self.scroll.set(self.scroll.get() + grew);
+            self.new_lines
+                .set(self.new_lines.get().saturating_add(grew));
         }
         let height = main.height as usize;
         let (start, end, off) = scroll_range(total, height, self.scroll.get());
@@ -985,10 +1406,16 @@ impl Screen {
 
         let mut visible: Vec<Line<'static>> = Vec::with_capacity(end.saturating_sub(start));
         let mut owners: Vec<usize> = Vec::with_capacity(end.saturating_sub(start));
+        let highlight = self.highlight.get();
         for i in start..end {
             if i < static_len {
-                visible.push(cache.lines[i].clone());
-                owners.push(cache.owner.get(i).copied().unwrap_or(usize::MAX));
+                let owner = cache.owner.get(i).copied().unwrap_or(usize::MAX);
+                let mut line = cache.lines[i].clone();
+                if highlight.is_some() && highlight == Some(owner) {
+                    line = line.patch_style(theme.selection());
+                }
+                visible.push(line);
+                owners.push(owner);
             } else if let Some(row) = stream_rows.get(i - static_len) {
                 visible.push(row.clone());
                 owners.push(usize::MAX);
@@ -1041,6 +1468,7 @@ impl Screen {
         let inner = block.inner(area);
         f.render_widget(block, area);
         if inner.height == 0 || inner.width == 0 {
+            self.input_hit.set(None);
             return;
         }
 
@@ -1050,6 +1478,12 @@ impl Screen {
         let (rows, caret_row, caret_col) = self.input.visual_rows(budget);
         let visible_rows = inner.height as usize;
         let first = caret_row.saturating_sub(visible_rows.saturating_sub(1));
+        self.input_hit.set(Some(InputHit {
+            area: inner,
+            budget,
+            first,
+            prompt: prompt_w,
+        }));
 
         if self.input.text.trim().is_empty() {
             f.render_widget(
@@ -1090,6 +1524,21 @@ impl Screen {
             };
             lines.push(Line::from(vec![lead, Span::raw(text.clone())]));
         }
+        if let Some(ghost) = self.ghost_completion() {
+            if caret_row >= first && caret_row < first.saturating_add(visible_rows) {
+                if let Some(line) = lines.get_mut(caret_row - first) {
+                    let used: usize = line
+                        .spans
+                        .iter()
+                        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                        .sum();
+                    if used + UnicodeWidthStr::width(ghost.as_str()) <= inner.width as usize {
+                        line.spans
+                            .push(Span::styled(ghost, Style::default().fg(theme.faint)));
+                    }
+                }
+            }
+        }
         f.render_widget(
             Paragraph::new(lines).style(Style::default().fg(theme.text)),
             inner,
@@ -1117,6 +1566,8 @@ impl Screen {
                 Span::styled(" interrupt  ", Style::default().fg(theme.dim)),
                 Span::styled("Enter", theme.key_style()),
                 Span::styled(" queue a follow-up  ", Style::default().fg(theme.dim)),
+                Span::styled("F1", theme.key_style()),
+                Span::styled(" help  ", Style::default().fg(theme.dim)),
                 Span::styled("Ctrl+O", theme.key_style()),
                 Span::styled(" details  ", Style::default().fg(theme.dim)),
                 Span::styled("Ctrl+F", theme.key_style()),
@@ -1128,6 +1579,8 @@ impl Screen {
                 Span::styled(" send  ", Style::default().fg(theme.dim)),
                 Span::styled("/", theme.key_style()),
                 Span::styled(" commands  ", Style::default().fg(theme.dim)),
+                Span::styled("F1", theme.key_style()),
+                Span::styled(" help  ", Style::default().fg(theme.dim)),
                 Span::styled("Ctrl+K", theme.key_style()),
                 Span::styled(" palette  ", Style::default().fg(theme.dim)),
                 Span::styled("Ctrl+O", theme.key_style()),
@@ -1159,8 +1612,13 @@ impl Screen {
             ));
         }
         if self.scroll.get() > 0 {
+            let new = self.new_lines.get();
             right.push(Span::styled(
-                "scrolled · Ctrl+End  ",
+                if new > 0 {
+                    format!("↓ {new} new · Ctrl+End  ")
+                } else {
+                    "scrolled · Ctrl+End  ".to_string()
+                },
                 Style::default().fg(theme.warn),
             ));
         }
@@ -1260,6 +1718,41 @@ fn scroll_range(total: usize, height: usize, off: usize) -> (usize, usize, usize
     (start, end, off)
 }
 
+/// Split one logical line into display rows `(start, end)` char ranges, using
+/// the composer's wrap rule: break at the last space that fits, drop the space
+/// that caused the break. An empty line yields one empty range.
+fn wrap_ranges(chars: &[char], budget: usize) -> Vec<(usize, usize)> {
+    let budget = budget.max(1);
+    if chars.is_empty() {
+        return vec![(0, 0)];
+    }
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let mut end = i;
+        let mut width = 0usize;
+        while end < chars.len() {
+            let cw = UnicodeWidthChar::width(chars[end]).unwrap_or(0);
+            if width + cw > budget {
+                break;
+            }
+            width += cw;
+            end += 1;
+        }
+        if end == i {
+            end = i + 1; // one glyph wider than the box still gets a row
+        }
+        let break_at = (i + 1..end).rev().find(|&k| chars[k] == ' ').unwrap_or(end);
+        out.push((i, break_at));
+        i = if break_at < chars.len() && chars[break_at] == ' ' {
+            break_at + 1
+        } else {
+            break_at
+        };
+    }
+    out
+}
+
 fn spans_width(spans: &[Span<'static>]) -> usize {
     spans
         .iter()
@@ -1282,6 +1775,29 @@ fn clip(text: &str, n: usize) -> String {
         used += w;
     }
     out
+}
+
+/// `/theme <name>` completion (the theme list lives in the TUI, not console).
+fn theme_arg_completion(line: &str) -> Option<(usize, Vec<String>)> {
+    let trimmed = line.trim_start();
+    let (verb, rest) = trimmed.split_once(char::is_whitespace)?;
+    if verb != "/theme" {
+        return None;
+    }
+    let arg = rest.trim_start();
+    if arg.contains(char::is_whitespace) {
+        return None;
+    }
+    let prefix = arg.to_ascii_lowercase();
+    let candidates: Vec<String> = ThemeName::names()
+        .into_iter()
+        .filter(|n| n.starts_with(&prefix))
+        .map(|n| n.to_string())
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    Some((line.len() - arg.len(), candidates))
 }
 
 /// Resolve a theme, honouring the `KAZI_ASCII=1` glyph fallback.
@@ -1373,6 +1889,11 @@ async fn launch_task(
         return None;
     };
     screen.begin_task(&task);
+    let refs = super::file_ref_names(&task);
+    if !refs.is_empty() {
+        // the model reads the contents; the human sees which files went along
+        screen.push_notice(Level::Info, format!("attaching @{}", refs.join(", @")));
+    }
     let cancel = owned.cancel_token();
     let expanded = super::expand_file_refs(&task, &owned.ctx.cwd);
     let slot2 = slot.clone();
@@ -1405,6 +1926,22 @@ pub async fn chat_loop_with(
     mode: PermissionMode,
     topic: Option<String>,
     resume: Option<String>,
+) -> anyhow::Result<u8> {
+    chat_loop_with_config(cfg, provider, model, mode, topic, resume, None).await
+}
+
+/// Same as [`chat_loop_with`], plus the config file behind `cfg` so `/theme`
+/// and `/details` can persist their `[ui]` choice. A library embedder without a
+/// file passes `None` and the settings stay session-only.
+#[allow(clippy::too_many_arguments)]
+pub async fn chat_loop_with_config(
+    cfg: crate::config::Config,
+    provider: Option<String>,
+    model: Option<String>,
+    mode: PermissionMode,
+    topic: Option<String>,
+    resume: Option<String>,
+    config_file: Option<std::path::PathBuf>,
 ) -> anyhow::Result<u8> {
     let session_name = match resume.as_deref() {
         Some(name) => super::session::resolve(name).unwrap_or_else(|| name.to_string()),
@@ -1481,6 +2018,7 @@ pub async fn chat_loop_with(
         provider: provider.clone(),
         model: model.clone(),
         session_name: session_name.clone(),
+        config_file,
     };
 
     match chat_loop_tui(
@@ -1513,6 +2051,21 @@ pub struct SessionState {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub session_name: String,
+    /// Where `cfg` came from, so `/theme` and `/details` can be remembered.
+    pub config_file: Option<std::path::PathBuf>,
+}
+
+/// Best-effort persistence of one `[ui]` setting. Returns "" when there is no
+/// config file behind this session (a library embedder), " · saved" on success,
+/// or a warning suffix when the file could not be rewritten.
+fn persist_note(sess: &SessionState, key: &str, value: &str) -> String {
+    let Some(path) = sess.config_file.as_ref() else {
+        return String::new();
+    };
+    match crate::config::set_ui_setting(path, key, value) {
+        Ok(()) => " · saved".to_string(),
+        Err(e) => format!(" · not saved ({e})"),
+    }
 }
 
 /// Run the TUI chat loop. `chat_loop_tui` owns its terminal; stdout is
@@ -1556,6 +2109,7 @@ pub async fn chat_loop_tui(
         &cwd,
     );
     screen.mode = permission.get();
+    screen.bell = sess.cfg.ui.bell.unwrap_or(false);
     screen.transcript.push_rule(format!(
         "kazi · {} · {}",
         screen.session_name,
@@ -1680,7 +2234,21 @@ async fn run_command(
     match verb_key.as_str() {
         "" => {}
         "help" => {
-            screen.overlay = Some(Overlay::Help(Help::default()));
+            if arg.is_empty() {
+                screen.overlay = Some(Overlay::Help(Help::default()));
+            } else {
+                match console::help_for(arg) {
+                    Some(text) => screen.show_text(text),
+                    None => {
+                        let verb = if arg.starts_with('/') {
+                            arg.to_string()
+                        } else {
+                            format!("/{arg}")
+                        };
+                        screen.show_text(console::unknown_command_text(&verb));
+                    }
+                }
+            }
         }
         "theme" => {
             let next = if arg.is_empty() {
@@ -1692,12 +2260,15 @@ async fn run_command(
             match next {
                 Some(name) => {
                     screen.theme = theme_named(name);
+                    let note = persist_note(sess, "theme", &format!("\"{}\"", name.as_str()));
                     screen.push_notice(
                         Level::Info,
-                        format!("theme -> {}", screen.theme.name.as_str()),
+                        format!("theme -> {}{note}", screen.theme.name.as_str()),
                     );
                 }
-                None => screen.show_text("usage: /theme [dark|light|mono]"),
+                None => {
+                    screen.show_text(format!("usage: /theme [{}]", ThemeName::names().join("|")))
+                }
             }
         }
         "details" | "verbose" => {
@@ -1711,9 +2282,13 @@ async fn run_command(
                 }
             };
             screen.transcript.set_details(next);
+            let note = persist_note(sess, "details", if next { "true" } else { "false" });
             screen.push_notice(
                 Level::Info,
-                format!("tool detail -> {}", if next { "full" } else { "collapsed" }),
+                format!(
+                    "tool detail -> {}{note}",
+                    if next { "full" } else { "collapsed" }
+                ),
             );
         }
         "exit" | "quit" => screen.quit = true,
@@ -1737,6 +2312,51 @@ async fn run_command(
             screen.transcript.clear();
             screen.transcript.push_rule(format!("session {note}"));
             screen.scroll_to_bottom();
+        }
+        "rename" => {
+            if arg.is_empty() {
+                screen.show_text(format!(
+                    "current session: {}\n{}",
+                    sess.session_name,
+                    console::usage_for("/rename")
+                ));
+                return None;
+            }
+            let name = console::slugify(arg);
+            if name.is_empty() {
+                screen.show_text("that name has no usable characters — try letters or digits");
+                return None;
+            }
+            if name == sess.session_name {
+                screen.push_notice(Level::Info, format!("already saving as `{name}`"));
+                return None;
+            }
+            let guard = slot.lock().await;
+            let saved = guard.as_ref().and_then(|a| {
+                (a.history.msgs_len() > 0).then(|| {
+                    super::session::save(&name, a.history.system.as_deref(), &a.history.msgs)
+                })
+            });
+            drop(guard);
+            let old = std::mem::replace(&mut sess.session_name, name.clone());
+            screen.session_name = name.clone();
+            match saved {
+                Some(Ok(path)) => screen.push_notice(
+                    Level::Success,
+                    format!(
+                        "auto-save now targets `{name}` (wrote {}) — the old `{old}` file is kept",
+                        path.display()
+                    ),
+                ),
+                Some(Err(e)) => screen.push_notice(
+                    Level::Warn,
+                    format!("auto-save now targets `{name}`, but the snapshot failed: {e}"),
+                ),
+                None => screen.push_notice(
+                    Level::Info,
+                    format!("auto-save now targets `{name}` (nothing to save yet)"),
+                ),
+            }
         }
         "compact" => {
             let force = match arg {
@@ -1908,6 +2528,43 @@ async fn run_command(
                     .show_text("usage: /permission [read-only|edit|yolo] — or Shift+Tab to cycle");
             }
         }
+        "allow" | "allows" => {
+            let mut allows = session_allows.lock().unwrap_or_else(|e| e.into_inner());
+            match arg.to_ascii_lowercase().as_str() {
+                "" => {
+                    if allows.is_empty() {
+                        screen.push_notice(
+                            Level::Info,
+                            "no commands approved for this session (answer `a` at a prompt to add one)",
+                        );
+                    } else {
+                        screen.push_notice(
+                            Level::Info,
+                            format!("{} session approval(s):", allows.len()),
+                        );
+                        let rows: Vec<String> =
+                            allows.iter().map(|cmd| first_lines(cmd, 1)).collect();
+                        for (i, cmd) in rows.iter().enumerate() {
+                            screen.push_notice(Level::Info, format!("  {}. {cmd}", i + 1));
+                        }
+                        screen.show_text("usage: /allow clear");
+                    }
+                }
+                "clear" | "reset" => {
+                    let n = allows.len();
+                    allows.clear();
+                    drop(allows);
+                    screen.push_notice(
+                        Level::Info,
+                        format!("cleared {n} session approval(s) — commands prompt again"),
+                    );
+                }
+                _ => {
+                    drop(allows);
+                    screen.show_text(console::usage_for("/allow"));
+                }
+            }
+        }
         "undo" => {
             let text = match slot.lock().await.as_ref() {
                 Some(a) => console::undo_text(a),
@@ -1915,26 +2572,93 @@ async fn run_command(
             };
             screen.show_text(text);
         }
+        "plan" | "todos" => {
+            if screen.todos.is_empty() {
+                screen.push_notice(
+                    Level::Info,
+                    "no plan yet — the model writes one with todo_write when a task needs steps",
+                );
+            } else {
+                let done = screen
+                    .todos
+                    .iter()
+                    .filter(|(_, s)| s == "completed")
+                    .count();
+                screen.push_notice(
+                    Level::Info,
+                    format!("plan — {done}/{} done", screen.todos.len()),
+                );
+                let rows: Vec<String> = screen
+                    .todos
+                    .iter()
+                    .map(|(content, status)| {
+                        let mark = match status.as_str() {
+                            "completed" => "[x]",
+                            "in_progress" => "[>]",
+                            _ => "[ ]",
+                        };
+                        format!("  {mark} {content}")
+                    })
+                    .collect();
+                for row in rows {
+                    screen.push_notice(Level::Info, row);
+                }
+            }
+        }
         "context" => {
             let text = match slot.lock().await.as_ref() {
                 Some(a) => console::context_report(a),
-                None => BUSY_TEXT.to_string(),
+                None => format!(
+                    "context estimate: ≈ {} / {} tokens ({}%)\n  the agent is busy — the full breakdown returns when the task ends",
+                    screen.est_tokens,
+                    screen.max_context,
+                    screen
+                        .est_tokens
+                        .saturating_mul(100)
+                        .checked_div(screen.max_context)
+                        .unwrap_or(0)
+                ),
             };
             screen.show_text(text);
         }
         "status" => {
             let text = match slot.lock().await.as_ref() {
                 Some(a) => format!(
-                    "{}\n{}\nrounds: {} · ctx ≈ {} tokens · budget {}",
+                    "{}\n{}\nrounds: {} · ctx ≈ {} tokens · budget {}\n{}",
                     console::status_text(a),
                     console::context_report(a),
                     screen.rounds,
                     screen.est_tokens,
-                    screen.max_context
+                    screen.max_context,
+                    screen.usage_report()
                 ),
-                None => BUSY_TEXT.to_string(),
+                None => format!(
+                    "provider/model: {}\nround budget:   {}\nrounds so far:  {} · ctx ≈ {} / {} tokens\n{}\n(task usage lands when the running round completes)",
+                    screen.provider_desc,
+                    screen.max_rounds,
+                    screen.rounds,
+                    screen.est_tokens,
+                    screen.max_context,
+                    screen.usage_report()
+                ),
             };
             screen.show_text(text);
+        }
+        "usage" => {
+            if arg.eq_ignore_ascii_case("reset") {
+                let (t, t_in, t_out) = (screen.tasks_done, screen.total_in, screen.total_out);
+                screen.total_in = 0;
+                screen.total_out = 0;
+                screen.tasks_done = 0;
+                screen.push_notice(
+                    Level::Info,
+                    format!("session usage reset (cleared {t} task(s), {t_in} in / {t_out} out)"),
+                );
+            } else if arg.is_empty() {
+                screen.show_text(screen.usage_report());
+            } else {
+                screen.show_text(console::usage_for("/usage"));
+            }
         }
         "auth" => {
             let text = match slot.lock().await.as_ref() {
@@ -1954,6 +2678,77 @@ async fn run_command(
             };
             screen.show_text(text);
         }
+        "diff" => {
+            let back = if arg.trim().is_empty() {
+                1
+            } else {
+                match console::parse_back(arg) {
+                    Some(n) => n,
+                    None => {
+                        screen.show_text(console::usage_for("/diff"));
+                        return None;
+                    }
+                }
+            };
+            match screen.transcript.diff_card(back) {
+                Some((name, summary, diff)) => {
+                    let title = if summary.trim().is_empty() {
+                        name
+                    } else {
+                        format!("{name} {summary}")
+                    };
+                    screen.overlay = Some(Overlay::Diff(overlay::DiffView::new(title, diff)));
+                }
+                None => screen.push_notice(
+                    Level::Info,
+                    if back == 1 {
+                        "no file diff yet — write_file/apply_patch calls show one".to_string()
+                    } else {
+                        format!("no diff {back} results back")
+                    },
+                ),
+            }
+        }
+        "queue" => {
+            let lower = arg.to_ascii_lowercase();
+            if arg.is_empty() {
+                if screen.queued.is_empty() {
+                    screen.push_notice(Level::Info, "the follow-up queue is empty");
+                } else {
+                    screen.push_notice(
+                        Level::Info,
+                        format!("{} queued follow-up(s):", screen.queued.len()),
+                    );
+                    let pending: Vec<String> = screen
+                        .queued
+                        .iter()
+                        .map(|task| first_lines(task, 2).replace('\n', " ⏎ "))
+                        .collect();
+                    for (i, first) in pending.iter().enumerate() {
+                        screen.push_notice(Level::Info, format!("  {}. {first}", i + 1));
+                    }
+                    screen.show_text("usage: /queue clear · /queue drop <n>");
+                }
+            } else if lower == "clear" || lower == "drop all" {
+                let n = screen.queued.len();
+                screen.queued.clear();
+                screen.push_notice(Level::Info, format!("cleared {n} queued follow-up(s)"));
+            } else if let Some(idx) = lower.strip_prefix("drop ") {
+                match idx.trim().parse::<usize>() {
+                    Ok(n) if n >= 1 && n <= screen.queued.len() => {
+                        if let Some(task) = screen.queued.remove(n - 1) {
+                            screen.push_notice(
+                                Level::Warn,
+                                format!("dropped queued task {n}: {}", first_lines(&task, 1)),
+                            );
+                        }
+                    }
+                    _ => screen.show_text(console::usage_for("/queue")),
+                }
+            } else {
+                screen.show_text(console::usage_for("/queue"));
+            }
+        }
         "tools" => {
             let text = match slot.lock().await.as_ref() {
                 Some(a) => a.registry().catalog(),
@@ -1969,10 +2764,32 @@ async fn run_command(
             screen.show_text(text);
         }
         "copy" => {
-            let text = if arg.eq_ignore_ascii_case("all") {
-                screen.transcript.plain_text()
-            } else {
-                screen.transcript.last_assistant().unwrap_or("").to_string()
+            let mut parts = arg.split_whitespace();
+            let target = parts.next().unwrap_or("").to_ascii_lowercase();
+            let back = parts
+                .next()
+                .and_then(|n| n.parse::<usize>().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(1);
+            let text = match target.as_str() {
+                "" | "answer" | "last" => {
+                    screen.transcript.last_assistant().unwrap_or("").to_string()
+                }
+                "all" => screen.transcript.plain_text(),
+                "tool" | "output" => screen.transcript.tool_output(back).unwrap_or_default(),
+                "diff" => screen
+                    .transcript
+                    .diff_card(back)
+                    .map(|(_, _, d)| d)
+                    .unwrap_or_default(),
+                "code" | "block" => screen.transcript.code_block(back).unwrap_or_default(),
+                other => {
+                    screen.show_text(format!(
+                        "unknown copy target `{other}`\n{}",
+                        console::usage_for("/copy")
+                    ));
+                    return None;
+                }
             };
             if text.trim().is_empty() {
                 screen.push_notice(Level::Warn, "nothing to copy yet");
@@ -2185,8 +3002,59 @@ fn export_session(agent: &Agent, sess: &SessionState, arg: &str) -> String {
     }
 }
 
-/// Copy text to the system clipboard, trying the platform's tool. Returns how
-/// it succeeded, or an error listing what was tried.
+/// Minimal base64 (no padding-free variants needed): used for the OSC 52
+/// clipboard escape so a remote session can copy without a local tool.
+fn base64(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Ask the terminal itself to set the clipboard with OSC 52. Only used when a
+/// remote session makes a local clipboard tool pointless (or `KAZI_OSC52=1`
+/// forces it); very large payloads are skipped because terminals cap them.
+fn osc52_copy(text: &str) -> bool {
+    const CAP: usize = 100_000;
+    if text.is_empty() || text.len() > CAP {
+        return false;
+    }
+    let seq = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
+    let mut out = std::io::stdout();
+    out.write_all(seq.as_bytes())
+        .and_then(|_| out.flush())
+        .is_ok()
+}
+
+/// Whether the OSC 52 fallback is worth trying in this environment.
+fn osc52_enabled() -> bool {
+    std::env::var_os("KAZI_OSC52").is_some()
+        || std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_TTY").is_some()
+}
+
+/// Copy text to the system clipboard, trying the platform's tool first and the
+/// terminal's OSC 52 escape as a remote-friendly fallback. Returns how it
+/// succeeded, or an error listing what was tried.
 fn copy_to_clipboard(text: &str) -> Result<String, String> {
     use std::process::{Command, Stdio};
     let mut candidates: Vec<(&str, Vec<&str>)> = Vec::new();
@@ -2220,8 +3088,11 @@ fn copy_to_clipboard(text: &str) -> Result<String, String> {
             _ => continue,
         }
     }
+    if osc52_enabled() && osc52_copy(text) {
+        return Ok("the terminal's OSC 52 clipboard".to_string());
+    }
     Err(format!(
-        "no clipboard tool worked (tried: {}). Use the terminal's own selection (Shift+drag).",
+        "no clipboard tool worked (tried: {}). Use the terminal's own selection (Shift+drag), or set KAZI_OSC52=1 to try the terminal clipboard.",
         tried.join(", ")
     ))
 }
@@ -2311,6 +3182,7 @@ async fn tui_inner(
                         ask,
                         reason_mode: false,
                         reason: String::new(),
+                        scroll: 0,
                     });
                 }
             }
@@ -2339,12 +3211,22 @@ async fn tui_inner(
                         }
                         Ok(_) => {}
                     }
+                    if let Some(t) = screen.started.get() {
+                        screen.last_elapsed.set(Some(t.elapsed()));
+                    }
+                    screen.finish_task_usage();
                     screen.busy = false;
                     screen.started.set(None);
+                    screen.cancelling = false;
                     runner = None;
                     current_cancel = None;
                     if let Some(agent) = shared_agent.lock().await.as_ref() {
                         on_session_save(&sess.session_name, agent);
+                    }
+                    if screen.bell {
+                        let mut out = std::io::stdout();
+                        let _ = out.write_all(b"\x07");
+                        let _ = out.flush();
                     }
                     // queued follow-ups: run the next one immediately
                     if let Some(next) = screen.queued.pop_front() {
@@ -2363,6 +3245,9 @@ async fn tui_inner(
             maybe_ev = events.next() => match maybe_ev {
                 Some(Ok(CtEvent::Key(key))) if key.kind != KeyEventKind::Release => {
                     log_key_event(&key);
+                    // a search highlight is a "look here" marker: it lasts
+                    // until the next keystroke
+                    screen.highlight.set(None);
 
                     // Ctrl+C always means "get me out" — even mid-approval or
                     // with a modal open (the agent is cancelled on the way out).
@@ -2385,7 +3270,10 @@ async fn tui_inner(
                         let mut accept: Option<(PickerKind, String)> = None;
                         let mut jump: Option<usize> = None;
                         let mut resume: Option<String> = None;
+                        let mut copy_text: Option<String> = None;
+                        let mut search_snapshot: Option<(Vec<SearchHit>, usize)> = None;
                         let mut notices: Vec<(Level, String)> = Vec::new();
+                        let body_h = screen.overlay_body.get() as usize;
                         {
                             let ov = screen.overlay.as_mut().expect("checked");
                             match ov {
@@ -2430,6 +3318,20 @@ async fn tui_inner(
                                     KeyCode::End => h.scroll = usize::MAX / 2,
                                     _ => {}
                                 },
+                                Overlay::Diff(d) => match key.code {
+                                    KeyCode::Esc | KeyCode::Char('q') => close = true,
+                                    KeyCode::Up => d.scroll_by(-1, body_h),
+                                    KeyCode::Down => d.scroll_by(1, body_h),
+                                    KeyCode::PageUp => d.scroll_by(-12, body_h),
+                                    KeyCode::PageDown => d.scroll_by(12, body_h),
+                                    KeyCode::Home => d.scroll = 0,
+                                    KeyCode::End => d.scroll = d.max_scroll(body_h),
+                                    KeyCode::Char('c') | KeyCode::Char('C') => {
+                                        copy_text = Some(d.diff.clone());
+                                        close = true;
+                                    }
+                                    _ => {}
+                                },
                                 Overlay::Sessions(s) => {
                                     let mut delete: Option<String> = None;
                                     match key.code {
@@ -2462,6 +3364,9 @@ async fn tui_inner(
                                         };
                                         s.rows = super::session::list_summaries();
                                         s.confirm_delete = None;
+                                        // the deleted row may have been selected
+                                        s.cursor = s.cursor.min(s.rows.len().saturating_sub(1));
+                                        s.refresh_preview();
                                         notices.push((Level::Warn, note));
                                     }
                                 }
@@ -2473,6 +3378,7 @@ async fn tui_inner(
                                         KeyCode::Backspace => s.pop(),
                                         KeyCode::Enter => {
                                             jump = s.hits.get(s.cursor).map(|h| h.entry);
+                                            search_snapshot = Some((s.hits.clone(), s.cursor));
                                             close = true;
                                         }
                                         code => {
@@ -2493,6 +3399,17 @@ async fn tui_inner(
                         for (level, text) in notices {
                             screen.push_notice(level, text);
                         }
+                        if let Some(text) = copy_text {
+                            match copy_to_clipboard(&text) {
+                                Ok(how) => screen.push_notice(
+                                    Level::Success,
+                                    format!("copied the diff ({} chars, {how})", text.chars().count()),
+                                ),
+                                Err(e) => {
+                                    screen.push_notice(Level::Error, format!("copy failed: {e}"))
+                                }
+                            }
+                        }
                         if close {
                             screen.overlay = None;
                         }
@@ -2511,8 +3428,12 @@ async fn tui_inner(
                             )
                             .await;
                         }
+                        if let Some((hits, pos)) = search_snapshot {
+                            screen.remember_search(hits, pos);
+                        }
                         if let Some(entry) = jump {
                             screen.scroll_to_entry(entry);
+                            screen.highlight.set(Some(entry));
                         }
                         if let Some(prefix) = resume {
                             if screen.busy {
@@ -2527,10 +3448,31 @@ async fn tui_inner(
 
                     // 3) the editor
                     match key.code {
+                        KeyCode::F(1) => {
+                            screen.overlay = Some(Overlay::Help(Help::default()));
+                        }
+                        KeyCode::F(3) => {
+                            let delta = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                -1
+                            } else {
+                                1
+                            };
+                            match screen.step_search(delta) {
+                                Some(entry) => {
+                                    screen.scroll_to_entry(entry);
+                                    screen.highlight.set(Some(entry));
+                                }
+                                None => screen.push_notice(
+                                    Level::Info,
+                                    "no transcript search yet — press Ctrl+F to search",
+                                ),
+                            }
+                        }
                         KeyCode::Esc => {
                             if screen.busy {
                                 if let Some(flag) = &current_cancel {
                                     flag.store(true, Ordering::Relaxed);
+                                    screen.cancelling = true;
                                     screen.push_notice(Level::Info, "cancelling…");
                                 }
                             } else if !screen.input.text.trim().is_empty() {
@@ -2564,18 +3506,25 @@ async fn tui_inner(
                         {
                             let next = screen.theme.name.cycle();
                             screen.theme = theme_named(next);
+                            let note =
+                                persist_note(sess, "theme", &format!("\"{}\"", next.as_str()));
                             screen.push_notice(
                                 Level::Info,
-                                format!("theme -> {}", next.as_str()),
+                                format!("theme -> {}{note}", next.as_str()),
                             );
                         }
                         KeyCode::Char('o')
                             if key.modifiers.contains(KeyModifiers::CONTROL) =>
                         {
                             let on = screen.transcript.toggle_details();
+                            let note =
+                                persist_note(sess, "details", if on { "true" } else { "false" });
                             screen.push_notice(
                                 Level::Info,
-                                format!("tool detail -> {}", if on { "full" } else { "collapsed" }),
+                                format!(
+                                    "tool detail -> {}{note}",
+                                    if on { "full" } else { "collapsed" }
+                                ),
                             );
                         }
                         KeyCode::Char('e')
@@ -2650,11 +3599,32 @@ async fn tui_inner(
                         KeyCode::Enter => {
                             if let Some(text) = screen.input.submit() {
                                 super::console::remember_input(&text);
-                                if text.starts_with('/') {
-                                    screen.push_notice(
-                                        Level::Warn,
-                                        "finish or interrupt the current task before running a command",
-                                    );
+                                if let Some(cmdline) = text.strip_prefix('/') {
+                                    let verb = cmdline
+                                        .split_whitespace()
+                                        .next()
+                                        .map(|v| format!("/{v}"))
+                                        .unwrap_or_default();
+                                    if super::console::works_while_busy(&verb) {
+                                        run_command(
+                                            cmdline.trim(),
+                                            screen,
+                                            &shared_agent,
+                                            sess,
+                                            ask_tx,
+                                            session_allows,
+                                            permission,
+                                            bg_tx,
+                                        )
+                                        .await;
+                                    } else {
+                                        screen.push_notice(
+                                            Level::Warn,
+                                            format!(
+                                                "`{verb}` needs the agent — wait for this task, or Esc to interrupt"
+                                            ),
+                                        );
+                                    }
                                 } else {
                                     screen.queued.push_back(text.clone());
                                     screen.transcript.push_notice(
@@ -2665,17 +3635,16 @@ async fn tui_inner(
                             }
                         }
                         KeyCode::Tab => {
-                            let token = super::console::pending_command(&screen.input.text)
-                                .map(|t| t.to_string());
-                            if let Some(token) = token {
-                                let hints = super::console::command_rows(&token);
-                                if hints.len() == 1 {
-                                    screen.input.set_text(format!("{token} "));
-                                } else if let Some(done) = super::console::command_completion(&token)
-                                {
-                                    screen.input.set_text(done);
-                                } else if hints.len() > 1 {
-                                    screen.move_command_sel(1);
+                            let token = super::console::pending_command(&screen.input.text);
+                            if token.is_some() {
+                                screen.complete_command_input();
+                            } else if screen.input.text.trim_start().starts_with('/') {
+                                if let Some(note) = screen.complete_argument(
+                                    &sess.cfg,
+                                    sess.provider.as_deref(),
+                                    sess.model.as_deref(),
+                                ) {
+                                    screen.push_notice(Level::Info, note);
                                 }
                             } else {
                                 let pos = screen.input.byte_of(screen.input.cursor);
@@ -2685,6 +3654,40 @@ async fn tui_inner(
                                     screen.input.set_text(done);
                                 }
                             }
+                        }
+                        KeyCode::Char('z') | KeyCode::Char('Z')
+                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                screen.input.redo();
+                            } else {
+                                screen.input.undo();
+                            }
+                        }
+                        KeyCode::Char('y')
+                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            screen.input.redo();
+                        }
+                        KeyCode::Left
+                            if key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                        {
+                            screen.input.word_left();
+                        }
+                        KeyCode::Right
+                            if key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                        {
+                            screen.input.word_right();
+                        }
+                        KeyCode::Delete if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            screen.input.delete_word_forward()
+                        }
+                        KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            screen.input.delete_word()
                         }
                         KeyCode::Backspace => screen.input.backspace(),
                         KeyCode::Delete => screen.input.delete(),
@@ -2747,28 +3750,92 @@ async fn tui_inner(
                         }
                     }
                 }
-                Some(Ok(CtEvent::Mouse(me))) => match me.kind {
-                    MouseEventKind::ScrollUp => screen.scroll_up(3),
-                    MouseEventKind::ScrollDown => screen.scroll_down(3),
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        let area = screen.body_area.get();
-                        if area.width > 0
-                            && me.column >= area.x
-                            && me.column < area.right()
-                            && me.row >= area.y
-                            && me.row < area.bottom()
-                        {
-                            let row = (me.row - area.y) as usize;
-                            let owners = screen.hit_owner.borrow();
-                            if let Some(idx) = owners.get(row).copied() {
-                                if idx != usize::MAX {
-                                    screen.transcript.toggle_entry(idx);
+                Some(Ok(CtEvent::Mouse(me))) => {
+                    if screen.pending_approval.is_some() {
+                        continue;
+                    }
+                    if screen.overlay.is_some() {
+                        let body = screen.overlay_body.get();
+                        match me.kind {
+                            MouseEventKind::ScrollUp => screen.overlay_scroll(-1, body),
+                            MouseEventKind::ScrollDown => screen.overlay_scroll(1, body),
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                screen.overlay_click(me.row);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    match me.kind {
+                        MouseEventKind::ScrollUp => screen.scroll_up(3),
+                        MouseEventKind::ScrollDown => screen.scroll_down(3),
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if let Some(hit) = screen.input_hit.get() {
+                                if me.row >= hit.area.y
+                                    && me.row < hit.area.bottom()
+                                    && me.column >= hit.area.x
+                                    && me.column < hit.area.right()
+                                {
+                                    let row =
+                                        (me.row - hit.area.y) as usize + hit.first;
+                                    let mut col = (me.column - hit.area.x) as usize;
+                                    if row == hit.first {
+                                        col = col.saturating_sub(hit.prompt);
+                                    }
+                                    if let Some(idx) =
+                                        screen.input.caret_at_visual(row, col, hit.budget)
+                                    {
+                                        screen.input.set_cursor(idx);
+                                    }
+                                    continue;
+                                }
+                            }
+                            let area = screen.body_area.get();
+                            if area.width > 0
+                                && me.column >= area.x
+                                && me.column < area.right()
+                                && me.row >= area.y
+                                && me.row < area.bottom()
+                            {
+                                let row = (me.row - area.y) as usize;
+                                let owners = screen.hit_owner.borrow();
+                                if let Some(idx) = owners.get(row).copied() {
+                                    if idx != usize::MAX {
+                                        screen.transcript.toggle_entry(idx);
+                                    }
                                 }
                             }
                         }
+                        MouseEventKind::Down(MouseButton::Right) => {
+                            let area = screen.body_area.get();
+                            if area.width > 0 && me.row >= area.y && me.row < area.bottom() {
+                                let row = (me.row - area.y) as usize;
+                                let owner = screen.hit_owner.borrow().get(row).copied();
+                                if let Some(idx) = owner.filter(|i| *i != usize::MAX) {
+                                    let text = screen.transcript.entry_text(idx).unwrap_or_default();
+                                    if text.trim().is_empty() {
+                                        screen.push_notice(Level::Info, "nothing to copy here");
+                                    } else {
+                                        match copy_to_clipboard(&text) {
+                                            Ok(how) => screen.push_notice(
+                                                Level::Success,
+                                                format!(
+                                                    "copied entry ({} chars, {how})",
+                                                    text.chars().count()
+                                                ),
+                                            ),
+                                            Err(e) => screen.push_notice(
+                                                Level::Error,
+                                                format!("copy failed: {e}"),
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                },
+                }
                 Some(Ok(CtEvent::Paste(text))) => {
                     if screen.pending_approval.is_none() && screen.overlay.is_none() {
                         screen.input.insert_str(&text);
@@ -2800,6 +3867,25 @@ fn handle_approval(screen: &mut Screen, key: &ratatui::crossterm::event::KeyEven
         let Some(p) = screen.pending_approval.as_mut() else {
             return;
         };
+        match key.code {
+            KeyCode::PageUp => {
+                p.scroll = p.scroll.saturating_sub(8);
+                return;
+            }
+            KeyCode::PageDown => {
+                p.scroll = p.scroll.saturating_add(8);
+                return;
+            }
+            KeyCode::Up => {
+                p.scroll = p.scroll.saturating_sub(1);
+                return;
+            }
+            KeyCode::Down => {
+                p.scroll = p.scroll.saturating_add(1);
+                return;
+            }
+            _ => {}
+        }
         if p.reason_mode {
             match key.code {
                 KeyCode::Enter => {
@@ -2989,6 +4075,374 @@ mod tests {
         let mut i = Input::default();
         i.insert_str("a\r\nb\rc");
         assert_eq!(i.text, "a\nb\nc");
+    }
+
+    #[test]
+    fn input_undo_redo_and_word_motion() {
+        let mut i = Input::default();
+        i.insert_str("one two three");
+        i.break_group();
+        i.insert('!');
+        assert_eq!(i.text, "one two three!");
+        assert!(i.undo());
+        assert_eq!(i.text, "one two three");
+        assert!(i.undo());
+        assert_eq!(i.text, "");
+        assert!(!i.undo());
+        assert!(i.redo());
+        assert_eq!(i.text, "one two three");
+        assert!(i.redo());
+        assert_eq!(i.text, "one two three!");
+
+        // word-wise motions land on word starts, not whitespace
+        i.end();
+        i.word_left();
+        assert_eq!(i.cursor, 8, "start of `three`");
+        i.word_left();
+        assert_eq!(i.cursor, 4, "start of `two`");
+        i.word_right();
+        assert_eq!(i.cursor, 8, "start of the next word (`three`)");
+        i.word_right();
+        assert_eq!(i.cursor, 14, "end of the buffer");
+
+        // forward word deletion keeps the word before the caret
+        i.end();
+        i.word_left();
+        i.delete_word_forward();
+        assert_eq!(i.text, "one two !");
+        i.home();
+        i.delete_word_forward();
+        assert_eq!(i.text, " two !");
+    }
+
+    #[test]
+    fn session_usage_totals_accumulate_and_reset() {
+        let mut s = test_screen();
+        assert!(s.usage_report().contains("0 finished task(s)"));
+        s.tokens_in = 100;
+        s.tokens_out = 20;
+        s.finish_task_usage();
+        assert_eq!((s.total_in, s.total_out, s.tasks_done), (100, 20, 1));
+        assert_eq!((s.tokens_in, s.tokens_out), (0, 0), "per-task reset");
+        s.tokens_in = 5;
+        s.tokens_out = 7;
+        s.finish_task_usage();
+        let report = s.usage_report();
+        assert!(
+            report.contains("105") && report.contains("27") && report.contains("2 finished"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn ghost_completion_hints_unique_commands() {
+        let mut s = test_screen();
+        s.input.set_text("/he".into());
+        assert_eq!(s.ghost_completion().as_deref(), Some("lp"));
+        s.input.set_text("/co".into());
+        assert!(
+            s.ghost_completion().is_none(),
+            "ambiguous prefix stars no ghost"
+        );
+        s.input.set_text("plain task".into());
+        assert!(s.ghost_completion().is_none());
+        s.input.set_text("/help".into());
+        assert!(s.ghost_completion().is_none(), "already complete");
+
+        s.input.set_text("/he".into());
+        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        term.draw(|f| s.draw(f)).unwrap();
+        let text = frame_rows(&term).join("\n");
+        assert!(
+            text.contains("/help"),
+            "ghost completes the name on screen:\n{text}"
+        );
+    }
+
+    #[test]
+    fn base64_encodes_for_the_osc52_clipboard() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"hello"), "aGVsbG8=");
+        // nothing to copy is never written to the terminal
+        assert!(!osc52_copy(""));
+    }
+
+    #[test]
+    fn f3_walks_the_remembered_search_hits() {
+        let mut s = test_screen();
+        s.push_notice(Level::Info, "alpha needle");
+        s.push_notice(Level::Info, "beta");
+        s.push_notice(Level::Info, "needle again");
+        let hits = s.transcript.search("needle");
+        assert_eq!(hits.len(), 2);
+        s.remember_search(hits, 0);
+        assert_eq!(s.step_search(1), Some(2));
+        assert_eq!(s.step_search(1), Some(0), "wraps to the first hit");
+        assert_eq!(s.step_search(-1), Some(2), "backwards wraps");
+        assert!(test_screen().step_search(1).is_none(), "no search yet");
+    }
+
+    #[test]
+    fn search_highlight_paints_the_jumped_entry() {
+        let theme = Theme::default();
+        let mut s = test_screen();
+        s.push_notice(Level::Info, "needle lives here");
+        s.highlight.set(Some(0));
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        term.draw(|f| s.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        let painted = (0..buf.area.height).any(|y| {
+            (0..buf.area.width).any(|x| {
+                let cell = &buf[(x, y)];
+                cell.bg == theme.sel_bg && cell.fg == theme.sel_fg
+            })
+        });
+        assert!(painted, "the selected entry gets the selection colours");
+    }
+
+    #[test]
+    fn click_position_maps_back_to_a_char_index() {
+        let mut i = Input::default();
+        i.insert_str("hello world");
+        assert_eq!(i.caret_at_visual(0, 0, 5), Some(0));
+        assert_eq!(i.caret_at_visual(0, 3, 5), Some(3));
+        assert_eq!(i.caret_at_visual(0, 99, 5), Some(5), "past the row end");
+        assert_eq!(
+            i.caret_at_visual(1, 0, 5),
+            Some(6),
+            "second row starts at `world`"
+        );
+        assert_eq!(i.caret_at_visual(1, 2, 5), Some(8));
+        assert_eq!(i.caret_at_visual(9, 0, 5), None);
+
+        // multi-line: row indices continue across the newline
+        let mut m = Input::default();
+        m.insert_str("ab\ncd");
+        assert_eq!(m.caret_at_visual(1, 0, 10), Some(3));
+        assert_eq!(m.caret_at_visual(1, 2, 10), Some(5));
+    }
+
+    #[test]
+    fn command_tab_completes_unique_prefix_to_the_real_name() {
+        let mut s = test_screen();
+        s.input.set_text("/he".into());
+        assert!(s.complete_command_input());
+        assert_eq!(s.input.text, "/help", "must not leave a half command");
+
+        s.input.set_text("/pro".into());
+        assert!(s.complete_command_input());
+        assert_eq!(s.input.text, "/provider ", "argument commands get a space");
+
+        s.input.set_text("/co".into());
+        assert!(s.complete_command_input());
+        assert_eq!(s.input.text, "/co", "ambiguous prefix stays put");
+        assert!(s.cmd_sel.get() > 0, "Tab cycles the candidate list");
+
+        s.input.set_text("plain task".into());
+        assert!(!s.complete_command_input());
+    }
+
+    #[test]
+    fn command_argument_tab_completion() {
+        let cfg: crate::config::Config =
+            toml::from_str("[providers.deepseek]\ntype = \"openai\"\nmodel = \"deepseek-chat\"")
+                .unwrap();
+        let mut s = test_screen();
+        s.input.set_text("/permission re".into());
+        assert!(s.complete_argument(&cfg, None, None).is_none());
+        assert_eq!(s.input.text, "/permission read-only ");
+
+        s.input.set_text("/theme so".into());
+        assert!(s.complete_argument(&cfg, None, None).is_none());
+        assert_eq!(s.input.text, "/theme solarized ");
+
+        s.input.set_text("/provider de".into());
+        assert!(s.complete_argument(&cfg, None, None).is_none());
+        assert_eq!(s.input.text, "/provider deepseek ");
+
+        // no shared extension beyond `o`: the next Tab lists the candidates
+        s.input.set_text("/yolo ".into());
+        assert!(s.complete_argument(&cfg, None, None).is_none());
+        assert_eq!(s.input.text, "/yolo o");
+        let note = s.complete_argument(&cfg, None, None).expect("two choices");
+        assert!(note.contains("on") && note.contains("off"), "{note}");
+
+        // unknown argument stays untouched
+        s.input.set_text("/permission bogus".into());
+        assert!(s.complete_argument(&cfg, None, None).is_none());
+        assert_eq!(s.input.text, "/permission bogus");
+    }
+
+    #[test]
+    fn mouse_click_selects_an_overlay_row() {
+        let mut s = test_screen();
+        s.overlay = Some(Overlay::Picker(Picker::new(
+            PickerKind::Model,
+            "models",
+            vec!["a/one".into(), "a/two".into(), "a/three".into()],
+            None,
+        )));
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| s.draw(f)).unwrap();
+        let hit = s.overlay_hit.get().expect("list hit map");
+        assert!(hit.shown >= 3);
+        assert!(s.overlay_click(hit.area.y + 2));
+        match s.overlay.as_ref().unwrap() {
+            Overlay::Picker(p) => assert_eq!(p.cursor, 2),
+            other => panic!("unexpected overlay: {other:?}"),
+        }
+        // a click outside the list rows is ignored
+        assert!(!s.overlay_click(0));
+    }
+
+    #[test]
+    fn diff_card_and_overlay_show_the_patch() {
+        let mut s = test_screen();
+        s.transcript.start_tool("d1", "apply_patch", "src/x.rs");
+        s.transcript.finish_tool(
+            "d1",
+            "apply_patch",
+            false,
+            "patched",
+            Some("@@ -1 +1 @@\n-old\n+new".into()),
+            4,
+        );
+        let (name, summary, diff) = s.transcript.diff_card(1).expect("diff card");
+        assert_eq!(name, "apply_patch");
+        assert_eq!(summary, "src/x.rs");
+        assert!(diff.contains("+new"));
+        assert!(s.transcript.diff_card(2).is_none());
+
+        s.overlay = Some(Overlay::Diff(overlay::DiffView::new(
+            "apply_patch src/x.rs",
+            diff,
+        )));
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| s.draw(f)).unwrap();
+        let text = frame_rows(&term).join("\n");
+        assert!(text.contains("diff · apply_patch"), "{text}");
+        assert!(text.contains("+new"), "{text}");
+    }
+
+    #[test]
+    fn queue_report_lists_and_drops_follow_ups() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let slot = Arc::new(tokio::sync::Mutex::new(Some(stub_agent())));
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalAsk>();
+            let mut sess = SessionState {
+                cfg: crate::config::Config::default(),
+                provider: None,
+                model: None,
+                session_name: "sess".to_string(),
+                config_file: None,
+            };
+            let mut screen = test_screen();
+            let perm = crate::tools::Permission::default();
+            let allows = SessionAllows::default();
+            let (bg_tx, _bg_rx) = tokio::sync::mpsc::unbounded_channel::<BackgroundEvent>();
+            screen.queued.push_back("first task".into());
+            screen.queued.push_back("second task".into());
+
+            run_command(
+                "queue",
+                &mut screen,
+                &slot,
+                &mut sess,
+                &tx,
+                &allows,
+                &perm,
+                &bg_tx,
+            )
+            .await;
+            let text = screen_text(&screen);
+            assert!(text.contains("1. first task"), "{text}");
+            assert!(text.contains("2. second task"), "{text}");
+
+            run_command(
+                "queue drop 1",
+                &mut screen,
+                &slot,
+                &mut sess,
+                &tx,
+                &allows,
+                &perm,
+                &bg_tx,
+            )
+            .await;
+            assert_eq!(screen.queued.len(), 1);
+            assert_eq!(screen.queued[0], "second task");
+
+            run_command(
+                "queue clear",
+                &mut screen,
+                &slot,
+                &mut sess,
+                &tx,
+                &allows,
+                &perm,
+                &bg_tx,
+            )
+            .await;
+            assert!(screen.queued.is_empty());
+
+            allows.lock().unwrap().push("$ cargo test".to_string());
+            run_command(
+                "allow",
+                &mut screen,
+                &slot,
+                &mut sess,
+                &tx,
+                &allows,
+                &perm,
+                &bg_tx,
+            )
+            .await;
+            assert!(screen_text(&screen).contains("cargo test"));
+            run_command(
+                "allow clear",
+                &mut screen,
+                &slot,
+                &mut sess,
+                &tx,
+                &allows,
+                &perm,
+                &bg_tx,
+            )
+            .await;
+            assert!(allows.lock().unwrap().is_empty());
+
+            // while a task runs the agent slot is empty; status/context/plan
+            // still answer from the screen instead of saying "busy"
+            let busy_slot = Arc::new(tokio::sync::Mutex::new(None));
+            screen.todos = vec![
+                ("write the test".into(), "completed".into()),
+                ("fix the bug".into(), "in_progress".into()),
+            ];
+            for (cmd, needle) in [
+                ("status", "rounds so far"),
+                ("context", "agent is busy"),
+                ("plan", "fix the bug"),
+            ] {
+                run_command(
+                    cmd,
+                    &mut screen,
+                    &busy_slot,
+                    &mut sess,
+                    &tx,
+                    &allows,
+                    &perm,
+                    &bg_tx,
+                )
+                .await;
+                let text = screen_text(&screen);
+                assert!(text.contains(needle), "{cmd}: {text}");
+            }
+            assert!(screen_text(&screen).contains("[x] write the test"));
+        });
     }
 
     #[test]
@@ -3209,6 +4663,10 @@ mod tests {
                 )),
                 Overlay::Sessions(Sessions::default()),
                 Overlay::Search(Search::default()),
+                Overlay::Diff(overlay::DiffView::new(
+                    "apply_patch src/x.rs",
+                    "@@ -1 +1 @@\n-old\n+new",
+                )),
             ] {
                 s.overlay = Some(overlay);
                 term.draw(|f| s.draw(f)).unwrap();
@@ -3223,6 +4681,7 @@ mod tests {
                 },
                 reason_mode: false,
                 reason: String::new(),
+                scroll: 0,
             });
             term.draw(|f| s.draw(f)).unwrap();
             s.pending_approval = None;
@@ -3243,8 +4702,14 @@ mod tests {
             },
             reason_mode: false,
             reason: String::new(),
+            scroll: 0,
         });
         let key = |code| ratatui::crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
+        // long commands scroll instead of being clipped
+        handle_approval(&mut s, &key(KeyCode::PageDown));
+        assert_eq!(s.pending_approval.as_ref().unwrap().scroll, 8);
+        handle_approval(&mut s, &key(KeyCode::Up));
+        assert_eq!(s.pending_approval.as_ref().unwrap().scroll, 7);
         // `r` opens the reason line; typing + Enter denies with the reason
         handle_approval(&mut s, &key(KeyCode::Char('r')));
         assert!(s.pending_approval.as_ref().unwrap().reason_mode);
@@ -3268,6 +4733,7 @@ mod tests {
             },
             reason_mode: false,
             reason: String::new(),
+            scroll: 0,
         });
         handle_approval(&mut s, &key(KeyCode::Char('y')));
         assert_eq!(rx.try_recv().unwrap(), Decision::Allow);
@@ -3349,6 +4815,7 @@ mod tests {
             provider: None,
             model: None,
             session_name: "sess".to_string(),
+            config_file: None,
         };
         let mut screen = test_screen();
         let perm = crate::tools::Permission::default();
@@ -3357,9 +4824,14 @@ mod tests {
 
         for cmd in [
             "help",
+            "help theme",
             "status",
             "auth",
             "last",
+            "diff",
+            "queue",
+            "plan",
+            "usage",
             "context",
             "tools",
             "undo",
@@ -3451,6 +4923,138 @@ mod tests {
     }
 
     #[test]
+    fn rename_repoints_autosave_and_keeps_the_old_file() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let slot = Arc::new(tokio::sync::Mutex::new(Some(stub_agent())));
+            if let Some(a) = slot.lock().await.as_mut() {
+                a.history.push(crate::llm::Message::user("hello"));
+            }
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalAsk>();
+            let mut sess = SessionState {
+                cfg: crate::config::Config::default(),
+                provider: None,
+                model: None,
+                session_name: "old-name".to_string(),
+                config_file: None,
+            };
+            let mut screen = test_screen();
+            let perm = crate::tools::Permission::default();
+            let allows = SessionAllows::default();
+            let (bg_tx, _bg_rx) = tokio::sync::mpsc::unbounded_channel::<BackgroundEvent>();
+            let new_name = format!("rename-test-{}", std::process::id());
+
+            run_command(
+                &format!("rename {new_name}"),
+                &mut screen,
+                &slot,
+                &mut sess,
+                &tx,
+                &allows,
+                &perm,
+                &bg_tx,
+            )
+            .await;
+            assert_eq!(sess.session_name, new_name);
+            assert_eq!(screen.session_name, new_name);
+            let text = screen_text(&screen);
+            assert!(text.contains("auto-save now targets"), "{text}");
+            assert!(
+                super::super::session::load(&new_name).is_ok(),
+                "conversation snapshot written"
+            );
+            let _ = super::super::session::delete(&new_name);
+
+            run_command(
+                "rename ",
+                &mut screen,
+                &slot,
+                &mut sess,
+                &tx,
+                &allows,
+                &perm,
+                &bg_tx,
+            )
+            .await;
+            assert!(
+                screen_text(&screen).contains("current session:"),
+                "bare /rename explains the current name"
+            );
+        });
+    }
+
+    #[test]
+    fn ui_choices_are_persisted_to_the_config_file() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let dir = std::env::temp_dir().join(format!("kazi-tui-ui-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("config.toml");
+            std::fs::write(
+                &path,
+                "# keep\n[providers.a]\ntype = \"openai\"\nmodel = \"m\"\n",
+            )
+            .unwrap();
+
+            let slot = Arc::new(tokio::sync::Mutex::new(Some(stub_agent())));
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalAsk>();
+            let mut sess = SessionState {
+                cfg: crate::config::Config::default(),
+                provider: None,
+                model: None,
+                session_name: "sess".to_string(),
+                config_file: Some(path.clone()),
+            };
+            let mut screen = test_screen();
+            let perm = crate::tools::Permission::default();
+            let allows = SessionAllows::default();
+            let (bg_tx, _bg_rx) = tokio::sync::mpsc::unbounded_channel::<BackgroundEvent>();
+
+            for cmd in ["theme nord", "details on"] {
+                run_command(
+                    cmd,
+                    &mut screen,
+                    &slot,
+                    &mut sess,
+                    &tx,
+                    &allows,
+                    &perm,
+                    &bg_tx,
+                )
+                .await;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.contains("# keep"), "comments survive:\n{text}");
+            assert!(text.contains("theme = \"nord\""), "{text}");
+            assert!(text.contains("details = true"), "{text}");
+            let parsed: crate::config::Config = toml::from_str(&text).unwrap();
+            assert_eq!(parsed.ui.theme.as_deref(), Some("nord"));
+            assert_eq!(parsed.ui.details, Some(true));
+            assert!(
+                screen_text(&screen).contains(" · saved"),
+                "the notice tells the user it stuck: {}",
+                screen_text(&screen)
+            );
+
+            // a session with no config file never claims to have saved
+            sess.config_file = None;
+            run_command(
+                "theme light",
+                &mut screen,
+                &slot,
+                &mut sess,
+                &tx,
+                &allows,
+                &perm,
+                &bg_tx,
+            )
+            .await;
+            assert!(!screen_text(&screen).contains("theme -> light · saved"));
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
     fn retry_returns_the_last_task() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -3461,6 +5065,7 @@ mod tests {
                 provider: None,
                 model: None,
                 session_name: "sess".to_string(),
+                config_file: None,
             };
             let mut screen = test_screen();
             screen.last_task = Some("fix the test".into());
@@ -3493,6 +5098,7 @@ mod tests {
                 base_url: None,
                 api_key_env: None,
                 models: None,
+                no_auth: None,
             },
         );
         assert_eq!(

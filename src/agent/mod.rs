@@ -50,6 +50,27 @@ fn approver(yolo: bool) -> Arc<dyn crate::tools::Approver> {
     }
 }
 
+/// The path behind one raw `@token`, with trailing punctuation stripped.
+fn ref_path(raw: &str) -> Option<&str> {
+    let path = raw.strip_prefix('@')?;
+    let path = path.trim_end_matches([',', '.', ';', ':', ')', ']', '"', '\'']);
+    (!path.is_empty()).then_some(path)
+}
+
+/// The `@path` references a task mentions, deduped and in order. The TUI shows
+/// this before the task runs so an attachment is never invisible.
+pub fn file_ref_names(task: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in task.split_whitespace() {
+        if let Some(path) = ref_path(raw) {
+            if !out.iter().any(|p| p == path) {
+                out.push(path.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Expand `@path` references in a task into attached file contents (capped at
 /// 64 KiB per file, binaries skipped, missing files reported inline). The
 /// model sees the augmented text; the transcript still shows what the user
@@ -58,15 +79,9 @@ pub fn expand_file_refs(task: &str, cwd: &std::path::Path) -> String {
     const CAP: usize = 64 * 1024;
     let mut attachments: Vec<String> = Vec::new();
     for raw in task.split_whitespace() {
-        let Some(path) = raw.strip_prefix('@') else {
+        let Some(path) = ref_path(raw) else {
             continue;
         };
-        let path = path.trim_end_matches(|c: char| {
-            matches!(c, ',' | '.' | ';' | ':' | ')' | ']' | '"' | '\'')
-        });
-        if path.is_empty() {
-            continue;
-        }
         let full = cwd.join(path);
         match std::fs::read(&full) {
             Ok(bytes) if bytes.iter().take(8192).any(|b| *b == 0) => {
@@ -1130,6 +1145,20 @@ mod tests {
 
         assert_eq!(expand_file_refs("no refs here", &d), "no refs here");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn file_ref_names_lists_dedupes_and_strips_punctuation() {
+        assert_eq!(
+            file_ref_names("compare @a.txt, @b.rs and @a.txt again"),
+            vec!["a.txt".to_string(), "b.rs".to_string()]
+        );
+        assert_eq!(
+            file_ref_names("email me at @home."),
+            vec!["home".to_string()]
+        );
+        assert!(file_ref_names("no refs here").is_empty());
+        assert!(file_ref_names("@").is_empty());
     }
 
     #[tokio::test]

@@ -369,6 +369,48 @@ impl Transcript {
             .rposition(|e| matches!(e, Entry::Tool(_)))
     }
 
+    /// The `back`-th newest tool card that carries a unified diff:
+    /// `(name, summary, diff)`. `/diff [n]` opens it in the viewer.
+    pub fn diff_card(&self, back: usize) -> Option<(String, String, String)> {
+        if back == 0 {
+            return None;
+        }
+        self.entries
+            .iter()
+            .rev()
+            .filter_map(|e| match e {
+                Entry::Tool(card) => card
+                    .diff
+                    .as_ref()
+                    .map(|d| (card.name.clone(), card.summary.clone(), d.clone())),
+                _ => None,
+            })
+            .nth(back - 1)
+    }
+
+    /// The `back`-th newest tool card's output (for `/copy tool [n]`). A card
+    /// with only a diff falls back to the patch text.
+    pub fn tool_output(&self, back: usize) -> Option<String> {
+        if back == 0 {
+            return None;
+        }
+        self.entries
+            .iter()
+            .rev()
+            .filter_map(|e| match e {
+                Entry::Tool(card) => {
+                    let text = if card.output.trim().is_empty() {
+                        card.diff.clone().unwrap_or_default()
+                    } else {
+                        card.output.clone()
+                    };
+                    (!text.trim().is_empty()).then_some(text)
+                }
+                _ => None,
+            })
+            .nth(back - 1)
+    }
+
     /// Whole transcript as plain text (tests, copy, debugging).
     pub fn plain_text(&self) -> String {
         let mut out = self
@@ -384,6 +426,47 @@ impl Transcript {
             out.push_str(&self.streaming);
         }
         out
+    }
+
+    /// Plain text of one entry, for right-click copy / actions.
+    pub fn entry_text(&self, idx: usize) -> Option<String> {
+        self.entries.get(idx).map(Entry::plain)
+    }
+
+    /// The `back`-th newest fenced code block across assistant answers (for
+    /// `/copy code [n]`). The language label is not part of the copied text.
+    pub fn code_block(&self, back: usize) -> Option<String> {
+        if back == 0 {
+            return None;
+        }
+        let mut seen = 0usize;
+        for entry in self.entries.iter().rev() {
+            let Entry::Assistant { text } = entry else {
+                continue;
+            };
+            let mut blocks = Vec::new();
+            let mut current: Option<String> = None;
+            for line in text.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("```") {
+                    if current.is_some() {
+                        blocks.push(current.take().unwrap_or_default());
+                    } else {
+                        current = Some(String::new());
+                    }
+                } else if let Some(block) = current.as_mut() {
+                    block.push_str(line);
+                    block.push('\n');
+                }
+            }
+            for block in blocks.iter().rev() {
+                seen += 1;
+                if seen == back {
+                    return Some(block.trim_end().to_string());
+                }
+            }
+        }
+        None
     }
 
     /// Case-insensitive transcript search; one hit per matching entry.
@@ -977,12 +1060,68 @@ mod tests {
     }
 
     #[test]
+    fn code_blocks_are_copied_newest_first() {
+        let mut t = Transcript::new();
+        t.push_assistant("before\n```rust\nfn a() {}\n```\nmiddle\n```python\nx = 1\n```\nafter");
+        assert_eq!(t.code_block(1).as_deref(), Some("x = 1"));
+        assert_eq!(t.code_block(2).as_deref(), Some("fn a() {}"));
+        assert!(t.code_block(3).is_none());
+
+        t.push_assistant("```\nsecond answer\n```");
+        assert_eq!(t.code_block(1).as_deref(), Some("second answer"));
+        assert_eq!(t.code_block(2).as_deref(), Some("x = 1"));
+        assert!(t.code_block(0).is_none());
+    }
+
+    #[test]
+    fn entry_text_exposes_one_row_for_copy() {
+        let mut t = Transcript::new();
+        t.push_user("question");
+        t.start_tool("a", "read_file", "src/main.rs");
+        t.finish_tool("a", "read_file", false, "file body", None, 1);
+        assert_eq!(t.entry_text(0).as_deref(), Some("question"));
+        let tool = t.entry_text(1).expect("tool entry");
+        assert!(
+            tool.contains("read_file") && tool.contains("file body"),
+            "{tool}"
+        );
+        assert!(t.entry_text(99).is_none());
+    }
+
+    #[test]
     fn last_assistant_returns_the_latest_answer() {
         let mut t = Transcript::new();
         assert!(t.last_assistant().is_none());
         t.push_assistant("one");
         t.push_assistant("two");
         assert_eq!(t.last_assistant(), Some("two"));
+    }
+
+    #[test]
+    fn copy_targets_walk_back_through_tool_cards() {
+        let mut t = Transcript::new();
+        assert!(t.tool_output(1).is_none());
+        t.start_tool("a", "run_command", "cargo test");
+        t.finish_tool("a", "run_command", false, "ok output", None, 1);
+        t.start_tool("b", "write_file", "src/x.rs");
+        t.finish_tool(
+            "b",
+            "write_file",
+            false,
+            "",
+            Some("@@ -1 +1 @@\n-a\n+b".into()),
+            1,
+        );
+
+        assert_eq!(t.tool_output(1).as_deref(), Some("@@ -1 +1 @@\n-a\n+b"));
+        assert_eq!(t.tool_output(2).as_deref(), Some("ok output"));
+        assert!(t.tool_output(3).is_none());
+        assert!(t.tool_output(0).is_none());
+        assert_eq!(
+            t.diff_card(1).map(|(n, _, _)| n).as_deref(),
+            Some("write_file")
+        );
+        assert!(t.diff_card(2).is_none());
     }
 
     #[test]

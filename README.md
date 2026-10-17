@@ -46,8 +46,9 @@ command that fixes it.
 provider = "deepseek"            # default when --provider is omitted
 
 [ui]
-theme = "dark"                   # dark | light | mono (Ctrl+T / /theme switch live)
+theme = "dark"                   # dark | light | nord | solarized | mono (Ctrl+T / /theme switch live)
 # details = true                 # start with full tool output expanded (Ctrl+O)
+# bell = true                    # ring the terminal when a task finishes
 
 [providers.deepseek]
 type = "openai"                  # any OpenAI-compatible endpoint
@@ -106,34 +107,57 @@ a log:
   glyph, duration and the tool's real output. Collapsed cards show the first
   rows; `Ctrl+O` expands everything, `Ctrl+E` the newest card, and **clicking a
   card** toggles it. `write_file`/`apply_patch` show a coloured unified diff
-  with `+added`/`−removed` counts instead of "wrote N bytes".
+  with `+added`/`−removed` counts instead of "wrote N bytes", and `/diff` opens
+  the newest patch in a full-screen, scrollable reader (`c` copies it).
 - **A header that answers questions**: permission mode, provider/model,
   session, and a context gauge with percentage that turns yellow near the
   budget and red before auto-compaction. A live spinner, elapsed seconds and
-  per-round token counts appear while a task runs.
-- **The input stays yours.** `Enter` while the agent is busy *queues* the
-  follow-up (visible in the footer) and runs it automatically when the task
-  ends. `Ctrl+J` starts a new line, the box grows to six rows, `↑/↓` walks
-  input history (or lines inside a multi-line task), and pasting a block keeps
-  it as one task.
+  per-round token counts appear while a task runs; after Esc it says
+  `cancelling…`, and the footer keeps the last task's duration.
+- **The input stays yours.** Click anywhere in the composer to put the caret
+  there; `Ctrl+Z`/`Ctrl+Y` undo and redo an editing run, `Ctrl+←/→` move by
+  word, `Ctrl+Delete`/`Ctrl+Backspace` delete one. `Enter` while the agent is
+  busy *queues* the follow-up (shown in the footer) and runs it automatically
+  when the task ends; `/queue` lists, drops or clears them. `Ctrl+J` starts a
+  new line, the box grows to six rows, `↑/↓` walks input history (or lines
+  inside a multi-line task), and pasting a block keeps it as one task.
+- **The transcript stays usable.** Scrolling up pauses follow-the-tail and the
+  footer reports `↓ N new` while output keeps arriving; `Ctrl+End` returns.
+  Right-clicking any entry copies its text.
 
 Keys: `Enter` send · `Ctrl+J` newline · `/` command dropdown · `Tab` completes
-(also `@path`) · `Ctrl+K` fuzzy command palette · `Ctrl+F` transcript search ·
-`Ctrl+R` session browser · `Ctrl+O` full tool output · `Ctrl+E` expand newest
-card · `Ctrl+T` cycle theme · `PgUp/PgDn` or the mouse wheel scroll
-(`Ctrl+Home/End` jump) · `Shift+Tab` cycles permission mode · `Esc` closes an
-overlay, clears a half-typed task, interrupts a running one, or quits from an
-empty prompt · `Ctrl+C` quits. Approval prompts take `y` (once), `a` (always
-this exact command, for the session), `n`/`Esc` (deny), or `r` to deny with a
-reason the model can act on. The mouse wheel scrolls and clicking a tool card
-opens it; hold `Shift` while dragging to select text natively.
+commands, their arguments and `@path` (a unique command also shows a dim ghost
+remainder as you type) · `Ctrl+K` fuzzy command palette · `F1`
+help overlay · `Ctrl+F` transcript search (`F3`/`Shift+F3` repeat it) ·
+`Ctrl+R` session browser (with a
+preview pane on wide terminals) · `Ctrl+O` full tool output · `Ctrl+E` expand
+newest card · `Ctrl+T` cycle theme · `Ctrl+Z/Y` undo/redo input · `Ctrl+←/→`
+word motion · `PgUp/PgDn` or the mouse wheel scroll (`Ctrl+Home/End` jump) ·
+`Shift+Tab` cycles permission mode · `Esc` closes an overlay, clears a
+half-typed task, interrupts a running one, or quits from an empty prompt ·
+`Ctrl+C` quits. Approval prompts take `y` (once), `a` (always this exact
+command, for the session), `n`/`Esc` (deny), or `r` to deny with a reason the
+model can act on; `PgUp/PgDn` scroll a long command, destructive shapes get a
+red warning line, and `/allow` shows or clears session approvals. The mouse
+wheel scrolls lists and the transcript, clicking a card/list row selects it,
+and hold `Shift` while dragging to select text natively.
 
-Slash commands: `/help` (scrollable overlay), `/new`, `/clear`, `/compact`,
-`/resume` (bare opens the session browser), `/sessions`, `/provider`, `/model`,
-`/permission`, `/yolo`, `/status`, `/context`, `/tools`, `/undo`, `/last
-[n]`, `/auth`, `/theme`, `/details`, `/export [path]`, `/copy [all]`, `/retry`,
-`/exit`. Every finished task autosaves, so quitting mid-task never costs you
-the session. `/undo` restores the files the last task changed.
+Slash commands: `/help [command]` (overlay, or one command's usage), `/new`,
+`/clear`, `/compact`,
+`/resume` (bare opens the session browser), `/sessions`, `/rename <name>`,
+`/provider`, `/model`, `/permission`, `/yolo`, `/allow [clear]`, `/status`,
+`/usage [reset]`, `/context`, `/plan`, `/tools`, `/undo`, `/last [n]`,
+`/diff [n]`, `/queue [clear|drop <n>]`, `/auth`, `/theme`, `/details`,
+`/export [path]`, `/copy [all|tool [n]|diff [n]|code [n]]`, `/retry`, `/exit`.
+Every finished task autosaves, so quitting mid-task never costs you the session;
+`/undo` restores the files the last task changed; `/rename` repoints autosave
+and keeps the old file. While a task runs, the commands that only read the
+UI/transcript (`/help`, `/theme`, `/details`, `/permission`, `/yolo`, `/allow`,
+`/plan`, `/status`, `/usage`, `/context`, `/sessions`, `/copy`, `/diff`,
+`/queue`) act immediately instead of refusing the keystroke. `/copy` and
+right-click copy use the platform clipboard tool (`clip`, `pbcopy`, `wl-copy`,
+`xclip`, `xsel`) and fall back to the terminal's OSC 52 escape over SSH (or with
+`KAZI_OSC52=1`), so a remote session can copy without extra tooling.
 
 Picking a provider or model never means typing a name from memory:
 
@@ -155,9 +179,12 @@ Picking a provider or model never means typing a name from memory:
   on a dead endpoint. First run (missing key) walks you through choosing a
   provider and model before asking for the key.
 
-Appearance: `[ui] theme` picks `dark` (default), `light` or `mono`, and
-`details = true` starts with full tool output. `Ctrl+T` and `/theme` switch
-live; `KAZI_ASCII=1` falls back to plain ASCII glyphs for limited terminals.
+Appearance: `[ui] theme` picks `dark` (default), `light`, `nord`, `solarized`
+or `mono`, and `details = true` starts with full tool output; `bell = true`
+rings the terminal when a task finishes. `Ctrl+T` and `/theme` switch live and
+write the choice back to `[ui] theme` (same for `/details`), so the next launch
+opens the way you left it; `KAZI_ASCII=1` falls back to plain ASCII glyphs for
+limited terminals.
 
 Every task run checkpoints the files it is about to modify (newest 20 kept),
 so `/undo` is a one-keystroke safety net after an aggressive edit. The report
@@ -167,8 +194,9 @@ already replayed is never applied twice — hand fixes in between stay safe.
 Permission modes: `edit` (default) gates commands behind approval, `read-only`
 refuses anything that writes, and `yolo` runs unattended. `Shift+Tab` cycles
 them and `/permission` sets them (both in the TUI); `--permission-mode`
-picks the startup one. `@file` in a task attaches a file's contents, and
-`/context` shows where the token budget goes.
+picks the startup one. `@file` in a task attaches a file's contents (the TUI
+echoes `attaching @a.rs, @b.rs` when the task starts), and `/context` shows
+where the token budget goes.
 
 Set `agent.feedback_command` (say `cargo clippy --all-targets -- -D warnings`)
 and kazi runs it after every round that changed files, feeding the output back

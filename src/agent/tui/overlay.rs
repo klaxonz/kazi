@@ -24,15 +24,22 @@ pub const KEY_BINDINGS: &[(&str, &str)] = &[
     ("Ctrl+J", "insert a newline"),
     ("/", "open the command palette"),
     ("Ctrl+K", "open the command palette"),
-    ("Tab", "complete a command or @path"),
+    ("Tab", "complete a command, argument, or @path"),
+    ("Ctrl+Z / Ctrl+Y", "undo / redo the input"),
+    ("Ctrl+← / Ctrl+→", "move by word"),
     ("Ctrl+O", "toggle full tool output"),
     ("Ctrl+F", "search the transcript"),
     ("Ctrl+R", "browse saved sessions"),
     ("Ctrl+T", "cycle the colour theme"),
     ("Ctrl+E", "expand the newest tool card"),
+    ("F1", "open this help"),
+    ("F3 / Shift+F3", "next / previous transcript search hit"),
     ("Shift+Tab", "cycle permission mode"),
     ("PgUp/PgDn", "scroll (Ctrl+Home/End jump)"),
-    ("Mouse", "wheel scrolls · click a tool card to expand it"),
+    (
+        "Mouse",
+        "wheel scrolls · click a card/list row · right-click copies",
+    ),
     ("Esc", "close overlay · interrupt a run · quit when idle"),
     ("Ctrl+C", "quit"),
     ("y / a / n", "approval: once / always this command / deny"),
@@ -245,6 +252,49 @@ pub struct Help {
     pub scroll: usize,
 }
 
+/// Full-screen unified-diff viewer (`/diff`). Owns its own scroll so a long
+/// diff never disturbs the conversation viewport.
+#[derive(Debug, Clone, Default)]
+pub struct DiffView {
+    /// `tool · path` line shown in the title.
+    pub title: String,
+    pub diff: String,
+    pub scroll: usize,
+}
+
+impl DiffView {
+    pub fn new(title: impl Into<String>, diff: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            diff: diff.into(),
+            scroll: 0,
+        }
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.diff.lines().count()
+    }
+
+    pub fn max_scroll(&self, height: usize) -> usize {
+        self.line_count().saturating_sub(height)
+    }
+
+    pub fn scroll_by(&mut self, delta: isize, height: usize) {
+        let max = self.max_scroll(height);
+        let next = (self.scroll.min(max) as isize + delta).clamp(0, max as isize);
+        self.scroll = next as usize;
+    }
+}
+
+/// A list overlay's clickable content area: the first visible row and how many
+/// rows it shows. The event loop turns a click into a cursor index.
+#[derive(Debug, Clone, Copy)]
+pub struct Hit {
+    pub area: Rect,
+    pub start: usize,
+    pub shown: usize,
+}
+
 /// Saved-session browser (`Ctrl+R`, bare `/resume`).
 #[derive(Debug, Clone, Default)]
 pub struct Sessions {
@@ -253,16 +303,36 @@ pub struct Sessions {
     pub cursor: usize,
     /// Set after the first `d`: pressing `d` again deletes the selection.
     pub confirm_delete: Option<usize>,
+    /// Rendered details for the selected session (wide terminals show it as a
+    /// preview pane; narrow ones simply don't).
+    pub preview: String,
+    preview_for: Option<String>,
 }
 
 impl Sessions {
     pub fn load() -> Self {
-        Self {
+        let mut s = Self {
             rows: session::list_summaries(),
             filter: String::new(),
             cursor: 0,
             confirm_delete: None,
+            preview: String::new(),
+            preview_for: None,
+        };
+        s.refresh_preview();
+        s
+    }
+
+    /// Load (and cache) the selected session's preview. Called whenever the
+    /// selection or the filter changes, so opening the browser never reads the
+    /// same file twice per keystroke.
+    pub fn refresh_preview(&mut self) {
+        let name = self.selected().map(|s| s.name.clone());
+        if name == self.preview_for {
+            return;
         }
+        self.preview = name.as_deref().map(session_preview).unwrap_or_default();
+        self.preview_for = name;
     }
 
     pub fn filtered(&self) -> Vec<&session::SessionSummary> {
@@ -291,6 +361,7 @@ impl Sessions {
         let cur = self.cursor.min(len - 1) as isize;
         self.cursor = (cur + delta).clamp(0, len as isize - 1) as usize;
         self.confirm_delete = None;
+        self.refresh_preview();
     }
 
     pub fn selected(&self) -> Option<&session::SessionSummary> {
@@ -301,13 +372,67 @@ impl Sessions {
         self.filter.push(c);
         self.cursor = 0;
         self.confirm_delete = None;
+        self.refresh_preview();
     }
 
     pub fn pop(&mut self) {
         self.filter.pop();
         self.cursor = 0;
         self.confirm_delete = None;
+        self.refresh_preview();
     }
+}
+
+/// A short, readable digest of a stored session: where it ran, when, and the
+/// tail of the conversation. This is what makes the browser useful when five
+/// sessions share the same generic `chat-*` name.
+fn session_preview(name: &str) -> String {
+    let Ok(file) = session::load(name) else {
+        return format!("{name}\n(stored session could not be read)");
+    };
+    let cwd = super::theme::sanitize_terminal(
+        &session::session_cwd(&file).unwrap_or_else(|| "(working directory unknown)".into()),
+    );
+    let mut out = format!(
+        "{name}\n{}\n{} messages\n",
+        clip(&cwd, 54),
+        file.messages.len()
+    );
+    let mut shown = 0usize;
+    for m in file.messages.iter().rev() {
+        if shown >= 6 {
+            break;
+        }
+        let (label, text) = match m.role {
+            crate::llm::Role::User => ("you", m.text()),
+            crate::llm::Role::Assistant => ("kazi", m.text()),
+            _ => continue,
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        out.push('\n');
+        out.push_str(label);
+        out.push_str(": ");
+        let clean = super::theme::sanitize_terminal(text);
+        for (i, line) in clean
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .take(3)
+            .enumerate()
+        {
+            if i > 0 {
+                out.push_str("\n  ");
+            }
+            out.push_str(&clip(line.trim(), 56));
+        }
+        shown += 1;
+    }
+    if shown == 0 {
+        out.push_str("\n(no user/assistant messages yet)");
+    }
+    out
 }
 
 /// Incremental transcript search (`Ctrl+F`).
@@ -345,12 +470,15 @@ pub enum Overlay {
     Palette(Palette),
     Picker(Picker),
     Help(Help),
+    Diff(DiffView),
     Sessions(Sessions),
     Search(Search),
 }
 
-/// Draw the open overlay centred over `screen`.
-pub fn draw(f: &mut Frame, screen: Rect, theme: Theme, overlay: &Overlay) {
+/// Draw the open overlay centred over `screen`. Returns the clickable list
+/// area (if the overlay is a list), so the event loop can map a mouse click to
+/// a row without duplicating layout arithmetic.
+pub fn draw(f: &mut Frame, screen: Rect, theme: Theme, overlay: &Overlay) -> Option<Hit> {
     match overlay {
         Overlay::Palette(p) => {
             let rows = p.rows();
@@ -367,7 +495,7 @@ pub fn draw(f: &mut Frame, screen: Rect, theme: Theme, overlay: &Overlay) {
                     rows.len(),
                     if rows.len() == 1 { "" } else { "es" }
                 ),
-            );
+            )
         }
         Overlay::Picker(p) => {
             let visible = p.filtered();
@@ -404,9 +532,16 @@ pub fn draw(f: &mut Frame, screen: Rect, theme: Theme, overlay: &Overlay) {
                 &rows,
                 p.cursor,
                 &footer,
-            );
+            )
         }
-        Overlay::Help(h) => draw_help(f, screen, theme, h),
+        Overlay::Help(h) => {
+            draw_help(f, screen, theme, h);
+            None
+        }
+        Overlay::Diff(d) => {
+            draw_diff(f, screen, theme, d);
+            None
+        }
         Overlay::Sessions(s) => {
             let visible = s.filtered();
             let rows: Vec<(String, String)> = visible
@@ -431,7 +566,11 @@ pub fn draw(f: &mut Frame, screen: Rect, theme: Theme, overlay: &Overlay) {
             if s.confirm_delete.is_some() {
                 footer = "press d again to DELETE this session, any other key cancels".to_string();
             }
-            draw_list(f, screen, theme, " sessions ", &rows, s.cursor, &footer);
+            if screen.width >= 100 && !s.preview.is_empty() {
+                draw_sessions(f, screen, theme, &rows, s.cursor, &footer, &s.preview)
+            } else {
+                draw_list(f, screen, theme, " sessions ", &rows, s.cursor, &footer)
+            }
         }
         Overlay::Search(s) => {
             let rows: Vec<(String, String)> = s
@@ -450,7 +589,7 @@ pub fn draw(f: &mut Frame, screen: Rect, theme: Theme, overlay: &Overlay) {
                     if rows.len() == 1 { "" } else { "es" }
                 )
             };
-            draw_list(f, screen, theme, " search ", &rows, s.cursor, &footer);
+            draw_list(f, screen, theme, " search ", &rows, s.cursor, &footer)
         }
     }
 }
@@ -463,7 +602,7 @@ fn draw_list(
     rows: &[(String, String)],
     cursor: usize,
     footer: &str,
-) {
+) -> Option<Hit> {
     let height = (rows.len() as u16 + 4).clamp(6, screen.height.saturating_sub(2).max(6));
     let rect = centred(screen, 92, height);
     clear_block(f, rect, theme, title);
@@ -503,11 +642,185 @@ fn draw_list(
             },
         );
     }
+    Some(Hit {
+        area: Rect {
+            height: visible as u16,
+            ..inner
+        },
+        start,
+        shown,
+    })
+}
+
+/// Sessions browser with a preview pane on wide terminals: the list keeps its
+/// measured width and the selected session's tail is readable without opening
+/// it first.
+#[allow(clippy::too_many_arguments)]
+fn draw_sessions(
+    f: &mut Frame,
+    screen: Rect,
+    theme: Theme,
+    rows: &[(String, String)],
+    cursor: usize,
+    footer: &str,
+    preview: &str,
+) -> Option<Hit> {
+    let height = (rows.len() as u16 + 4).clamp(10, screen.height.saturating_sub(2).max(10));
+    let rect = centred(screen, 124, height);
+    clear_block(f, rect, theme, " sessions ");
+    let inner = Rect {
+        x: rect.x + 1,
+        y: rect.y + 1,
+        width: rect.width.saturating_sub(2),
+        height: rect.height.saturating_sub(2),
+    };
+    let list_w = ((inner.width as usize * 55) / 100).max(28) as u16;
+    let list_w = list_w.min(inner.width.saturating_sub(12));
+    let [list, preview_area] = ratatui::layout::Layout::horizontal([
+        ratatui::layout::Constraint::Length(list_w),
+        ratatui::layout::Constraint::Min(10),
+    ])
+    .areas(inner);
+
+    // list pane (footer row shared at the bottom of the modal)
+    let visible = list.height.saturating_sub(1) as usize;
+    let (start, shown) = window(cursor, rows.len(), visible);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(shown);
+    for (i, (left, right)) in rows.iter().enumerate().skip(start).take(shown) {
+        lines.push(list_row(
+            left,
+            right,
+            i == cursor,
+            list.width as usize,
+            theme,
+        ));
+    }
+    if rows.is_empty() {
+        lines.push(Line::styled(
+            "  (nothing matches)",
+            Style::default().fg(theme.warn),
+        ));
+    }
+    f.render_widget(Paragraph::new(lines), list);
+
+    // preview pane, separated by a left border
+    let divider = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme.border));
+    let preview_inner = divider.inner(preview_area);
+    f.render_widget(divider, preview_area);
+    let preview_lines: Vec<Line<'static>> = preview
+        .lines()
+        .take(preview_inner.height as usize)
+        .map(|line| {
+            let style = if line.starts_with("you:") {
+                Style::default().fg(theme.user)
+            } else if line.starts_with("kazi:") {
+                Style::default().fg(theme.text)
+            } else if line.starts_with(' ') {
+                Style::default().fg(theme.dim)
+            } else {
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            };
+            Line::styled(clip(line, preview_inner.width as usize), style)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(preview_lines), preview_inner);
+
+    if inner.height > 0 {
+        f.render_widget(
+            Paragraph::new(Line::styled(
+                format!(" {}", clip(footer, inner.width as usize)),
+                Style::default().fg(theme.dim),
+            )),
+            Rect {
+                x: inner.x,
+                y: inner.bottom().saturating_sub(1),
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+    Some(Hit {
+        area: Rect {
+            height: visible as u16,
+            ..list
+        },
+        start,
+        shown,
+    })
+}
+
+/// Full-screen diff viewer: every hunk row, coloured, with a scrollbar-ish
+/// position hint in the footer.
+fn draw_diff(f: &mut Frame, screen: Rect, theme: Theme, view: &DiffView) {
+    let rect = centred(screen, 140, screen.height.saturating_sub(2).max(5));
+    let title = format!(" diff · {} ", clip(&view.title, 80));
+    clear_block(f, rect, theme, &title);
+    let inner = Rect {
+        x: rect.x + 1,
+        y: rect.y + 1,
+        width: rect.width.saturating_sub(2),
+        height: rect.height.saturating_sub(2),
+    };
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let body_h = inner.height.saturating_sub(1) as usize;
+    let total = view.line_count();
+    let off = view.scroll.min(total.saturating_sub(body_h));
+    let gutter = total.to_string().len().max(3);
+    let text_w = inner.width.saturating_sub(gutter as u16 + 2) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, line) in view.diff.lines().enumerate().skip(off).take(body_h) {
+        let mut spans = vec![
+            Span::styled(
+                format!(" {:>gutter$} ", i + 1),
+                Style::default().fg(theme.faint),
+            ),
+            Span::styled(clip(line, text_w), theme.diff_style(line)),
+        ];
+        if spans
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum::<usize>()
+            < inner.width as usize
+        {
+            spans.push(Span::raw(
+                " ".repeat(
+                    (inner.width as usize)
+                        .saturating_sub(spans.iter().map(|s| s.content.chars().count()).sum()),
+                ),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+    let end = (off + body_h).min(total);
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            format!(
+                " ↑/↓ scroll · PgUp/PgDn · Home/End · c copy · Esc close        {end}/{total} "
+            ),
+            Style::default().fg(theme.dim),
+        )),
+        Rect {
+            x: inner.x,
+            y: inner.bottom().saturating_sub(1),
+            width: inner.width,
+            height: 1,
+        },
+    );
 }
 
 fn list_row(left: &str, right: &str, selected: bool, width: usize, theme: Theme) -> Line<'static> {
     let marker = if selected { theme.glyphs.prompt } else { " " };
-    let right_w = UnicodeWidthStr::width(right);
+    // Never let metadata crowd out the name: the right column gets at most
+    // half the row and is clipped, not the identifier.
+    let right = clip(right, (width / 2).max(8));
+    let right_w = UnicodeWidthStr::width(right.as_str());
     let budget = width.saturating_sub(4).saturating_sub(right_w + 2);
     let left = clip(left, budget);
     let left_w = UnicodeWidthStr::width(left.as_str());
@@ -614,7 +927,54 @@ pub fn help_lines(theme: Theme) -> Vec<Line<'static>> {
     out
 }
 
+/// Cheap, honest risk hint for the approval prompt. It never blocks anything
+/// (the human is the gate); it just makes the dangerous shapes impossible to
+/// miss when skimming a long command.
+pub fn risk_note(summary: &str) -> Option<&'static str> {
+    let s = summary.to_ascii_lowercase();
+    const DESTRUCTIVE: &[&str] = &[
+        "rm -rf",
+        "rm -fr",
+        "rm -r ",
+        "del /f",
+        "del /s",
+        "rmdir /s",
+        "rd /s",
+        "format ",
+        "mkfs",
+        "dd if=",
+        "git reset --hard",
+        "git clean -f",
+        "git push --force",
+        "git push -f",
+        "shutdown",
+        "taskkill /f",
+        "stop-process",
+        "reg delete",
+        "drop database",
+        "truncate table",
+        "chmod -r 777",
+        "chown -r",
+        "> /dev/sd",
+    ];
+    if s.contains("| sh")
+        || s.contains("| bash")
+        || s.contains("| iex")
+        || s.contains("| powershell")
+    {
+        return Some("this pipes remote content straight into a shell");
+    }
+    if DESTRUCTIVE.iter().any(|p| s.contains(p)) {
+        return Some("this looks destructive — read the whole command before allowing it");
+    }
+    if s.contains("sudo ") || s.contains("runas ") {
+        return Some("this asks for elevated privileges");
+    }
+    None
+}
+
 /// Approval prompt. Returns nothing; the caller answers by keystroke.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_approval(
     f: &mut Frame,
     screen: Rect,
@@ -623,6 +983,7 @@ pub fn draw_approval(
     summary: &str,
     reason_mode: bool,
     reason: &str,
+    scroll: usize,
 ) {
     let cap = screen.width.max(1);
     let width = screen
@@ -630,6 +991,7 @@ pub fn draw_approval(
         .saturating_sub(4)
         .clamp(1, 110)
         .clamp(16.min(cap), cap);
+    let risk = risk_note(summary);
     // estimate wrapped body height (the box must fit the key hints)
     let inner_w = width.saturating_sub(4) as usize;
     let body_lines: usize = summary
@@ -637,7 +999,7 @@ pub fn draw_approval(
         .map(|l| UnicodeWidthStr::width(l).max(1).div_ceil(inner_w.max(1)))
         .sum::<usize>()
         .max(1);
-    let height = (body_lines as u16 + 6)
+    let height = (body_lines as u16 + 6 + u16::from(risk.is_some()))
         .min(screen.height.saturating_sub(1).max(3))
         .min(screen.height.max(1));
     let rect = Rect {
@@ -657,19 +1019,39 @@ pub fn draw_approval(
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    let body = Paragraph::new(summary)
-        .style(Style::default().fg(theme.text))
-        .wrap(Wrap { trim: false });
     let body_area = Rect {
-        height: inner.height.saturating_sub(2),
+        height: inner.height.saturating_sub(2 + u16::from(risk.is_some())),
         ..inner
     };
+    let body = Paragraph::new(summary)
+        .style(Style::default().fg(theme.text))
+        .wrap(Wrap { trim: false })
+        .scroll((
+            scroll
+                .min(body_lines.saturating_sub(body_area.height as usize))
+                .min(u16::MAX as usize) as u16,
+            0,
+        ));
     f.render_widget(body, body_area);
+
+    if let Some(note) = risk {
+        f.render_widget(
+            Paragraph::new(Line::styled(
+                format!(" ! {note}"),
+                Style::default().fg(theme.err).add_modifier(Modifier::BOLD),
+            )),
+            Rect {
+                y: inner.bottom().saturating_sub(2),
+                height: 1,
+                ..inner
+            },
+        );
+    }
 
     let hint = if reason_mode {
         format!(" reason for the model: {reason}█   · Enter send · Esc cancel")
     } else {
-        " [y] run once   [a] always this command   [n] deny   [r] deny with a reason".to_string()
+        " [y] run once   [a] always this command   [n] deny   [r] deny with a reason   · PgUp/PgDn scroll".to_string()
     };
     f.render_widget(
         Paragraph::new(Line::styled(
@@ -892,6 +1274,89 @@ mod tests {
     }
 
     #[test]
+    fn diff_view_scrolls_and_clamps() {
+        let mut d = DiffView::new("apply_patch src/x.rs", "@@ -1 +1 @@\n-old\n+new\n context");
+        assert_eq!(d.line_count(), 4);
+        assert_eq!(d.max_scroll(2), 2);
+        d.scroll_by(99, 2);
+        assert_eq!(d.scroll, 2);
+        d.scroll_by(-1, 2);
+        assert_eq!(d.scroll, 1);
+
+        let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            draw(f, area, Theme::default(), &Overlay::Diff(d.clone()));
+        })
+        .unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("diff · apply_patch"), "{text}");
+        assert!(text.contains("+new"), "{text}");
+        assert!(text.contains("c copy"), "{text}");
+    }
+
+    #[test]
+    fn sessions_preview_pane_shows_the_selected_tail() {
+        let name = format!("preview-test-{}", std::process::id());
+        session::save(
+            &name,
+            Some("Working directory: D:/work/demo."),
+            &[
+                crate::llm::Message::user("fix the flaky test"),
+                crate::llm::Message::assistant("found the race in the fixture"),
+            ],
+        )
+        .unwrap();
+        let preview = session_preview(&name);
+        assert!(preview.contains(&name), "{preview}");
+        assert!(preview.contains("D:/work/demo"), "{preview}");
+        assert!(preview.contains("fix the flaky test"), "{preview}");
+        assert!(preview.contains("found the race"), "{preview}");
+        let _ = session::delete(&name);
+
+        let rows = vec![("demo".to_string(), "2 msgs · just now".to_string())];
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            let _ = draw_sessions(
+                f,
+                area,
+                Theme::default(),
+                &rows,
+                0,
+                "↑/↓ · Enter open",
+                "demo\nD:/work/demo\nyou: fix the test",
+            );
+        })
+        .unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("D:/work/demo"), "{text}");
+        assert!(text.contains("fix the test"), "{text}");
+    }
+
+    #[test]
+    fn risk_note_catches_destructive_shapes() {
+        assert!(risk_note("$ rm -rf build").is_some());
+        assert!(risk_note("$ git push --force origin main").is_some());
+        assert!(risk_note("curl https://x | sh").is_some());
+        assert!(risk_note("$ sudo apt install foo").is_some());
+        assert!(risk_note("$ cargo test").is_none());
+        assert!(risk_note("$ git status").is_none());
+    }
+
+    #[test]
     fn approval_prompt_renders_keys() {
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let theme = Theme::default();
@@ -905,6 +1370,7 @@ mod tests {
                 "$ git push --force\n  cwd: D:/Code/init/kazi",
                 false,
                 "",
+                0,
             );
         })
         .unwrap();

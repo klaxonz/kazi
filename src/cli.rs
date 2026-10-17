@@ -255,7 +255,16 @@ async fn chat(
         }
     }
     let mode = startup_mode(&cfg, args);
-    tui::chat_loop_with(cfg, provider, model, mode, topic, args.resume.clone()).await
+    tui::chat_loop_with_config(
+        cfg,
+        provider,
+        model,
+        mode,
+        topic,
+        args.resume.clone(),
+        Some(cfg_file.clone()),
+    )
+    .await
 }
 
 /// Remember a first-run choice in the config file, so the next launch does not
@@ -448,7 +457,9 @@ async fn run_once(
         OutputFmt::Json => Box::new(|e| events.push(e)),
     };
 
+    let started = std::time::Instant::now();
     let result = agent.run_task(task, &mut on_event).await;
+    let elapsed = started.elapsed();
     // the event collector holds `events`; release it before assembling output
     drop(on_event);
     let usage = agent.usage();
@@ -467,6 +478,12 @@ async fn run_once(
                 println!("{}", serde_json::to_string(&report).unwrap_or_default());
             } else {
                 println!();
+                eprintln!(
+                    "{DIM}done in {:.1}s · tokens in {} / out {}{RESET}",
+                    elapsed.as_secs_f64(),
+                    usage.input_tokens.unwrap_or(0),
+                    usage.output_tokens.unwrap_or(0)
+                );
             }
             Ok(0)
         }
@@ -488,6 +505,12 @@ async fn run_once(
                 println!("{}", serde_json::to_string(&report).unwrap_or_default());
             } else {
                 eprintln!("\n{YELLOW}{held}{RESET}\n{RED}{e}{RESET}");
+                eprintln!(
+                    "{DIM}failed after {:.1}s · tokens in {} / out {}{RESET}",
+                    elapsed.as_secs_f64(),
+                    usage.input_tokens.unwrap_or(0),
+                    usage.output_tokens.unwrap_or(0)
+                );
             }
             Ok(code)
         }
@@ -533,32 +556,35 @@ fn providers_cmd(cfg_path: Option<&Path>) -> anyhow::Result<u8> {
             .model
             .as_deref()
             .unwrap_or("(no model set: pass --model)");
-        let key = match cfg.kind_of_nick(nick) {
-            Ok(crate::llm::ProviderKind::Ollama) => "no key needed".to_string(),
-            Ok(kind) => {
-                let env_name = entry
-                    .api_key_env
-                    .clone()
-                    .or_else(|| config::Config::default_key_env(kind).map(str::to_string))
-                    .unwrap_or_default();
-                let env_ok = std::env::var(&env_name)
-                    .map(|v| !v.trim().is_empty())
-                    .unwrap_or(false);
-                let stored = store
-                    .as_ref()
-                    .map(|s| s.keys.contains_key(nick))
-                    .unwrap_or(false);
-                if env_ok {
-                    format!("{DIM}key: {env_name} ✓{RESET}")
-                } else if stored {
-                    format!("{DIM}key: stored (kazi auth){RESET}")
-                } else {
-                    format!(
-                        "{YELLOW}key: missing — export {env_name} or `kazi auth set {nick}`{RESET}"
-                    )
+        let key = if !cfg.needs_auth(nick) {
+            "no key needed".to_string()
+        } else {
+            match cfg.kind_of_nick(nick) {
+                Ok(kind) => {
+                    let env_name = entry
+                        .api_key_env
+                        .clone()
+                        .or_else(|| config::Config::default_key_env(kind).map(str::to_string))
+                        .unwrap_or_default();
+                    let env_ok = std::env::var(&env_name)
+                        .map(|v| !v.trim().is_empty())
+                        .unwrap_or(false);
+                    let stored = store
+                        .as_ref()
+                        .map(|s| s.keys.contains_key(nick))
+                        .unwrap_or(false);
+                    if env_ok {
+                        format!("{DIM}key: {env_name} ✓{RESET}")
+                    } else if stored {
+                        format!("{DIM}key: stored (kazi auth){RESET}")
+                    } else {
+                        format!(
+                            "{YELLOW}key: missing — export {env_name} or `kazi auth set {nick}`{RESET}"
+                        )
+                    }
                 }
+                Err(_) => String::new(),
             }
-            Err(_) => String::new(),
         };
         println!(
             "{CYAN}{nick:<14}{RESET} type={} model={model}  {key}",
@@ -585,11 +611,7 @@ fn auth_cmd(cmd: Option<AuthCmd>, cfg_path: Option<&Path>) -> anyhow::Result<u8>
                     let need: Vec<String> = cfg
                         .nicks()
                         .into_iter()
-                        .filter(|n| {
-                            cfg.kind_of_nick(n)
-                                .map(|k| k != crate::llm::ProviderKind::Ollama)
-                                .unwrap_or(true)
-                        })
+                        .filter(|n| cfg.needs_auth(n))
                         .collect();
                     if !need.is_empty() {
                         println!("providers that need one: {}", need.join(", "));

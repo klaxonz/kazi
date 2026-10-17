@@ -16,14 +16,27 @@ pub enum ThemeName {
     #[default]
     Dark,
     Light,
+    Nord,
+    Solarized,
     Mono,
 }
 
 impl ThemeName {
+    /// Every theme, in `Ctrl+T` cycle order.
+    pub const ALL: [ThemeName; 5] = [
+        Self::Dark,
+        Self::Light,
+        Self::Nord,
+        Self::Solarized,
+        Self::Mono,
+    ];
+
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "dark" | "default" => Some(Self::Dark),
             "light" | "bright" => Some(Self::Light),
+            "nord" | "arctic" => Some(Self::Nord),
+            "solarized" | "solarised" | "solar" => Some(Self::Solarized),
             "mono" | "none" | "plain" => Some(Self::Mono),
             _ => None,
         }
@@ -33,17 +46,21 @@ impl ThemeName {
         match self {
             Self::Dark => "dark",
             Self::Light => "light",
+            Self::Nord => "nord",
+            Self::Solarized => "solarized",
             Self::Mono => "mono",
         }
     }
 
+    /// Every name, for `/theme` completion and error hints.
+    pub fn names() -> Vec<&'static str> {
+        Self::ALL.iter().map(|t| t.as_str()).collect()
+    }
+
     /// Next theme in the `Ctrl+T` / `/theme` cycle.
     pub fn cycle(self) -> Self {
-        match self {
-            Self::Dark => Self::Light,
-            Self::Light => Self::Mono,
-            Self::Mono => Self::Dark,
-        }
+        let idx = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
     }
 }
 
@@ -148,6 +165,8 @@ impl Theme {
         match name {
             ThemeName::Dark => Self::dark(),
             ThemeName::Light => Self::light(),
+            ThemeName::Nord => Self::nord(),
+            ThemeName::Solarized => Self::solarized(),
             ThemeName::Mono => Self::mono(),
         }
     }
@@ -221,6 +240,78 @@ impl Theme {
             comment: Color::Rgb(0x8a, 0x91, 0xa1),
             number: Color::Rgb(0x8f, 0x5f, 0x02),
             constant: Color::Rgb(0x8f, 0x5f, 0x02),
+        }
+    }
+
+    fn nord() -> Self {
+        Self {
+            name: ThemeName::Nord,
+            glyphs: UNICODE,
+            text: Color::Rgb(0xd8, 0xde, 0xe9),
+            dim: Color::Rgb(0x7b, 0x85, 0x98),
+            faint: Color::Rgb(0x61, 0x6e, 0x88),
+            accent: Color::Rgb(0x88, 0xc0, 0xd0),
+            border: Color::Rgb(0x43, 0x4c, 0x5e),
+            border_active: Color::Rgb(0x81, 0xa1, 0xc1),
+            user: Color::Rgb(0x88, 0xc0, 0xd0),
+            tool: Color::Rgb(0x8f, 0xbc, 0xbb),
+            ok: Color::Rgb(0xa3, 0xbe, 0x8c),
+            err: Color::Rgb(0xbf, 0x61, 0x6a),
+            warn: Color::Rgb(0xeb, 0xcb, 0x8b),
+            add: Color::Rgb(0xa3, 0xbe, 0x8c),
+            del: Color::Rgb(0xbf, 0x61, 0x6a),
+            code: Color::Rgb(0x8f, 0xbc, 0xbb),
+            code_bg: Color::Rgb(0x2b, 0x30, 0x3b),
+            heading: Color::Rgb(0xb4, 0x8e, 0xad),
+            link: Color::Rgb(0x88, 0xc0, 0xd0),
+            quote: Color::Rgb(0x7b, 0x85, 0x98),
+            key: Color::Rgb(0xeb, 0xcb, 0x8b),
+            sel_bg: Color::Rgb(0x3b, 0x42, 0x52),
+            sel_fg: Color::Rgb(0xec, 0xef, 0xf4),
+            header_bg: Color::Rgb(0x23, 0x28, 0x31),
+            keyword: Color::Rgb(0xb4, 0x8e, 0xad),
+            ty: Color::Rgb(0x8f, 0xbc, 0xbb),
+            func: Color::Rgb(0x88, 0xc0, 0xd0),
+            string: Color::Rgb(0xa3, 0xbe, 0x8c),
+            comment: Color::Rgb(0x61, 0x6e, 0x88),
+            number: Color::Rgb(0xd0, 0x87, 0x70),
+            constant: Color::Rgb(0xd0, 0x87, 0x70),
+        }
+    }
+
+    fn solarized() -> Self {
+        Self {
+            name: ThemeName::Solarized,
+            glyphs: UNICODE,
+            text: Color::Rgb(0x58, 0x6e, 0x75),
+            dim: Color::Rgb(0x65, 0x7b, 0x83),
+            faint: Color::Rgb(0x93, 0xa1, 0xa1),
+            accent: Color::Rgb(0x26, 0x8b, 0xd2),
+            border: Color::Rgb(0xd3, 0xcb, 0xb7),
+            border_active: Color::Rgb(0x26, 0x8b, 0xd2),
+            user: Color::Rgb(0x26, 0x8b, 0xd2),
+            tool: Color::Rgb(0x2a, 0xa1, 0x98),
+            ok: Color::Rgb(0x85, 0x99, 0x00),
+            err: Color::Rgb(0xdc, 0x32, 0x2f),
+            warn: Color::Rgb(0xb5, 0x89, 0x00),
+            add: Color::Rgb(0x85, 0x99, 0x00),
+            del: Color::Rgb(0xdc, 0x32, 0x2f),
+            code: Color::Rgb(0x2a, 0xa1, 0x98),
+            code_bg: Color::Rgb(0xee, 0xe8, 0xd5),
+            heading: Color::Rgb(0x6c, 0x71, 0xc4),
+            link: Color::Rgb(0x26, 0x8b, 0xd2),
+            quote: Color::Rgb(0x93, 0xa1, 0xa1),
+            key: Color::Rgb(0xb5, 0x89, 0x00),
+            sel_bg: Color::Rgb(0xe4, 0xdd, 0xc8),
+            sel_fg: Color::Rgb(0x07, 0x36, 0x42),
+            header_bg: Color::Rgb(0xee, 0xe8, 0xd5),
+            keyword: Color::Rgb(0x6c, 0x71, 0xc4),
+            ty: Color::Rgb(0x26, 0x8b, 0xd2),
+            func: Color::Rgb(0x26, 0x8b, 0xd2),
+            string: Color::Rgb(0x85, 0x99, 0x00),
+            comment: Color::Rgb(0x93, 0xa1, 0xa1),
+            number: Color::Rgb(0xb5, 0x89, 0x00),
+            constant: Color::Rgb(0xcb, 0x4b, 0x16),
         }
     }
 
@@ -428,10 +519,19 @@ mod tests {
     fn names_parse_and_cycle() {
         assert_eq!(ThemeName::parse("LIGHT"), Some(ThemeName::Light));
         assert_eq!(ThemeName::parse("plain"), Some(ThemeName::Mono));
+        assert_eq!(ThemeName::parse("Nord"), Some(ThemeName::Nord));
+        assert_eq!(ThemeName::parse("solarised"), Some(ThemeName::Solarized));
         assert_eq!(ThemeName::parse("neon"), None);
         assert_eq!(ThemeName::Dark.cycle(), ThemeName::Light);
-        assert_eq!(ThemeName::Light.cycle(), ThemeName::Mono);
+        // every theme is reachable by cycling and parses back to itself
+        let mut t = ThemeName::Dark;
+        for _ in 0..ThemeName::ALL.len() {
+            assert_eq!(ThemeName::parse(t.as_str()), Some(t));
+            t = t.cycle();
+        }
+        assert_eq!(t, ThemeName::Dark);
         assert_eq!(ThemeName::Mono.cycle(), ThemeName::Dark);
+        assert_eq!(ThemeName::names().len(), ThemeName::ALL.len());
     }
 
     #[test]

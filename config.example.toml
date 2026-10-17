@@ -13,8 +13,9 @@ provider = "deepseek"
 # max_parallel_tools = 4           # concurrent tool executions within a round
 
 # [ui]
-# theme = "dark"                   # dark | light | mono (the TUI's /theme switches live)
-# details = false                  # start with full tool output expanded (Ctrl+O toggles)
+# theme = "dark"                   # dark | light | nord | solarized | mono (the TUI's /theme changes this line)
+# details = false                  # start with full tool output expanded (Ctrl+O toggles; /details writes this line)
+# bell = false                     # ring the terminal when a task finishes
 
 # [mcp]
 # Local MCP (Model Context Protocol) servers; their tools join the catalog as

@@ -167,8 +167,13 @@ pub fn last_tool_text(agent: &Agent, back: usize) -> String {
 pub fn auth_report(agent: &Agent, cfg: &Config) -> String {
     let nick = agent.nick();
     let mut out = format!("auth — provider `{nick}`\n");
-    if cfg.kind_of_nick(nick).ok() == Some(crate::llm::ProviderKind::Ollama) {
-        out.push_str("  local ollama provider — no key needed\n");
+    if !cfg.needs_auth(nick) {
+        out.push_str("  local/keyless endpoint — no API key needed\n");
+        if let Some(entry) = cfg.providers.get(nick) {
+            if let Some(url) = &entry.base_url {
+                out.push_str(&format!("  endpoint: {url}\n"));
+            }
+        }
         return out;
     }
     match cfg.key_sources(nick) {
@@ -893,6 +898,18 @@ const COMMANDS: &[CmdSpec] = &[
         arg: ArgKind::Permission,
     },
     CmdSpec {
+        name: "/plan",
+        args: "",
+        help: "show the model's full todo checklist",
+        arg: ArgKind::No,
+    },
+    CmdSpec {
+        name: "/allow",
+        args: "[clear]",
+        help: "show or clear commands approved for this session",
+        arg: ArgKind::Flag,
+    },
+    CmdSpec {
         name: "/context",
         args: "",
         help: "show the estimated token distribution",
@@ -911,9 +928,27 @@ const COMMANDS: &[CmdSpec] = &[
         arg: ArgKind::No,
     },
     CmdSpec {
+        name: "/usage",
+        args: "[reset]",
+        help: "session-wide token totals (reset clears them)",
+        arg: ArgKind::Flag,
+    },
+    CmdSpec {
         name: "/last",
         args: "[n]",
         help: "show the newest tool output in full (n = how many back)",
+        arg: ArgKind::Flag,
+    },
+    CmdSpec {
+        name: "/diff",
+        args: "[n]",
+        help: "open the newest file diff in a scrollable viewer (n = older)",
+        arg: ArgKind::Flag,
+    },
+    CmdSpec {
+        name: "/queue",
+        args: "[clear|drop <n>]",
+        help: "show or edit follow-ups waiting for the running task",
         arg: ArgKind::Flag,
     },
     CmdSpec {
@@ -948,9 +983,15 @@ const COMMANDS: &[CmdSpec] = &[
     },
     CmdSpec {
         name: "/copy",
-        args: "[all]",
-        help: "copy the last answer (or the whole transcript) to the clipboard",
+        args: "[all|tool [n]|diff [n]|code [n]]",
+        help: "copy the last answer, a tool output, a diff, a code block, or everything",
         arg: ArgKind::Flag,
+    },
+    CmdSpec {
+        name: "/rename",
+        args: "<name>",
+        help: "rename the auto-save target (the old session file is kept)",
+        arg: ArgKind::Topic,
     },
     CmdSpec {
         name: "/retry",
@@ -1037,6 +1078,111 @@ pub fn command_completion(token: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Targeted help for one command (`/help theme`): usage line plus description.
+pub fn help_for(arg: &str) -> Option<String> {
+    let verb = if arg.starts_with('/') {
+        arg.to_string()
+    } else {
+        format!("/{}", arg.trim())
+    };
+    let spec = spec_of(&verb)?;
+    let usage = if spec.args.is_empty() {
+        spec.name.to_string()
+    } else {
+        format!("{} {}", spec.name, spec.args)
+    };
+    Some(format!("{usage}\n  {}", spec.help))
+}
+
+/// TAB completion for the FIRST argument of a slash command, e.g.
+/// `/permission re` → `read-only`, `/provider de` → `deepseek`,
+/// `/model de` → `deepseek/deepseek-chat`, `/resume fi` → `fix-kproxy`.
+///
+/// Returns `(replace_start_byte, candidates)` where the replacement starts at
+/// the argument token (so the caller can swap just the argument). `None` when
+/// the line is not in argument position or the command has no known values.
+pub fn arg_completions(
+    cfg: &Config,
+    line: &str,
+    current_provider: Option<&str>,
+    current_model: Option<&str>,
+) -> Option<(usize, Vec<String>)> {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let (verb, rest) = trimmed.split_once(char::is_whitespace)?;
+    let arg = rest.trim_start();
+    // Only the first argument is completed; a second word is free-form.
+    if arg.contains(char::is_whitespace) {
+        return None;
+    }
+    let prefix = arg.to_ascii_lowercase();
+    let mut candidates: Vec<String> = match verb {
+        "/provider" => cfg.nicks(),
+        "/model" => model_choices_static(cfg, current_provider, current_model),
+        "/resume" => session::list(),
+        "/permission" => ["read-only", "edit", "yolo"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        "/yolo" | "/details" => ["on", "off"].iter().map(|s| s.to_string()).collect(),
+        "/compact" => vec!["force".to_string()],
+        _ => return None,
+    };
+    candidates.retain(|c| c.to_ascii_lowercase().starts_with(&prefix));
+    candidates.sort_by_key(|c| c.to_ascii_lowercase());
+    candidates.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    if candidates.is_empty() {
+        return None;
+    }
+    let arg_start = line.len() - arg.len();
+    Some((arg_start, candidates))
+}
+
+/// The longest common prefix of a candidate list (`Tab` on `/co`-style forks
+/// extends as far as the choices agree).
+pub fn common_prefix(candidates: &[String]) -> String {
+    let Some(first) = candidates.first() else {
+        return String::new();
+    };
+    let mut prefix = first.clone();
+    for cand in &candidates[1..] {
+        let common = prefix
+            .char_indices()
+            .zip(cand.chars())
+            .take_while(|((_, a), b)| a == b)
+            .map(|((i, c), _)| i + c.len_utf8())
+            .last()
+            .unwrap_or(0);
+        prefix.truncate(common);
+    }
+    prefix
+}
+
+/// Slash commands that are safe (and useful) while a task is running: they
+/// only read the UI, the transcript, or the shared permission cell, never the
+/// agent that the running task has taken out of its slot.
+pub fn works_while_busy(verb: &str) -> bool {
+    matches!(
+        verb,
+        "/help"
+            | "/theme"
+            | "/details"
+            | "/permission"
+            | "/yolo"
+            | "/allow"
+            | "/plan"
+            | "/status"
+            | "/usage"
+            | "/context"
+            | "/sessions"
+            | "/copy"
+            | "/diff"
+            | "/queue"
+    )
 }
 
 /// The command token being typed, if the input is still in command position
@@ -1292,6 +1438,15 @@ mod tests {
     }
 
     #[test]
+    fn help_for_returns_one_command() {
+        let theme = help_for("theme").expect("known command");
+        assert!(theme.contains("/theme"), "{theme}");
+        assert!(theme.contains("colour theme"), "{theme}");
+        assert!(help_for("/resume").unwrap().contains("/resume <prefix>"));
+        assert!(help_for("/definitely-not-a-command").is_none());
+    }
+
+    #[test]
     fn usage_lines_match_args_hints() {
         assert!(usage_line(spec_of("/resume").unwrap()).contains("<prefix>"));
         assert!(usage_line(spec_of("/clear").unwrap()).contains("no argument"));
@@ -1346,6 +1501,43 @@ mod slug_tests {
         assert_eq!(command_completion("/"), None);
         // already-complete name: nothing to add
         assert_eq!(command_completion("/undo"), None);
+    }
+
+    #[test]
+    fn argument_completion_and_busy_commands() {
+        let cfg: Config = toml::from_str(
+            "[providers.deepseek]\ntype = \"openai\"\nmodel = \"deepseek-chat\"\n[providers.ollama]\ntype = \"ollama\"\nmodel = \"qwen3:14b\"",
+        )
+        .unwrap();
+
+        let (start, rows) = arg_completions(&cfg, "/permission re", None, None).expect("modes");
+        assert_eq!(&"/permission re"[start..], "re");
+        assert_eq!(rows, vec!["read-only"]);
+
+        let (_, rows) = arg_completions(&cfg, "/provider ", None, None).expect("nicks");
+        assert!(rows.contains(&"deepseek".to_string()) && rows.contains(&"ollama".to_string()));
+
+        let (_, rows) = arg_completions(&cfg, "/yolo ", None, None).expect("toggle");
+        assert_eq!(rows, vec!["off", "on"]);
+
+        // model rows stay provider-qualified, matching the picker
+        let (_, rows) = arg_completions(&cfg, "/model deep", None, None).expect("models");
+        assert!(
+            rows.iter().any(|r| r == "deepseek/deepseek-chat"),
+            "{rows:?}"
+        );
+
+        // no argument position / unknown command → not ours
+        assert!(arg_completions(&cfg, "/permission", None, None).is_none());
+        assert!(arg_completions(&cfg, "/permission read-only x", None, None).is_none());
+        assert!(arg_completions(&cfg, "/tools", None, None).is_none());
+        assert!(arg_completions(&cfg, "plain task", None, None).is_none());
+        assert_eq!(common_prefix(&["read-only".into(), "read".into()]), "read");
+
+        assert!(works_while_busy("/help"));
+        assert!(works_while_busy("/queue"));
+        assert!(!works_while_busy("/compact"));
+        assert!(!works_while_busy("/undo"));
     }
 
     #[test]
