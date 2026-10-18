@@ -25,6 +25,33 @@ explicit patent grant and NOTICE-file requirements.
 cargo install kazi
 ```
 
+Building from source on Windows with the GNU toolchain needs **one** extra thing:
+a complete MinGW-w64 on `PATH`.
+
+```text
+rustup target x86_64-pc-windows-gnu       # what most Windows setups already are
+scoop install mingw-msvcrt                # or any full MinGW-w64 build
+```
+
+Why: `rust-mingw` (the component rustup installs for the GNU target) ships `ld`,
+`dlltool` and the import libraries, but **not `as.exe`**. `dlltool` shells out to
+an assembler when it writes an import library, so linking anything that pulls in
+`windows-sys` fails with:
+
+```text
+error: error calling dlltool 'dlltool.exe': program not found
+```
+
+Pointing `PATH` at `rustlib/<target>/bin/self-contained` does not help — it has
+the same missing `as`. Expose a real MinGW-w64 `bin` directory instead (MSVCRT
+flavour pairs with the CRT `rust-mingw` links against). If your `PATH` builds
+itself from a variable like scoop's `%SCOOP_PATH%`, add the MinGW `bin`
+directory as a literal entry as well: Windows does not expand that reference
+when it composes the environment block for a new process.
+
+MSVC (`x86_64-pc-windows-msvc`) needs no MinGW, but requires the Visual Studio
+Build Tools C++ workload.
+
 ## Configure (keys stay out of the file)
 
 ```sh
@@ -114,16 +141,28 @@ a log:
   highlighted (Rust, Python, JS/TS, JSON, TOML, YAML, shell, C/C++, Go, Java,
   SQL, HTML, CSS), tables become tables, and long lines wrap by display width.
 - **Tool calls are cards.** `glob **/*.rs`, `run_command cargo test`, a status
-  glyph, duration and the tool's real output. Collapsed cards show the first
-  rows; `Ctrl+O` expands everything, `Ctrl+E` the newest card, and **clicking a
-  card** toggles it. `write_file`/`apply_patch` show a coloured unified diff
+  glyph, duration and the tool's real output. A `▸`/`▾` marker on the card's
+  first row says whether it is folded; `Ctrl+O` expands everything, `Ctrl+E`
+  the newest card, and **clicking a card** toggles it.
+  `write_file`/`apply_patch` show a coloured unified diff
   with `+added`/`−removed` counts instead of "wrote N bytes", and `/diff` opens
   the newest patch in a full-screen, scrollable reader (`c` copies it).
 - **A header that answers questions**: permission mode, provider/model,
   session, and a context gauge with percentage that turns yellow near the
   budget and red before auto-compaction. A live spinner, elapsed seconds and
   per-round token counts appear while a task runs; after Esc it says
-  `cancelling…`, and the footer keeps the last task's duration.
+  `cancelling…`, and the footer keeps the last task's duration. The bar is
+  width-aware: facts are added in priority order and the one that does not fit
+  is dropped whole rather than cut into `deeps…`; below ~84 columns the gauge
+  becomes `73% ctx`.
+- **One screen, four bands.** Header (1 row) · plan rail (1 row) · conversation
+  (the rest) · composer and footer. The model's checklist is a single rail —
+  `plan 2/4 ✓ read ✓ reproduce ❯ patch +1` — instead of one row per step, so a
+  20-row terminal still shows the conversation. Footer hints are chosen to fit
+  and never end in half a word; the right end of the footer carries only what
+  is true right now (a running job, queued follow-ups, a paused tail). A fresh
+  session opens on a welcome panel — where you are, which model, four useful
+  commands, three example tasks — instead of an empty screen.
 - **The input stays yours.** Click anywhere in the composer to put the caret
   there; `Ctrl+Z`/`Ctrl+Y` undo and redo an editing run, `Ctrl+←/→` move by
   word, `Ctrl+Delete`/`Ctrl+Backspace` delete one. `Enter` while the agent is

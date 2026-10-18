@@ -1,0 +1,20 @@
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+ ┌ diff · apply_patch src/agent/context.rs ───────────────┐ 
+ │   1 @@ -40,7 +40,7 @@                                  │ 
+ │   2 -    let n = compact(&mut msgs);                   │ 
+ │   3 +    compact(&mut msgs);                           │ 
+ │   4 +    let n = msgs.len();                           │ 
+ │   5 @@ -52,3 +52,2 @@                                  │ 
+ │   6 -    // stale                                      │ 
+ │   7  continued                                         │ 
+ │ ↑/↓ scroll · PgUp/PgDn · Home/End · c copy · Esc close │ 
+ └────────────────────────────────────────────────────────┘ 
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            

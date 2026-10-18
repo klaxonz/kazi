@@ -1,0 +1,24 @@
+                                                                                
+ ┌ commands ──────────────────────────────────────────────────────────────────┐ 
+ │ ❯ /help                                                     show this help │ 
+ │   /undo                             restore files changed by the last task │ 
+ │   /exit                         save session and leave (Ctrl+C also quits) │ 
+ │   /quit                                                    alias for /exit │ 
+ │   /new [name]     fresh session (optional name); the old one keeps on exit │ 
+ │   /clear            forget history; autosave moves to a fresh session file │ 
+ │   /compact [force]  summarize old turns away (only over budget; force = a… │ 
+ │   /resume <prefix>          load a stored session (bare opens the browser) │ 
+ │   /provider <nick|#>           switch provider (bare /provider lists them) │ 
+ │   /model <name|#>                    switch model (bare /model lists them) │ 
+ │   /yolo [on|off]                              toggle command auto-approval │ 
+ │   /permission [read-only|re…               show or set the permission mode │ 
+ │   /plan                               show the model's full todo checklist │ 
+ │   /allow [clear]          show or clear commands approved for this session │ 
+ │   /context                           show the estimated token distribution │ 
+ │   /jobs [id|kill <id>]  background jobs: list, show one's output, or stop… │ 
+ │   /tools                               list built-in tools (+ MCP servers) │ 
+ │   /mcp    MCP servers: transport, bridged tools, resources/prompts tooling │ 
+ │   /instructions  project files (KAZI.md / AGENTS.md) loaded into the syst… │ 
+ │ › _    38 matches · ↑/↓ · Enter insert · Esc close                         │ 
+ └────────────────────────────────────────────────────────────────────────────┘ 
+                                                                                

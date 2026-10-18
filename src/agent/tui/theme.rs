@@ -91,6 +91,9 @@ pub struct Glyphs {
     pub ellipsis: &'static str,
     pub bar_full: &'static str,
     pub bar_empty: &'static str,
+    /// Tool card opened / folded (the card's own affordance).
+    pub fold_open: &'static str,
+    pub fold_closed: &'static str,
 }
 
 const UNICODE: Glyphs = Glyphs {
@@ -103,6 +106,8 @@ const UNICODE: Glyphs = Glyphs {
     ellipsis: "…",
     bar_full: "█",
     bar_empty: "░",
+    fold_open: "▾",
+    fold_closed: "▸",
 };
 
 const ASCII: Glyphs = Glyphs {
@@ -115,6 +120,8 @@ const ASCII: Glyphs = Glyphs {
     ellipsis: "...",
     bar_full: "#",
     bar_empty: ".",
+    fold_open: "v",
+    fold_closed: ">",
 };
 
 /// The full palette for one theme.

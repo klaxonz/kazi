@@ -159,6 +159,12 @@ impl Transcript {
         self.entries.len()
     }
 
+    /// Nothing has happened yet: only then does the body show the welcome
+    /// panel instead of an empty column of blank rows.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.streaming.trim().is_empty()
+    }
+
     pub fn details(&self) -> bool {
         self.details.get()
     }
@@ -591,8 +597,10 @@ fn render_entry(
             out.extend(wrap_plain(text, style, width, prefix, cont));
         }
         Entry::Rule { label } => {
+            // measure the label in columns, not bytes: a rule whose label has
+            // a `·` or an em dash used to overflow the row and wrap
             let label = format!(" {label} ");
-            let side = width.saturating_sub(label.len() + 4) / 2;
+            let side = width.saturating_sub(UnicodeWidthStr::width(label.as_str()) + 4) / 2;
             let line = format!(
                 "  {}{}{}",
                 theme.glyphs.hbar.repeat(side),
@@ -646,20 +654,34 @@ fn render_tool(
             ));
         }
     }
-    if card.state != ToolState::Running {
+    // Sub-100ms tools (most reads) would otherwise stamp "· 0.0s" on every
+    // card: a duration that measures nothing is noise.
+    if card.state != ToolState::Running && card.elapsed_ms >= 100 {
         head.push(Span::styled(
-            format!("  {:.1}s", card.elapsed_ms as f64 / 1000.0),
+            format!(" · {:.1}s", card.elapsed_ms as f64 / 1000.0),
             Style::default().fg(theme.faint),
         ));
     }
-    if !card.expanded
-        && card.state != ToolState::Running
-        && (card.diff.is_some() || !card.output.is_empty())
-    {
-        head.push(Span::styled(
-            "  (click to expand)",
-            Style::default().fg(theme.faint),
-        ));
+    // The fold marker comes first: it is the card's affordance, and a repeated
+    // "(click to expand)" at the end of every line is noise on a narrow
+    // terminal (it is cut off anyway) and redundant next to the marker.
+    let expandable =
+        card.state != ToolState::Running && (card.diff.is_some() || !card.output.is_empty());
+    if expandable {
+        head.insert(
+            2,
+            Span::styled(
+                format!(
+                    "{} ",
+                    if card.expanded {
+                        theme.glyphs.fold_open
+                    } else {
+                        theme.glyphs.fold_closed
+                    }
+                ),
+                Style::default().fg(theme.faint),
+            ),
+        );
     }
     out.push(Line::from(clip_spans(head, width)));
 
@@ -719,7 +741,7 @@ fn render_tool(
 
 fn more_rows(rest: usize, theme: Theme, width: usize) -> Line<'static> {
     let text = format!(
-        "  {} {} more line{} · ctrl+o for details",
+        "  {} {} more line{} · Ctrl+O or click to open",
         theme.glyphs.ellipsis,
         rest,
         if rest == 1 { "" } else { "s" }
@@ -829,7 +851,7 @@ fn spans_width(spans: &[Span<'static>]) -> usize {
 }
 
 /// Trim a span list to `width` display columns, adding `…` when clipped.
-fn clip_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+pub(super) fn clip_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
     let mut out = Vec::with_capacity(spans.len());
     let mut used = 0usize;
     for span in spans {
@@ -953,7 +975,9 @@ mod tests {
             let r = t.rendered(theme, 80);
             text_of(&r.lines).clone()
         };
-        assert!(collapsed.contains("more lines · ctrl+o"));
+        assert!(collapsed.contains("more lines · Ctrl+O"));
+        // the fold marker is the card's affordance, drawn before the tool name
+        assert!(collapsed.contains("▸ run_command"), "{collapsed}");
         assert!(!collapsed.contains("line 30"));
         let idx = t.entries.len() - 1;
         assert_eq!(t.toggle_entry(idx), Some(true));

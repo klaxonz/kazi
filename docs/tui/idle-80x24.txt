@@ -1,0 +1,24 @@
+ kazi  edit · deepseek/deepseek-chat · fix-flaky-test                 14% ctx   
+  ❯ type a task in your own words and press Enter                               
+                                                                                
+  • D:/Code/init/kazi  deepseek/deepseek-chat                                   
+                                                                                
+  /model      pick a provider and model together                                
+  /sessions   reopen an earlier conversation                                    
+  /permission decide what kazi may do                                           
+  /help       every key and command                                             
+                                                                                
+  try: explain src/main.rs · fix the failing test · run the test suite          
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+┌ / command ───────────────────────────────────────────────────────────────────┐
+│❯ ask kazi to change code, run a command, or explain something…               │
+└──────────────────────────────────────────────────────────────────────────────┘
+ Enter send  / commands  Ctrl+K palette  Ctrl+R sessions  Ctrl+O details        

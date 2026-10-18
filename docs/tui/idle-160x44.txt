@@ -1,0 +1,44 @@
+ kazi  edit · deepseek/deepseek-chat · https://api.deepseek.com/v1 · fix-flaky-test · D:/Code/init/kazi                              █░░░░░░░  14% 8.4k / 60k   
+  ❯ type a task in your own words and press Enter                                                                                                               
+                                                                                                                                                                
+  • D:/Code/init/kazi  deepseek/deepseek-chat                                                                                                                   
+                                                                                                                                                                
+  /model      pick a provider and model together                                                                                                                
+  /sessions   reopen an earlier conversation                                                                                                                    
+  /permission decide what kazi may do                                                                                                                           
+  /help       every key and command                                                                                                                             
+                                                                                                                                                                
+  try: explain src/main.rs · fix the failing test · run the test suite                                                                                          
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+┌ / command ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│❯ ask kazi to change code, run a command, or explain something…                                                                                               │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ Enter send  / commands  Ctrl+K palette  Ctrl+R sessions  Ctrl+O details  Ctrl+F find  F1 help  Esc quit                                                        

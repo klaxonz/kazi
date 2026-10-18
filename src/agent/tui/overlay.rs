@@ -632,6 +632,15 @@ pub enum Overlay {
 /// area (if the overlay is a list), so the event loop can map a mouse click to
 /// a row without duplicating layout arithmetic.
 pub fn draw(f: &mut Frame, screen: Rect, theme: Theme, overlay: &Overlay) -> Option<Hit> {
+    // Blank the frame before the modal: a modal is a place, not a sticker.
+    // Without this the transcript showed through every gap — most visibly in
+    // the one-column margin around a centred box, where a stray letter from
+    // the conversation sat next to the border.
+    f.render_widget(Clear, screen);
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.header_bg)),
+        screen,
+    );
     match overlay {
         Overlay::Palette(p) => {
             let rows = p.rows();
@@ -913,7 +922,19 @@ fn draw_sessions(
 /// Full-screen diff viewer: every hunk row, coloured, with a scrollbar-ish
 /// position hint in the footer.
 fn draw_diff(f: &mut Frame, screen: Rect, theme: Theme, view: &DiffView) {
-    let rect = centred(screen, 140, screen.height.saturating_sub(2).max(5));
+    // Hug the content (+ footer + borders) instead of stretching to the
+    // bottom: a seven-line patch in a full-height box is mostly empty, and an
+    // empty box reads as "still loading". Keep a floor so a long patch does
+    // not open in a three-line window.
+    let body = (view.line_count() as u16).saturating_add(3);
+    let rect = centred(
+        screen,
+        140,
+        // min <= max is not guaranteed on a tiny terminal: clamp against
+        // whichever bound is actually smaller.
+        body.min(screen.height.saturating_sub(2).max(5))
+            .max(9.min(screen.height)),
+    );
     let title = format!(" diff · {} ", clip(&view.title, 80));
     clear_block(f, rect, theme, &title);
     let inner = Rect {
@@ -974,12 +995,21 @@ fn draw_diff(f: &mut Frame, screen: Rect, theme: Theme, view: &DiffView) {
 
 fn list_row(left: &str, right: &str, selected: bool, width: usize, theme: Theme) -> Line<'static> {
     let marker = if selected { theme.glyphs.prompt } else { " " };
-    // Never let metadata crowd out the name: the right column gets at most
-    // half the row and is clipped, not the identifier.
-    let right = clip(right, (width / 2).max(8));
+    // Two columns, split by need rather than by halves: the name gets what
+    // it needs up to 45% of the row, and the description gets the rest. When
+    // the remainder is too narrow to say anything it is dropped — a "…"
+    // column next to every row is worse than no column.
+    let chrome = 4;
+    let name_cap = ((width.saturating_sub(chrome)) * 45 / 100).clamp(10, 26);
+    let left = clip(left, name_cap);
+    let left_w = UnicodeWidthStr::width(left.as_str());
+    let room = width.saturating_sub(chrome + left_w + 2);
+    let right = if room < 12 {
+        String::new()
+    } else {
+        clip(right, room)
+    };
     let right_w = UnicodeWidthStr::width(right.as_str());
-    let budget = width.saturating_sub(4).saturating_sub(right_w + 2);
-    let left = clip(left, budget);
     let left_w = UnicodeWidthStr::width(left.as_str());
     let mut spans: Vec<Span<'static>> = vec![
         Span::styled(
@@ -1034,17 +1064,84 @@ fn draw_help(f: &mut Frame, screen: Rect, theme: Theme, help: &Help) {
     };
     let mut body = help_lines(theme);
     body.extend(help.extra.iter().cloned());
+    // Wrap here rather than in `Paragraph`: a wrapped description must hang
+    // under its own column (a continuation starting at the border reads as a
+    // different command), and the scroll bound has to count real rows —
+    // otherwise the last screenful is unreachable.
+    let body = wrap_help(body, inner.width as usize);
     let max = body.len().saturating_sub(inner.height as usize);
     let off = help.scroll.min(max);
     let visible: Vec<Line<'static>> = body.into_iter().skip(off).collect();
-    f.render_widget(
-        Paragraph::new(visible)
-            .wrap(Wrap { trim: false })
-            .scroll((0, 0)),
-        inner,
-    );
+    f.render_widget(Paragraph::new(visible), inner);
 }
 
+/// Wrap help rows to `width` columns with a hanging indent, so a long command
+/// description continues under the description column instead of under the
+/// border (where it reads as a different command). `Paragraph` cannot do this:
+/// it wraps at column 0, and its scroll bound counts unwrapped rows, which
+/// makes the last screenful of help unreachable.
+fn wrap_help(rows: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return rows;
+    }
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let total: usize = row
+            .spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        if total <= width || row.spans.is_empty() {
+            out.push(row);
+            continue;
+        }
+        // The first span is the name column (already padded); the rest is
+        // prose. Keep at least a dozen columns for the prose.
+        let indent = UnicodeWidthStr::width(row.spans[0].content.as_ref())
+            .min(width.saturating_sub(12))
+            .max(2);
+        let head = row.spans[0].content.trim_end().to_string();
+        let mut words: Vec<(String, Style)> = Vec::new();
+        let mut word = String::new();
+        let mut style = Style::default();
+        for span in row.spans.iter().skip(1) {
+            for ch in span.content.chars() {
+                if ch.is_whitespace() {
+                    if !word.is_empty() {
+                        words.push((std::mem::take(&mut word), style));
+                    }
+                } else {
+                    if word.is_empty() {
+                        style = span.style;
+                    }
+                    word.push(ch);
+                }
+            }
+        }
+        if !word.is_empty() {
+            words.push((word, style));
+        }
+        let mut cur: Vec<Span<'static>> =
+            vec![Span::styled(format!("{head:<indent$}"), row.spans[0].style)];
+        let mut used = indent;
+        for (word, style) in words {
+            let w = UnicodeWidthStr::width(word.as_str());
+            if used > indent && used + 1 + w > width {
+                out.push(Line::from(std::mem::take(&mut cur)));
+                cur.push(Span::raw(" ".repeat(indent)));
+                used = indent;
+            }
+            if used > indent {
+                cur.push(Span::raw(" "));
+                used += 1;
+            }
+            cur.push(Span::styled(word, style));
+            used += w;
+        }
+        out.push(Line::from(cur));
+    }
+    out
+}
 /// Everything the help overlay prints (commands + key bindings + notes).
 pub fn help_lines(theme: Theme) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
@@ -1160,6 +1257,12 @@ pub fn draw_approval(f: &mut Frame, screen: Rect, theme: Theme, view: ApprovalVi
         reason,
         scroll,
     } = view;
+    // the prompt takes the screen: see `draw`, the same reason applies here
+    f.render_widget(Clear, screen);
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.header_bg)),
+        screen,
+    );
     let cap = screen.width.max(1);
     let width = screen
         .width
@@ -1174,7 +1277,9 @@ pub fn draw_approval(f: &mut Frame, screen: Rect, theme: Theme, view: ApprovalVi
         .map(|l| UnicodeWidthStr::width(l).max(1).div_ceil(inner_w.max(1)))
         .sum::<usize>()
         .max(1);
-    let height = (body_lines as u16 + 6 + u16::from(risk.is_some()))
+    // borders (2) + the command body + the risk note + the key hint: any
+    // more is dead space inside a modal that is asking a yes/no question
+    let height = (body_lines as u16 + 3 + u16::from(risk.is_some()))
         .min(screen.height.saturating_sub(1).max(3))
         .min(screen.height.max(1));
     let rect = Rect {
@@ -1184,6 +1289,10 @@ pub fn draw_approval(f: &mut Frame, screen: Rect, theme: Theme, view: ApprovalVi
         height,
     };
     f.render_widget(Clear, rect);
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.header_bg)),
+        rect,
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.warn))
@@ -1219,7 +1328,7 @@ pub fn draw_approval(f: &mut Frame, screen: Rect, theme: Theme, view: ApprovalVi
     if let Some(note) = risk {
         f.render_widget(
             Paragraph::new(Line::styled(
-                format!(" ! {note}"),
+                clip(&format!(" ! {note}"), inner.width as usize),
                 Style::default().fg(theme.err).add_modifier(Modifier::BOLD),
             )),
             Rect {
@@ -1230,10 +1339,17 @@ pub fn draw_approval(f: &mut Frame, screen: Rect, theme: Theme, view: ApprovalVi
         );
     }
 
+    // keys that fit: the full sentence is cut mid-word on a 60-column
+    // terminal, which hides the one key the user is looking for
     let hint = if reason_mode {
-        format!(" reason for the model: {reason}█   · Enter send · Esc cancel")
+        clip(
+            &format!(" reason for the model: {reason}█   · Enter send · Esc cancel"),
+            inner.width as usize,
+        )
+    } else if inner.width >= 78 {
+        " [y] run   [a] always   [n] deny   [r] reason   · PgUp/PgDn scroll".to_string()
     } else {
-        " [y] run once   [a] always this command   [n] deny   [r] deny with a reason   · PgUp/PgDn scroll".to_string()
+        " [y] run   [a] always   [n] deny   [r] reason".to_string()
     };
     f.render_widget(
         Paragraph::new(Line::styled(
@@ -1271,7 +1387,13 @@ fn centred(screen: Rect, max_width: u16, height: u16) -> Rect {
 }
 
 fn clear_block(f: &mut Frame, rect: Rect, theme: Theme, title: &str) {
+    // `Clear` resets the cells but leaves the frame's default background, so
+    // the transcript behind a modal showed through every blank cell.
     f.render_widget(Clear, rect);
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.header_bg)),
+        rect,
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border_active))
@@ -1574,6 +1696,10 @@ mod tests {
         assert!(text.contains("sub-agent"), "{text}");
         assert!(text.contains("#3"), "{text}");
         assert!(text.contains("2 waiting"), "{text}");
-        assert!(text.contains("[y] run once"));
+        // the hint adapts to the width; the keys themselves never move
+        assert!(text.contains("[y] run"), "{text}");
+        assert!(text.contains("[a] always"), "{text}");
+        assert!(text.contains("[n] deny"), "{text}");
+        assert!(text.contains("[r] reason"), "{text}");
     }
 }

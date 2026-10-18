@@ -1,0 +1,20 @@
+                                                            
+                                                            
+ ┌ help ──────────────────────────────────────────────────┐ 
+ │ commands                                               │ 
+ │  /help                      show this help             │ 
+ │  /undo                     restore files changed by the│ 
+ │                            last task                   │ 
+ │  /exit                     save session and leave      │ 
+ │                            (Ctrl+C also quits)         │ 
+ │  /quit                      alias for /exit            │ 
+ │  /new [name]               fresh session (optional     │ 
+ │                            name); the old one keeps on │ 
+ │                            exit                        │ 
+ │  /clear                    forget history; autosave    │ 
+ │                            moves to a fresh session    │ 
+ │                            file                        │ 
+ │  /compact [force]          summarize old turns away    │ 
+ └────────────────────────────────────────────────────────┘ 
+                                                            
+                                                            

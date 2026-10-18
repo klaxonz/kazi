@@ -11,14 +11,20 @@ categories = ["command-line-utilities"]
 readme = "README.md"
 # crates.io upload whitelist (include_str! reads config.example.toml at build)
 include = [
-    "src/**/*",
-    "Cargo.toml",
-    "LICENSE-MIT",
-    "LICENSE-APACHE",
-    "README.md",
-    "CHANGELOG.md",
-    "docs/**/*",
-    "config.example.toml",
+    # Anchored with a leading "/": these are gitignore-style patterns, so a
+    # bare "README.md" would also match docs/tui/README.md.
+    "/src/**/*",
+    "/Cargo.toml",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+    "/README.md",
+    "/CHANGELOG.md",
+    # prose docs ship; the rendered TUI snapshots under docs/tui stay in the
+    # repository (review aids, not crate contents)
+    "/docs/VERSIONING.md",
+    "/docs/architecture.md",
+    "/docs/roadmap.md",
+    "/config.example.toml",
 ]
 
 [lib]

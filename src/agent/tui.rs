@@ -26,6 +26,7 @@ use std::collections::VecDeque;
 use std::io::{Stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use transcript::clip_spans;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use anyhow::Context as _;
@@ -1472,19 +1473,19 @@ impl Screen {
         if area.width < 12 || area.height < 4 {
             return;
         }
-        let mut plan_rows = if self.todos.is_empty() {
-            0
-        } else {
-            (self.todos.len().min(5) + 1) as u16
-        };
+        // The plan is one rail row; the conversation is whatever is left.
+        let mut plan_rows = u16::from(!self.todos.is_empty());
         let mut input_rows = self.input_rows(area.width);
         let mut footer_rows = 1u16;
-        while 1 + plan_rows + 1 + input_rows + footer_rows > area.height {
-            if plan_rows > 0 {
-                plan_rows -= 1;
-            } else if footer_rows > 0 {
+        // Priority when the terminal is too short: keep the input box usable
+        // (it is the one thing the user is typing into) and drop the footer
+        // hints, then the plan rail, before taking rows from the composer.
+        while 2 + plan_rows + input_rows + footer_rows > area.height {
+            if footer_rows > 0 {
                 footer_rows = 0;
-            } else if input_rows > 1 {
+            } else if plan_rows > 0 {
+                plan_rows = 0;
+            } else if input_rows > 3 {
                 input_rows -= 1;
             } else {
                 break;
@@ -1536,19 +1537,114 @@ impl Screen {
         }
     }
 
+    /// The welcome panel: shown only while the session has no conversation.
+    /// It is deliberately a *panel*, not a wall of centred art — it sits in
+    /// the normal left margin, wraps at any width, and disappears the moment
+    /// the first task is sent, so it never competes with the transcript.
+    fn draw_welcome(&self, f: &mut Frame, area: Rect) {
+        let theme = self.theme;
+        if area.height < 6 || area.width < 24 {
+            return;
+        }
+        let width = (area.width as usize).saturating_sub(2);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {} ", theme.glyphs.prompt),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                clip(
+                    "type a task in your own words and press Enter",
+                    width.saturating_sub(6),
+                ),
+                Style::default().fg(theme.text),
+            ),
+        ]));
+        lines.push(Line::default());
+        // where it points: the directory, then the model — never the endpoint
+        // (a URL that has to be truncated tells nobody anything)
+        let model = self
+            .provider_desc
+            .split(" · ")
+            .next()
+            .unwrap_or(&self.provider_desc);
+        let mut where_ = vec![Span::styled(
+            format!("  {} ", theme.glyphs.bullet),
+            Style::default().fg(theme.faint),
+        )];
+        where_.push(Span::styled(
+            clip(&self.cwd, (width / 2).max(12)),
+            Style::default().fg(theme.dim),
+        ));
+        if width > 44 {
+            where_.push(Span::styled(
+                format!("  {}", clip(model, width / 2)),
+                Style::default().fg(theme.faint),
+            ));
+        }
+        lines.push(Line::from(where_));
+        lines.push(Line::default());
+        for (cmd, what) in [
+            ("/model", "pick a provider and model together"),
+            ("/sessions", "reopen an earlier conversation"),
+            ("/permission", "decide what kazi may do"),
+            ("/help", "every key and command"),
+        ] {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {cmd:<12}"), theme.key_style()),
+                Span::styled(
+                    clip(what, width.saturating_sub(16)),
+                    Style::default().fg(theme.dim),
+                ),
+            ]));
+        }
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            clip(
+                "  try: explain src/main.rs · fix the failing test · run the test suite",
+                width,
+            ),
+            Style::default().fg(theme.faint),
+        ));
+        let visible = lines.len().min(area.height as usize);
+        let rect = Rect {
+            height: visible as u16,
+            ..area
+        };
+        f.render_widget(
+            Paragraph::new(lines.into_iter().take(visible).collect::<Vec<_>>()),
+            rect,
+        );
+    }
+    /// The top bar answers four questions in priority order: what this is,
+    /// what it may do, where it is pointed, how much context is left. When the
+    /// terminal is narrow the least useful fact is dropped whole — the header
+    /// never truncates a fact into gibberish.
     fn draw_header(&self, f: &mut Frame, area: Rect) {
         let theme = self.theme;
         f.render_widget(
             Block::default().style(Style::default().bg(theme.header_bg)),
             area,
         );
-        let right = self.header_right();
-        let right_w = spans_width(&right)
-            .min(area.width.saturating_sub(8) as usize)
-            .max(1) as u16;
+        // measure the right cluster first: the activity readout is what the
+        // eye checks while a task runs, so the left side gives up room.
+        let right = self.header_right(area.width);
+        let right_w = (spans_width(&right) as u16)
+            .min(area.width.saturating_sub(12))
+            .max(1);
+        let left_w = area.width.saturating_sub(right_w).saturating_sub(1) as usize;
         let [left_area, right_area] =
-            Layout::horizontal([Constraint::Min(10), Constraint::Length(right_w.max(1))])
-                .areas(area);
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(right_w)]).areas(area);
+        // paint the left panel's own background first: a Paragraph only styles
+        // the cells it writes, so without this the header's two halves would
+        // sit on different backgrounds wherever the left text ends early.
+        f.render_widget(
+            Block::default().style(Style::default().bg(theme.header_bg)),
+            left_area,
+        );
 
         let badge = if theme.name == ThemeName::Mono {
             Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
@@ -1564,30 +1660,64 @@ impl Screen {
             PermissionMode::Edit => Style::default().fg(theme.dim),
             PermissionMode::Yolo => Style::default().fg(theme.err).add_modifier(Modifier::BOLD),
         };
-        let prov = clip(
-            &self.provider_desc,
-            (left_area.width as usize).saturating_sub(38),
-        );
         let mut spans = vec![
             Span::styled(" kazi ", badge),
-            Span::styled(format!(" [{}]", self.mode.as_str()), mode_style),
-            Span::styled(format!("  {prov}"), Style::default().fg(theme.dim)),
+            Span::styled(format!(" {}", self.mode.as_str()), mode_style),
         ];
+        let mut used = spans_width(&spans);
+        // Each detail is all-or-nothing: if it does not fit in the room that
+        // is left it is skipped entirely rather than cut in half.
+        // Provider: the model is the fact that matters, the endpoint is a
+        // footnote. Show the model whole or not at all, and append the
+        // endpoint only when it fits whole too — never a "https://api.dee…"
+        // stub, which is what made a narrow header look broken.
+        let (model, endpoint) = match self.provider_desc.split_once(" · ") {
+            Some((m, e)) => (m, Some(e)),
+            None => (self.provider_desc.as_str(), None),
+        };
+        let model_w = UnicodeWidthStr::width(model);
+        if used + model_w + 3 <= left_w {
+            used += model_w + 3;
+            spans.push(Span::styled(
+                format!(" · {model}"),
+                Style::default().fg(theme.dim),
+            ));
+            if let Some(endpoint) = endpoint {
+                let need = UnicodeWidthStr::width(endpoint) + 3;
+                if used + need + 24 < left_w {
+                    used += need;
+                    spans.push(Span::styled(
+                        format!(" · {endpoint}"),
+                        Style::default().fg(theme.faint),
+                    ));
+                }
+            }
+        }
         // effort badge: without it the same model can answer very differently
         // after a /effort and nothing on screen says so
-        if !self.preset.is_empty() && self.preset != "balanced" {
+        if !self.preset.is_empty() && self.preset != "balanced" && used + 12 <= left_w {
+            let preset = clip(&self.preset, 10);
+            used += UnicodeWidthStr::width(preset.as_str()) + 3;
             spans.push(Span::styled(
-                format!("· {}", clip(&self.preset, 12)),
+                format!(" · {preset}"),
                 Style::default().fg(theme.warn),
             ));
         }
-        spans.push(Span::styled(
-            format!("  {}", clip(&self.session_name, 24)),
-            Style::default().fg(theme.accent),
-        ));
-        if left_area.width > 100 {
+        // The session name is all-or-nothing too: a half-spelled name is not
+        // a shorter name, it is a different (wrong) one.
+        let session = &self.session_name;
+        let session_w = UnicodeWidthStr::width(session.as_str());
+        if used + session_w + 3 <= left_w {
+            used += session_w + 3;
             spans.push(Span::styled(
-                format!("  {}", clip(&self.cwd, 30)),
+                format!(" · {session}"),
+                Style::default().fg(theme.accent),
+            ));
+        }
+        // the working directory only earns a slot when there is room to spare
+        if left_w > used + 36 {
+            spans.push(Span::styled(
+                format!(" · {}", clip(&self.cwd, 30)),
                 Style::default().fg(theme.faint),
             ));
         }
@@ -1603,120 +1733,152 @@ impl Screen {
         );
     }
 
-    fn header_right(&self) -> Vec<Span<'static>> {
+    /// The header's right cluster: context gauge, then (while running) the
+    /// activity readout. Every piece has a narrow fallback, so the bar keeps
+    /// its shape down to tiny terminals instead of overprinting itself.
+    fn header_right(&self, width: u16) -> Vec<Span<'static>> {
         let theme = self.theme;
         let mut spans = Vec::new();
-        // context gauge
         let pct = self
             .est_tokens
             .saturating_mul(100)
             .checked_div(self.max_context)
             .unwrap_or(0);
-        let cells = 8usize;
-        let filled = ((pct as usize) * cells / 100).min(cells);
-        let gauge = format!(
-            "{}{}",
-            theme.glyphs.bar_full.repeat(filled),
-            theme.glyphs.bar_empty.repeat(cells - filled)
-        );
-        spans.push(Span::styled(
-            format!("{} {:>3}% ", gauge, pct),
-            Style::default().fg(theme.usage_color(self.est_tokens, self.max_context)),
-        ));
-        spans.push(Span::styled(
-            format!(
-                "{} / {}  ",
-                compact_tokens(self.est_tokens),
-                compact_tokens(self.max_context)
-            ),
-            Style::default().fg(theme.dim),
-        ));
-        if !self.busy {
-            if let Some(d) = self.last_elapsed.get() {
-                spans.push(Span::styled(
-                    format!("last {:.1}s  ", d.as_secs_f64()),
-                    Style::default().fg(theme.faint),
-                ));
-            }
+        let usage = Style::default().fg(theme.usage_color(self.est_tokens, self.max_context));
+        if width >= 84 {
+            // the gauge is scanned peripherally; the number is the fallback
+            let cells = if width >= 110 { 8 } else { 5 };
+            let filled = ((pct as usize) * cells / 100).min(cells);
+            spans.push(Span::styled(
+                format!(
+                    "{}{} {pct:>3}%",
+                    theme.glyphs.bar_full.repeat(filled),
+                    theme.glyphs.bar_empty.repeat(cells - filled)
+                ),
+                usage,
+            ));
+        } else {
+            spans.push(Span::styled(format!("{pct:>3}% ctx"), usage));
         }
+        if width >= 100 {
+            spans.push(Span::styled(
+                format!(
+                    " {} / {}",
+                    compact_tokens(self.est_tokens),
+                    compact_tokens(self.max_context)
+                ),
+                Style::default().fg(theme.faint),
+            ));
+        }
+        spans.push(Span::raw("  "));
         if self.busy {
             let secs = self
                 .started
                 .get()
                 .map(|t| t.elapsed().as_secs())
                 .unwrap_or(0);
-            let activity = if self.cancelling {
-                format!("{} cancelling…  ", theme.spinner(self.spinner.get()))
-            } else {
-                format!(
-                    "{} {}s  r{}/{}  ",
-                    theme.spinner(self.spinner.get()),
-                    secs,
-                    self.rounds,
-                    self.max_rounds
-                )
-            };
-            spans.push(Span::styled(activity, Style::default().fg(theme.accent)));
-            spans.push(Span::styled(
-                format!("↑{} ↓{} ", self.tokens_in, self.tokens_out),
-                Style::default().fg(theme.faint),
-            ));
-            if let Some(cost) = self.task_cost {
+            if self.cancelling {
                 spans.push(Span::styled(
-                    format!("{} ", super::console::money(cost)),
+                    format!("{} cancelling…", theme.spinner(self.spinner.get())),
+                    Style::default().fg(theme.warn),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    format!("{} {secs}s", theme.spinner(self.spinner.get())),
+                    Style::default().fg(theme.accent),
+                ));
+            }
+            if width >= 80 {
+                spans.push(Span::styled(
+                    format!(" · r{}/{}", self.rounds, self.max_rounds),
+                    Style::default().fg(theme.dim),
+                ));
+            }
+            if width >= 96 {
+                spans.push(Span::styled(
+                    format!(" · ↑{} ↓{}", self.tokens_in, self.tokens_out),
+                    Style::default().fg(theme.faint),
+                ));
+            }
+            if let Some(cost) = self.task_cost {
+                if width >= 96 {
+                    spans.push(Span::styled(
+                        format!(" · {}", super::console::money(cost)),
+                        Style::default().fg(theme.faint),
+                    ));
+                }
+            }
+        } else if let Some(d) = self.last_elapsed.get() {
+            if width >= 108 {
+                spans.push(Span::styled(
+                    format!("last {:.1}s", d.as_secs_f64()),
                     Style::default().fg(theme.faint),
                 ));
             }
         }
+        spans.push(Span::raw(" "));
         spans
     }
 
+    /// The model's plan on ONE row: a glyph per step, the step's text, and an
+    /// overflow count. A plan is context, not a report — it must never grow to
+    /// push the conversation itself off the screen, which is what a row per
+    /// step did on a 20-row terminal.
     fn draw_plan(&self, f: &mut Frame, area: Rect) {
-        if area.height == 0 {
+        if area.height == 0 || self.todos.is_empty() {
             return;
         }
         let theme = self.theme;
-        let mut lines = vec![Line::from(vec![
-            Span::styled(
-                " plan",
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(
-                    "  {}/{} done",
-                    self.todos.iter().filter(|(_, s)| s == "completed").count(),
-                    self.todos.len()
-                ),
-                Style::default().fg(theme.faint),
-            ),
-        ])];
-        for (content, status) in self.todos.iter().take(5) {
-            let (marker, style) = match status.as_str() {
-                "completed" => (
-                    "[x]",
-                    Style::default()
-                        .fg(theme.ok)
-                        .add_modifier(Modifier::CROSSED_OUT),
-                ),
-                "in_progress" => ("[>]", Style::default().fg(theme.accent)),
-                _ => ("[ ]", Style::default().fg(theme.text)),
+        let done = self.todos.iter().filter(|(_, s)| s == "completed").count();
+        let width = area.width as usize;
+        let mut spans = vec![Span::styled(
+            " plan ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )];
+        let mut used = 6usize;
+        let progress = format!(" {done}/{} ", self.todos.len());
+        used += UnicodeWidthStr::width(progress.as_str());
+        spans.push(Span::styled(progress, Style::default().fg(theme.faint)));
+        let mut hidden = 0usize;
+        let mut first = true;
+        for (i, (content, status)) in self.todos.iter().enumerate() {
+            let (mark, color) = match status.as_str() {
+                "completed" => (theme.glyphs.ok, theme.dim),
+                "in_progress" => (theme.glyphs.prompt, theme.accent),
+                _ => (theme.glyphs.bullet, theme.faint),
             };
-            lines.push(Line::from(vec![
-                Span::styled("  ", Style::default()),
-                Span::styled(marker, style),
-                Span::styled(
-                    format!(" {}", clip(content, area.width.saturating_sub(8) as usize)),
-                    if status == "in_progress" {
-                        Style::default().fg(theme.text)
-                    } else {
-                        Style::default().fg(theme.dim)
-                    },
-                ),
-            ]));
+            let label = clip(content, 28);
+            let need = UnicodeWidthStr::width(label.as_str()) + 5;
+            // keep two columns for a possible overflow count
+            if used + need + 2 > width {
+                hidden = self.todos.len() - i;
+                break;
+            }
+            used += need;
+            if !first {
+                spans.push(Span::raw("  "));
+            }
+            first = false;
+            spans.push(Span::styled(format!("{mark} "), Style::default().fg(color)));
+            let text_style = match status.as_str() {
+                "in_progress" => Style::default().fg(theme.text),
+                "completed" => Style::default()
+                    .fg(theme.dim)
+                    .add_modifier(Modifier::CROSSED_OUT),
+                _ => Style::default().fg(theme.dim),
+            };
+            spans.push(Span::styled(label, text_style));
         }
-        f.render_widget(Paragraph::new(lines), area);
+        if hidden > 0 {
+            spans.push(Span::styled(
+                format!("  +{hidden}"),
+                Style::default().fg(theme.faint),
+            ));
+        }
+        let line = clip_spans(spans, width);
+        f.render_widget(Paragraph::new(Line::from(line)), area);
     }
 
     fn draw_body(&self, f: &mut Frame, area: Rect) {
@@ -1733,6 +1895,17 @@ impl Screen {
         };
         let cache = self.transcript.rendered(theme, width);
         let static_len = cache.lines.len();
+        // A fresh session has no conversation to show. An empty column of
+        // blank rows is wasted space; put the four things a newcomer needs
+        // (what this is, where it points, examples, next keys) in it instead.
+        if self.transcript.is_empty() && !self.busy {
+            drop(cache);
+            self.body_area.set(main);
+            self.hit_owner.borrow_mut().clear();
+            self.scroll.set(0);
+            self.draw_welcome(f, main);
+            return;
+        }
         let total = static_len + stream_rows.len();
         // a scrolled reader keeps their place as new output arrives
         let grew = total.saturating_sub(self.last_total.replace(total));
@@ -1794,18 +1967,37 @@ impl Screen {
         } else {
             Style::default().fg(theme.border_active)
         };
-        let title = if self.busy {
-            Span::styled(
-                format!(" input · {} waiting ", self.queued.len()),
-                Style::default().fg(theme.dim),
-            )
+        // The border answers "what happens if I press Enter right now?": a
+        // quiet "/ command" while idle (rather than a label that only repeats
+        // the prompt glyph), an explicit queue counter while busy, and the
+        // approval notice when the keyboard belongs to a prompt instead.
+        let mut title = vec![Span::styled(" ", Style::default().fg(theme.dim))];
+        if self.has_approval() {
+            title.push(Span::styled(
+                "approval pending",
+                Style::default().fg(theme.warn),
+            ));
+        } else if self.busy {
+            title.push(Span::styled(
+                if self.queued.is_empty() {
+                    "working…".to_string()
+                } else {
+                    format!("{} queued", self.queued.len())
+                },
+                Style::default().fg(if self.queued.is_empty() {
+                    theme.dim
+                } else {
+                    theme.accent
+                }),
+            ));
         } else {
-            Span::styled(" input ", Style::default().fg(theme.dim))
-        };
+            title.push(Span::styled("/ command", Style::default().fg(theme.dim)));
+        }
+        title.push(Span::styled(" ", Style::default().fg(theme.dim)));
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(border)
-            .title(title);
+            .title(Line::from(title));
         let inner = block.inner(area);
         f.render_widget(block, area);
         if inner.height == 0 || inner.width == 0 {
@@ -1836,7 +2028,14 @@ impl Screen {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        "ask kazi to change code, run a command, or explain something…",
+                        clip(
+                            if self.busy {
+                                "a follow-up runs when this task ends…"
+                            } else {
+                                "ask kazi to change code, run a command, or explain something…"
+                            },
+                            (inner.width as usize).saturating_sub(prompt_w),
+                        ),
                         Style::default().fg(theme.faint),
                     ),
                 ])),
@@ -1894,56 +2093,97 @@ impl Screen {
         }
     }
 
+    /// Key hints that fit. The full set is a wall of text that gets cut
+    /// mid-word on an 80-column terminal and teaches nothing; hints are added
+    /// in priority order and the first one that does not fit ends the line.
+    fn footer_hints(&self, width: u16) -> Vec<Span<'static>> {
+        const IDLE: &[(&str, &str)] = &[
+            ("Enter", "send"),
+            ("/", "commands"),
+            ("Ctrl+K", "palette"),
+            ("Ctrl+R", "sessions"),
+            ("Ctrl+O", "details"),
+            ("Ctrl+F", "find"),
+            ("F1", "help"),
+            ("Esc", "quit"),
+        ];
+        const BUSY: &[(&str, &str)] = &[
+            ("Esc", "interrupt"),
+            ("Enter", "queue"),
+            ("Ctrl+O", "details"),
+            ("Ctrl+F", "find"),
+            ("F1", "help"),
+        ];
+        let theme = self.theme;
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut used = 0usize;
+        let budget = width as usize;
+        for (key, what) in if self.busy { BUSY } else { IDLE } {
+            let piece = key.len() + 1 + what.len() + 2;
+            // one column of slack: the right cluster may claim the tail
+            if used + piece + 1 > budget {
+                break;
+            }
+            used += piece;
+            spans.push(Span::styled(format!(" {key}"), theme.key_style()));
+            spans.push(Span::styled(
+                format!(" {what} "),
+                Style::default().fg(theme.dim),
+            ));
+        }
+        spans
+    }
+
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         let theme = self.theme;
+        let right = self.footer_right();
+        // the right cluster is a status, not a hint: give it its columns
+        // first so the hints stop cleanly before it instead of running under it
+        let right_w = if right.is_empty() || self.has_approval() {
+            0
+        } else {
+            (spans_width(&right) as u16).min(area.width.saturating_sub(24))
+        };
         let hints: Vec<Span> = if self.has_approval() {
+            // the approval keys are not hints: they are the only way forward,
+            // so they take the whole row and drop the rest
             vec![Span::styled(
-                " approval pending — y run · a always · n deny · r deny with reason · Esc deny ",
+                clip(
+                    " approval pending — y run · a always · n deny · r with reason · Esc deny",
+                    area.width as usize,
+                ),
                 Style::default().fg(theme.warn),
             )]
-        } else if self.busy {
-            vec![
-                Span::styled(" Esc", theme.key_style()),
-                Span::styled(" interrupt  ", Style::default().fg(theme.dim)),
-                Span::styled("Enter", theme.key_style()),
-                Span::styled(" queue a follow-up  ", Style::default().fg(theme.dim)),
-                Span::styled("F1", theme.key_style()),
-                Span::styled(" help  ", Style::default().fg(theme.dim)),
-                Span::styled("Ctrl+O", theme.key_style()),
-                Span::styled(" details  ", Style::default().fg(theme.dim)),
-                Span::styled("Ctrl+F", theme.key_style()),
-                Span::styled(" find", Style::default().fg(theme.dim)),
-            ]
         } else {
-            vec![
-                Span::styled(" Enter", theme.key_style()),
-                Span::styled(" send  ", Style::default().fg(theme.dim)),
-                Span::styled("/", theme.key_style()),
-                Span::styled(" commands  ", Style::default().fg(theme.dim)),
-                Span::styled("F1", theme.key_style()),
-                Span::styled(" help  ", Style::default().fg(theme.dim)),
-                Span::styled("Ctrl+K", theme.key_style()),
-                Span::styled(" palette  ", Style::default().fg(theme.dim)),
-                Span::styled("Ctrl+O", theme.key_style()),
-                Span::styled(" details  ", Style::default().fg(theme.dim)),
-                Span::styled("Ctrl+F", theme.key_style()),
-                Span::styled(" find  ", Style::default().fg(theme.dim)),
-                Span::styled("Ctrl+R", theme.key_style()),
-                Span::styled(" sessions  ", Style::default().fg(theme.dim)),
-                Span::styled("Esc", theme.key_style()),
-                Span::styled(" quit", Style::default().fg(theme.dim)),
-            ]
+            self.footer_hints(area.width.saturating_sub(right_w))
         };
         f.render_widget(
             Paragraph::new(Line::from(hints)).style(Style::default().bg(theme.header_bg)),
             area,
         );
 
+        if right_w > 0 {
+            let [_, r] =
+                Layout::horizontal([Constraint::Min(1), Constraint::Length(right_w)]).areas(area);
+            f.render_widget(
+                Paragraph::new(Line::from(right))
+                    .alignment(Alignment::Right)
+                    .style(Style::default().bg(theme.header_bg)),
+                r,
+            );
+        }
+    }
+
+    /// The footer's status cluster. Only things that are true right now and
+    /// actionable belong here — a running job, queued follow-ups, an expanded
+    /// transcript, a paused tail — never a key hint (those are drawn left).
+    fn footer_right(&self) -> Vec<Span<'static>> {
+        let theme = self.theme;
         let mut right: Vec<Span> = Vec::new();
         if self.jobs_running > 0 {
             right.push(Span::styled(
                 format!(
-                    "{} job{} running  ",
+                    "{} job{}  ",
                     self.jobs_running,
                     if self.jobs_running == 1 { "" } else { "s" }
                 ),
@@ -1958,7 +2198,7 @@ impl Screen {
         }
         if self.transcript.details() {
             right.push(Span::styled(
-                "details: on  ",
+                "details expanded  ",
                 Style::default().fg(theme.warn),
             ));
         }
@@ -1968,22 +2208,12 @@ impl Screen {
                 if new > 0 {
                     format!("↓ {new} new · Ctrl+End  ")
                 } else {
-                    "scrolled · Ctrl+End  ".to_string()
+                    "paused · Ctrl+End  ".to_string()
                 },
                 Style::default().fg(theme.warn),
             ));
         }
-        if !right.is_empty() {
-            let w = spans_width(&right).min(area.width as usize / 2) as u16;
-            let [_, r] =
-                Layout::horizontal([Constraint::Min(1), Constraint::Length(w.max(1))]).areas(area);
-            f.render_widget(
-                Paragraph::new(Line::from(right))
-                    .alignment(Alignment::Right)
-                    .style(Style::default().bg(theme.header_bg)),
-                r,
-            );
-        }
+        right
     }
 
     fn draw_command_hints(&self, f: &mut Frame, input: Rect) {
@@ -2506,18 +2736,21 @@ pub async fn chat_loop_tui(
         }
     }
     screen.bell = sess.cfg.ui.bell.unwrap_or(false);
-    screen.transcript.push_rule(format!(
-        "kazi · {} · {}",
-        screen.session_name,
-        clip(&provider_desc, 60)
-    ));
+    // A brand-new session gets the welcome panel (drawn by the TUI whenever
+    // the transcript is empty). Seeding notices here would hide it behind
+    // three lines that say the same thing, so they are only written when
+    // there IS a conversation or something to warn about.
+    let had_history = !agent.history.msgs.is_empty();
+    if had_history {
+        screen.transcript.push_rule(format!(
+            "kazi · {} · {}",
+            screen.session_name,
+            clip(&provider_desc, 60)
+        ));
+    }
     if let Some(hint) = agent.auth_hint() {
         screen.push_notice(Level::Warn, hint.to_string());
     }
-    screen.push_notice(
-        Level::Info,
-        "type a task and press Enter · / for commands · Ctrl+K for the palette · Esc quits",
-    );
     replay_history(&mut screen, &agent);
 
     let res = tui_inner(
@@ -5404,10 +5637,92 @@ mod tests {
         let rows = frame_rows(&term);
         let status = &rows[0];
         assert!(status.contains("kazi"), "{status}");
-        assert!(status.contains("[read-only]"), "{status}");
+        assert!(status.contains("read-only"), "{status}");
         assert!(status.contains("stub-provider"), "{status}");
         assert!(status.contains("sess"), "{status}");
         assert!(status.contains("50%"), "gauge percentage: {status}");
+    }
+
+    #[test]
+    fn header_drops_whole_facts_instead_of_cutting_words() {
+        // 0.26 truncated the provider mid-word ("deeps…") and then let the
+        // right cluster overprint it. Now every tier is all-or-nothing.
+        let mut s = test_screen();
+        s.provider_desc = "deepseek/deepseek-chat · https://api.deepseek.com/v1".into();
+        s.session_name = "fix-flaky-test".into();
+        s.cwd = "D:/Code/init/kazi".into();
+        for width in [40u16, 60, 80, 100, 140, 200] {
+            let mut term = Terminal::new(TestBackend::new(width, 12)).unwrap();
+            term.draw(|f| s.draw(f)).unwrap();
+            let status = &frame_rows(&term)[0];
+            assert!(status.contains("kazi"), "{width}: {status}");
+            assert!(status.contains("edit"), "{width}: {status}");
+            // no fact is cut into a fragment, and nothing overprints
+            assert!(!status.contains("deeps…"), "{width}: {status}");
+            assert!(
+                status.contains("stub-provider") || !status.contains('…'),
+                "{width}: a dropped fact is dropped whole: {status}"
+            );
+        }
+        // the narrowest bar still reports the budget
+        let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        term.draw(|f| s.draw(f)).unwrap();
+        assert!(
+            frame_rows(&term)[0].contains("ctx"),
+            "{} ",
+            frame_rows(&term)[0]
+        );
+    }
+
+    #[test]
+    fn plan_rail_costs_one_row_and_counts_overflow() {
+        let mut s = test_screen();
+        for i in 0..8 {
+            s.todos.push((
+                format!("step number {i} with a long description"),
+                "pending".into(),
+            ));
+        }
+        for (w, h) in [(60u16, 20u16), (100, 24), (160, 30)] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| s.draw(f)).unwrap();
+            let rows = frame_rows(&term);
+            let plan: Vec<&String> = rows.iter().filter(|r| r.contains(" plan ")).collect();
+            assert_eq!(
+                plan.len(),
+                1,
+                "one rail row at {w}x{h}:\n{}",
+                rows.join("\n")
+            );
+            assert!(plan[0].contains("0/8"), "{w}: {}", plan[0]);
+            // the rail never pushes the composer off the screen
+            assert!(
+                rows.iter().any(|r| r.contains("❯")),
+                "{w}x{h} keeps the composer"
+            );
+        }
+    }
+
+    #[test]
+    fn footer_drops_hints_from_the_end_to_fit() {
+        let s = test_screen();
+        for width in [40u16, 60, 80, 120, 200] {
+            let mut term = Terminal::new(TestBackend::new(width, 12)).unwrap();
+            term.draw(|f| s.draw(f)).unwrap();
+            let footer = frame_rows(&term).last().cloned().unwrap_or_default();
+            assert!(
+                !footer.contains("Ctrl↓") && !footer.trim_end().ends_with("C"),
+                "{width}: a hint is never cut mid-word: {footer:?}"
+            );
+        }
+        // the widest terminal keeps the whole set, in priority order
+        let mut term = Terminal::new(TestBackend::new(200, 12)).unwrap();
+        term.draw(|f| s.draw(f)).unwrap();
+        let footer = frame_rows(&term).last().cloned().unwrap();
+        assert!(
+            footer.contains("Enter") && footer.contains("Esc"),
+            "{footer}"
+        );
     }
 
     #[test]
@@ -5456,11 +5771,16 @@ mod tests {
 
         s.overlay = Some(Overlay::Help(Help::default()));
         term.draw(|f| s.draw(f)).unwrap();
-        let rows = frame_rows(&term).join("\n");
-        assert!(
-            rows.contains("key bindings") || rows.contains("Ctrl+F"),
-            "{rows}"
-        );
+        // the help body scrolls, so assert on the frame's own geometry:
+        // the modal is drawn, framed, and lists commands on its first rows
+        let rows = frame_rows(&term);
+        let text = rows.join("\n");
+        assert!(text.contains(" help "), "help has a title bar:\n{text}");
+        assert!(text.contains("/compact"), "help lists commands:\n{text}");
+        let framed = rows
+            .iter()
+            .any(|r| r.trim_start().starts_with('┌') || r.contains("┌ help ─"));
+        assert!(framed, "help is a bordered modal:\n{text}");
     }
 
     #[test]
@@ -6172,5 +6492,224 @@ mod tests {
         assert!(!s.transcript.details());
         s.transcript.set_details(true);
         assert!(s.transcript.details());
+    }
+
+    /// One scenario paints a transcript into a fresh screen.
+    type Snapshot = fn(&mut Screen);
+
+    /// Render the real workspace at a batch of terminal sizes and dump it, so
+    /// a layout review can look at the UI instead of guessing from the code.
+    /// Writes `docs/tui/<scenario>-<w>x<h>.txt`. Opt-in:
+    ///   KAZI_TUI_SNAPSHOT=1 cargo test tui_snapshots -- --nocapture
+    #[test]
+    fn tui_snapshots() {
+        if std::env::var("KAZI_TUI_SNAPSHOT").ok().as_deref() != Some("1") {
+            return;
+        }
+        let dir = std::path::Path::new("docs/tui");
+        std::fs::create_dir_all(dir).unwrap();
+        // (name, paint function, one-line description for the index)
+        let scenarios: Vec<(&str, Snapshot, &str)> = vec![
+            ("idle", snap_idle, "a fresh session: the welcome panel"),
+            (
+                "working",
+                snap_working,
+                "plan rail, tool cards, live header, queued composer",
+            ),
+            (
+                "long",
+                snap_long,
+                "a scrolled transcript with the paused-tail footer",
+            ),
+            ("help", snap_help, "the help overlay, hanging-indented wrap"),
+            (
+                "approval",
+                snap_approval,
+                "the approval prompt with its risk note",
+            ),
+            ("palette", snap_palette, "the Ctrl+K command palette"),
+            ("diff", snap_diff, "the diff reader hugging its content"),
+        ];
+        let sizes = [
+            (60u16, 20u16),
+            (80, 24),
+            (100, 30),
+            (120, 34),
+            (140, 40),
+            (160, 44),
+        ];
+        let mut index = String::from(
+            "# kazi TUI snapshots\n\n\
+             Real frames from `Screen::draw`, captured at six terminal sizes \
+             (60x20 up to 160x44) because every layout bug in this UI is a \
+             narrow-terminal bug.\n\n\
+             Regenerate with:\n\n\
+             ```sh\n\
+             KAZI_TUI_SNAPSHOT=1 cargo test tui_snapshots\n\
+             ```\n\n\
+             The test is opt-in so a normal `cargo test` never writes files. \
+             Compare a change by regenerating before and after and diffing the \
+             frames: a layout regression shows up as a changed line.\n\n\
+             | scenario | what it shows |\n|---|---|\n",
+        );
+        // table first, links after: interleaving them breaks the markdown table
+        for (name, _, what) in &scenarios {
+            index.push_str(&format!("| `{name}` | {what} |\n"));
+        }
+        index.push('\n');
+        for (name, setup, _) in scenarios {
+            for (w, h) in sizes {
+                let mut s = test_screen();
+                s.session_name = "fix-flaky-test".into();
+                s.provider_desc = "deepseek/deepseek-chat · https://api.deepseek.com/v1".into();
+                setup(&mut s);
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| s.draw(f)).unwrap();
+                let text = frame_rows(&term).join("\n");
+                std::fs::write(dir.join(format!("{name}-{w}x{h}.txt")), format!("{text}\n"))
+                    .unwrap();
+            }
+            index.push_str(&format!(
+                "\n`{name}`: {}",
+                sizes
+                    .iter()
+                    .map(|(w, h)| format!("[{w}x{h}]({name}-{w}x{h}.txt)"))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            ));
+            index.push('\n');
+        }
+        std::fs::write(dir.join("README.md"), index).unwrap();
+    }
+
+    /// The command palette (Ctrl+K) open over a live transcript.
+    fn snap_palette(s: &mut Screen) {
+        snap_working(s);
+        s.overlay = Some(Overlay::Palette(Palette::default()));
+    }
+
+    /// The full-screen diff reader (/diff).
+    fn snap_diff(s: &mut Screen) {
+        snap_working(s);
+        s.overlay = Some(Overlay::Diff(overlay::DiffView::new(
+            "apply_patch src/agent/context.rs",
+            "@@ -40,7 +40,7 @@\n-    let n = compact(&mut msgs);\n+    compact(&mut msgs);\n+    let n = msgs.len();\n@@ -52,3 +52,2 @@\n-    // stale\n continued",
+        )));
+    }
+
+    /// The help overlay ("/" and F1): the densest text screen in the app.
+    fn snap_help(s: &mut Screen) {
+        snap_working(s);
+        s.overlay = Some(Overlay::Help(Help::default()));
+    }
+
+    /// The approval prompt: the one modal that blocks the agent.
+    fn snap_approval(s: &mut Screen) {
+        snap_working(s);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::mem::forget(rx);
+        s.push_approval(PendingApproval {
+            ask: ApprovalAsk {
+                id: next_ask_id(),
+                task: 3,
+                origin: AskOrigin::Main,
+                tool: "run_command".into(),
+                summary: "$ git push --force origin main\n  cwd: D:/Code/init/kazi".into(),
+                reply: tx,
+            },
+            reason_mode: false,
+            reason: String::new(),
+            scroll: 0,
+        });
+    }
+
+    /// A brand-new session: nothing has been asked yet.
+    fn snap_idle(s: &mut Screen) {
+        s.est_tokens = 8_400;
+        s.cwd = "D:/Code/init/kazi".into();
+    }
+
+    fn snap_working(s: &mut Screen) {
+        s.transcript
+            .push_rule("kazi · sess · deepseek/deepseek-chat");
+        s.transcript
+            .push_user("fix the flaky test in src/agent/context.rs and show me the diff");
+        s.transcript.push_assistant(
+            "I will look at the test first, then run it to see the failure.\n\n- read the failing test\n- reproduce it\n- patch the assertion",
+        );
+        s.transcript
+            .start_tool("t1", "read_file", "src/agent/context.rs");
+        s.transcript.finish_tool(
+            "t1",
+            "read_file",
+            false,
+            "fn compact(msgs: &mut Vec<Message>) {\n    // keep the pinned tail\n}",
+            None,
+            120,
+        );
+        s.transcript
+            .start_tool("t2", "run_command", "cargo test --lib");
+        s.transcript.finish_tool(
+            "t2",
+            "run_command",
+            true,
+            "error[E0308]: mismatched types\n  --> src/agent/context.rs:42:9\n   |\n42 |     let n = compact(&mut msgs);\n   |             ^^^^^^^ expected `usize`, found `()`",
+            None,
+            830,
+        );
+        s.transcript
+            .start_tool("t3", "apply_patch", "src/agent/context.rs");
+        s.transcript.finish_tool(
+            "t3",
+            "apply_patch",
+            false,
+            "patched",
+            Some("@@ -40,7 +40,7 @@\n-    let n = compact(&mut msgs);\n+    compact(&mut msgs);\n+    let n = msgs.len();".to_string()),
+            40,
+        );
+        s.transcript
+            .append_delta("The failure was a stale `let n =` binding — ");
+        s.todos = vec![
+            ("read the failing test".into(), "completed".into()),
+            ("reproduce it".into(), "completed".into()),
+            ("patch the assertion".into(), "in_progress".into()),
+            ("run the suite again".into(), "pending".into()),
+        ];
+        s.busy = true;
+        s.started.set(Some(std::time::Instant::now()));
+        s.rounds = 3;
+        s.tokens_in = 18_400;
+        s.tokens_out = 1_200;
+        s.est_tokens = 44_000;
+        s.preset = "deep".into();
+        s.task_cost = Some(0.013);
+        s.jobs_running = 1;
+    }
+
+    fn snap_long(s: &mut Screen) {
+        s.transcript
+            .push_rule("kazi · sess · deepseek/deepseek-chat");
+        for i in 0..10 {
+            s.transcript
+                .push_user(format!("question {i}: why does the test fail?"));
+            s.transcript.push_assistant(format!(
+                "Answer {i}.\n\nThe compact() helper drops the pinned tail when the budget is tight, so the model loses the instructions it got at the start.\n\n```rust\nlet n = compact(&mut msgs);\n```"
+            ));
+            s.transcript.start_tool(
+                format!("t{i}"),
+                "run_command",
+                format!("cargo test --lib test_{i}"),
+            );
+            s.transcript.finish_tool(
+                &format!("t{i}"),
+                "run_command",
+                false,
+                "test result: ok. 12 passed; 0 failed",
+                None,
+                300,
+            );
+        }
+        s.est_tokens = 58_000;
+        s.scroll.set(20);
     }
 }

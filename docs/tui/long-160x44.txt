@@ -1,0 +1,44 @@
+ kazi  edit · deepseek/deepseek-chat · https://api.deepseek.com/v1 · fix-flaky-test · D:/tmp                                          ███████░  96% 58k / 60k   
+  ────────────────────────────────────────────────────────── kazi · sess · deepseek/deepseek-chat ──────────────────────────────────────────────────────────   █
+                                                                                                                                                               █
+❯ question 0: why does the test fail?                                                                                                                          █
+                                                                                                                                                               █
+Answer 0.                                                                                                                                                      █
+                                                                                                                                                               █
+The compact() helper drops the pinned tail when the budget is tight, so the model loses the instructions it got at the start.                                  █
+                                                                                                                                                               █
+  ╭─ rust                                                                                                                                                      █
+  │ let n = compact(&mut msgs);                                                                                                                                █
+                                                                                                                                                               █
+  ✓ ▸ run_command cargo test --lib test_0 · 0.3s                                                                                                               █
+  │ test result: ok. 12 passed; 0 failed                                                                                                                       █
+                                                                                                                                                               │
+❯ question 1: why does the test fail?                                                                                                                          │
+                                                                                                                                                               │
+Answer 1.                                                                                                                                                      │
+                                                                                                                                                               │
+The compact() helper drops the pinned tail when the budget is tight, so the model loses the instructions it got at the start.                                  │
+                                                                                                                                                               │
+  ╭─ rust                                                                                                                                                      │
+  │ let n = compact(&mut msgs);                                                                                                                                │
+                                                                                                                                                               │
+  ✓ ▸ run_command cargo test --lib test_1 · 0.3s                                                                                                               │
+  │ test result: ok. 12 passed; 0 failed                                                                                                                       │
+                                                                                                                                                               │
+❯ question 2: why does the test fail?                                                                                                                          │
+                                                                                                                                                               │
+Answer 2.                                                                                                                                                      │
+                                                                                                                                                               │
+The compact() helper drops the pinned tail when the budget is tight, so the model loses the instructions it got at the start.                                  │
+                                                                                                                                                               │
+  ╭─ rust                                                                                                                                                      │
+  │ let n = compact(&mut msgs);                                                                                                                                │
+                                                                                                                                                               │
+  ✓ ▸ run_command cargo test --lib test_2 · 0.3s                                                                                                               │
+  │ test result: ok. 12 passed; 0 failed                                                                                                                       │
+                                                                                                                                                               │
+❯ question 3: why does the test fail?                                                                                                                          │
+┌ / command ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│❯ ask kazi to change code, run a command, or explain something…                                                                                               │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ Enter send  / commands  Ctrl+K palette  Ctrl+R sessions  Ctrl+O details  Ctrl+F find  F1 help  Esc quit                                  ↓ 122 new · Ctrl+End  

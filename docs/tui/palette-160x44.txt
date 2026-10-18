@@ -1,0 +1,44 @@
+                                                                                                                                                                
+                                  ┌ commands ────────────────────────────────────────────────────────────────────────────────┐                                  
+                                  │ ❯ /help                                                                   show this help │                                  
+                                  │   /undo                                           restore files changed by the last task │                                  
+                                  │   /exit                                       save session and leave (Ctrl+C also quits) │                                  
+                                  │   /quit                                                                  alias for /exit │                                  
+                                  │   /new [name]                   fresh session (optional name); the old one keeps on exit │                                  
+                                  │   /clear                          forget history; autosave moves to a fresh session file │                                  
+                                  │   /compact [force]           summarize old turns away (only over budget; force = always) │                                  
+                                  │   /resume <prefix>                        load a stored session (bare opens the browser) │                                  
+                                  │   /provider <nick|#>                         switch provider (bare /provider lists them) │                                  
+                                  │   /model <name|#>                                  switch model (bare /model lists them) │                                  
+                                  │   /yolo [on|off]                                            toggle command auto-approval │                                  
+                                  │   /permission [read-only|re…                             show or set the permission mode │                                  
+                                  │   /plan                                             show the model's full todo checklist │                                  
+                                  │   /allow [clear]                        show or clear commands approved for this session │                                  
+                                  │   /context                                         show the estimated token distribution │                                  
+                                  │   /jobs [id|kill <id>]              background jobs: list, show one's output, or stop it │                                  
+                                  │   /tools                                             list built-in tools (+ MCP servers) │                                  
+                                  │   /mcp                  MCP servers: transport, bridged tools, resources/prompts tooling │                                  
+                                  │   /instructions        project files (KAZI.md / AGENTS.md) loaded into the system prompt │                                  
+                                  │   /skills [name]                           list project skills, or print one's procedure │                                  
+                                  │   /hooks             project hooks (pre_tool / post_tool / post_task) and their policies │                                  
+                                  │   /status                                                 provider, model, rounds, usage │                                  
+                                  │   /usage [reset]                           session-wide token totals (reset clears them) │                                  
+                                  │   /last [n]                      show the newest tool output in full (n = how many back) │                                  
+                                  │   /diff [n]                 open the newest file diff in a scrollable viewer (n = older) │                                  
+                                  │   /queue [clear|drop <n>]           show or edit follow-ups waiting for the running task │                                  
+                                  │   /auth                                  where the current provider's API key comes from │                                  
+                                  │   /theme [name]                            switch the colour theme (dark | light | mono) │                                  
+                                  │   /details [on|off]                                  expand or collapse full tool output │                                  
+                                  │   /sessions                                    browse saved sessions (Enter resumes one) │                                  
+                                  │   /export [path]                               write the conversation to a markdown file │                                  
+                                  │   /copy [all|tool [n]|diff …  copy the last answer, a tool output, a diff, a code block… │                                  
+                                  │   /rename <name>              rename the auto-save target (the old session file is kept) │                                  
+                                  │   /retry                                                         run the last task again │                                  
+                                  │   /effort [fast|balanced|de…  swap the request preset (temperature, output budget, reas… │                                  
+                                  │   /cost [reset]        tokens and money for this task and session (needs [usage.prices]) │                                  
+                                  │   /pin [n|off]               keep a message through trimming (bare lists pinned entries) │                                  
+                                  │   /find <text>                                   search every saved session for a phrase │                                  
+                                  │                                                                                          │                                  
+                                  │ › _    38 matches · ↑/↓ · Enter insert · Esc close                                       │                                  
+                                  └──────────────────────────────────────────────────────────────────────────────────────────┘                                  
+                                                                                                                                                                
