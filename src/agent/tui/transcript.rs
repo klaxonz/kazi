@@ -13,7 +13,7 @@
 
 use std::cell::{Cell, RefCell};
 
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -375,6 +375,37 @@ impl Transcript {
             .rposition(|e| matches!(e, Entry::Tool(_)))
     }
 
+    /// Step a focus index to the next (`delta > 0`) or previous tool card.
+    /// `None` when there is nothing to focus, or when the step would leave
+    /// the transcript.
+    pub fn step_focus(&self, from: Option<usize>, delta: isize) -> Option<usize> {
+        // Indices stay `usize` throughout: the walk is expressed as
+        // "advance" / "checked_sub(1)" rather than signed arithmetic that can
+        // go negative, which keeps the loop honest on every backend.
+        let n = self.entries.len();
+        if n == 0 || delta == 0 {
+            return None;
+        }
+        let actionable = |i: usize| matches!(self.entries.get(i), Some(Entry::Tool(_)));
+        let forward = delta > 0;
+        let mut idx: Option<usize> = match from {
+            Some(i) if forward => Some(i + 1),
+            Some(i) => i.checked_sub(1),
+            None if forward => Some(0),
+            None => Some(n.saturating_sub(1)),
+        };
+        while let Some(i) = idx {
+            if i >= n {
+                break;
+            }
+            if actionable(i) {
+                return Some(i);
+            }
+            idx = if forward { Some(i + 1) } else { i.checked_sub(1) };
+        }
+        None
+    }
+
     /// The `back`-th newest tool card that carries a unified diff:
     /// `(name, summary, diff)`. `/diff [n]` opens it in the viewer.
     pub fn diff_card(&self, back: usize) -> Option<(String, String, String)> {
@@ -552,6 +583,70 @@ impl Transcript {
     }
 }
 
+/// Longest line of prose the transcript will draw. Beyond this the eye loses
+/// its place between the end of one row and the start of the next; a wide
+/// terminal gets margins rather than 200-column paragraphs.
+pub const MAX_COLUMN: usize = 96;
+/// Left margin before any transcript content (the rail/corner lives in it).
+const GUTTER: usize = 2;
+/// Padding between a turn's tint and its text.
+const PAD: usize = 2;
+
+/// The reading column for a body of `width` columns, centred and bounded by
+/// [`MAX_COLUMN`]. Below the bound this is just the whole area.
+pub fn column(width: usize) -> (usize, usize) {
+    let w = width.min(MAX_COLUMN);
+    (w, (width - w) / 2)
+}
+
+/// Paint a turn's tint as whole rows.
+///
+/// `Paragraph` styles only the cells it writes, so a background set on the
+/// text stops mid-row and looks torn. Each row is therefore: the page margin
+/// (no tint) → one run that carries the tint from the band's left edge past
+/// the text → the turn's own spans on top of it, with their foreground kept.
+fn banded(
+    lines: Vec<Line<'static>>,
+    bg: Color,
+    indent: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let band_w = width.saturating_sub(indent);
+    lines
+        .into_iter()
+        .map(|line| {
+            // layout: page margin → full-width tint run → the row's own spans.
+            // The tint run is exactly the row's width, so the bare row is a
+            // clean bar and text sits on it from the left edge.
+            let mut spans = Vec::with_capacity(line.spans.len() + 2);
+            if indent > 0 {
+                spans.push(Span::raw(" ".repeat(indent)));
+            }
+            spans.push(Span::styled(String::new(), Style::default().bg(bg)));
+            spans.extend(line.spans.into_iter().map(|s| {
+                let style = s.style.bg(bg);
+                Span::styled(s.content, style)
+            }));
+            spans.push(Span::styled(
+                " ".repeat(band_w.saturating_sub(row_width(&spans))),
+                Style::default().bg(bg),
+            ));
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn row_width(spans: &[Span<'static>]) -> usize {
+    spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum()
+}
+
+fn wrap_budget(indent: usize, width: usize) -> usize {
+    width.saturating_sub(indent).max(8)
+}
+
 fn render_entry(
     entry: &Entry,
     theme: Theme,
@@ -559,29 +654,79 @@ fn render_entry(
     details: bool,
     out: &mut Vec<Line<'static>>,
 ) {
+    // Everything hangs off one margin, so a turn's tint, a tool rail and the
+    // assistant's prose all start on the same column — the transcript reads
+    // as one column of thought, not three competing layouts. The card's
+    // `╭` sits ON the margin (not left of it), so a card's head lines up
+    // with the prose above it.
+    let indent = GUTTER.min(width.saturating_sub(12)).saturating_sub(1);
+    render_entry_at(entry, theme, width, details, indent, out);
+}
+
+fn render_entry_at(
+    entry: &Entry,
+    theme: Theme,
+    width: usize,
+    details: bool,
+    indent: usize,
+    out: &mut Vec<Line<'static>>,
+) {
+    let inner = width.saturating_sub(indent);
     match entry {
         Entry::User { text } => {
-            let prefix = vec![Span::styled(
-                format!("{} ", theme.glyphs.prompt),
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            )];
-            let cont = vec![Span::raw("  ")];
-            out.extend(wrap_plain(
-                text,
-                Style::default().fg(theme.user),
-                width,
-                prefix,
-                cont,
-            ));
-            out.push(Line::default());
+            // A user turn is *input*: it gets a quiet tint and a corner glyph
+            // so it separates from answers without a label shouting "you".
+            let bg = theme.surface(theme.user, 14);
+            let budget = wrap_budget(indent + PAD, width);
+            let mut rows: Vec<Line<'static>> = Vec::new();
+            let lines: Vec<&str> = text.split('\n').collect();
+            for (i, src) in lines.iter().enumerate() {
+                let lead = if i == 0 {
+                    vec![
+                        Span::styled(" ".repeat(PAD), Style::default()),
+                        Span::styled(
+                            theme.glyphs.prompt.to_string(),
+                            Style::default()
+                                .fg(theme.user)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(" ", Style::default()),
+                    ]
+                } else {
+                    vec![Span::styled(" ".repeat(PAD + 2), Style::default())]
+                };
+                let cont = vec![Span::styled(" ".repeat(PAD + 2), Style::default())];
+                rows.extend(wrap_plain(
+                    src,
+                    Style::default().fg(theme.text),
+                    budget,
+                    lead,
+                    cont,
+                ));
+            }
+            out.push(Line::from(Span::styled(
+                " ".repeat(indent),
+                Style::default(),
+            )));
+            out.extend(banded(rows, bg, indent, width));
+            out.push(Line::from(Span::styled(
+                " ".repeat(indent),
+                Style::default(),
+            )));
         }
         Entry::Assistant { text } => {
-            out.extend(markdown::render(text, theme, width));
-            out.push(Line::default());
+            let budget = wrap_budget(indent, width);
+            let rendered = markdown::render(text, theme, budget);
+            out.extend(rendered.into_iter().map(|line| {
+                let mut spans = Vec::with_capacity(line.spans.len() + 1);
+                if indent > 0 {
+                    spans.push(Span::raw(" ".repeat(indent)));
+                }
+                spans.extend(line.spans);
+                Line::from(spans)
+            }));
         }
-        Entry::Tool(card) => render_tool(card, theme, width, details, out),
+        Entry::Tool(card) => render_tool(card, theme, width, details, indent, out),
         Entry::Notice { level, text } => {
             let (mark, style) = match level {
                 Level::Info => ("·", Style::default().fg(theme.dim)),
@@ -590,25 +735,32 @@ fn render_entry(
                 Level::Error => (theme.glyphs.err, Style::default().fg(theme.err)),
             };
             let prefix = vec![
-                Span::styled("  ", Style::default()),
+                Span::raw(" ".repeat(indent)),
                 Span::styled(format!("{mark} "), style.add_modifier(Modifier::BOLD)),
             ];
-            let cont = vec![Span::raw("    ")];
-            out.extend(wrap_plain(text, style, width, prefix, cont));
+            let cont = vec![Span::raw(" ".repeat(indent + 2))];
+            out.extend(wrap_plain(
+                text,
+                style,
+                wrap_budget(indent + 2, width),
+                prefix,
+                cont,
+            ));
         }
         Entry::Rule { label } => {
             // measure the label in columns, not bytes: a rule whose label has
             // a `·` or an em dash used to overflow the row and wrap
             let label = format!(" {label} ");
-            let side = width.saturating_sub(UnicodeWidthStr::width(label.as_str()) + 4) / 2;
+            let room = inner.saturating_sub(UnicodeWidthStr::width(label.as_str()));
+            let side = room / 2;
             let line = format!(
-                "  {}{}{}",
+                "{}{}{}{}",
+                " ".repeat(indent),
                 theme.glyphs.hbar.repeat(side),
                 label,
-                theme.glyphs.hbar.repeat(side)
+                theme.glyphs.hbar.repeat(room - side)
             );
             out.push(Line::styled(line, Style::default().fg(theme.border)));
-            out.push(Line::default());
         }
     }
 }
@@ -618,25 +770,49 @@ fn render_tool(
     theme: Theme,
     width: usize,
     details: bool,
+    indent: usize,
     out: &mut Vec<Line<'static>>,
 ) {
     let (glyph, gstyle) = match card.state {
-        ToolState::Running => ("◦", Style::default().fg(theme.accent)),
+        ToolState::Running => (theme.spinner(0), Style::default().fg(theme.accent)),
         ToolState::Ok => (theme.glyphs.ok, Style::default().fg(theme.ok)),
         ToolState::Error => (theme.glyphs.err, Style::default().fg(theme.err)),
     };
-    let mut head: Vec<Span<'static>> = vec![
-        Span::raw("  "),
-        Span::styled(format!("{glyph} "), gstyle.add_modifier(Modifier::BOLD)),
-        Span::styled(
-            card.name.clone(),
-            Style::default().fg(theme.tool).add_modifier(Modifier::BOLD),
-        ),
-    ];
+    let expandable =
+        card.state != ToolState::Running && (card.diff.is_some() || !card.output.is_empty());
+    let expanded = details || card.expanded;
+    // The head is ONE row of facts: fold marker, state, tool, what it acted
+    // on, its effect. Everything below it hangs off a rail so the card is
+    // visually "inside" the head, not a new section.
+    let mut head: Vec<Span<'static>> = vec![Span::raw(" ".repeat(indent))];
+    if expandable {
+        head.push(Span::styled(
+            format!(
+                "{}{} ",
+                theme.glyphs.turn_top,
+                if card.expanded || details {
+                    theme.glyphs.fold_open
+                } else {
+                    theme.glyphs.fold_closed
+                }
+            ),
+            Style::default().fg(theme.border),
+        ));
+    } else {
+        head.push(Span::styled(
+            format!("{} ", theme.glyphs.turn_top),
+            Style::default().fg(theme.border),
+        ));
+    }
+    head.push(Span::styled(format!("{glyph} "), gstyle));
+    head.push(Span::styled(
+        card.name.clone(),
+        Style::default().fg(theme.tool).add_modifier(Modifier::BOLD),
+    ));
     if !card.summary.is_empty() {
         head.push(Span::styled(
             format!(" {}", card.summary),
-            Style::default().fg(theme.dim),
+            Style::default().fg(theme.text),
         ));
     }
     if let Some(diff) = &card.diff {
@@ -662,30 +838,8 @@ fn render_tool(
             Style::default().fg(theme.faint),
         ));
     }
-    // The fold marker comes first: it is the card's affordance, and a repeated
-    // "(click to expand)" at the end of every line is noise on a narrow
-    // terminal (it is cut off anyway) and redundant next to the marker.
-    let expandable =
-        card.state != ToolState::Running && (card.diff.is_some() || !card.output.is_empty());
-    if expandable {
-        head.insert(
-            2,
-            Span::styled(
-                format!(
-                    "{} ",
-                    if card.expanded {
-                        theme.glyphs.fold_open
-                    } else {
-                        theme.glyphs.fold_closed
-                    }
-                ),
-                Style::default().fg(theme.faint),
-            ),
-        );
-    }
     out.push(Line::from(clip_spans(head, width)));
 
-    let expanded = details || card.expanded;
     let limit = if expanded {
         CARD_ROWS_EXPANDED
     } else if card.state == ToolState::Error {
@@ -693,15 +847,18 @@ fn render_tool(
     } else {
         CARD_ROWS_COLLAPSED
     };
+    // body rows hang off the rail: `   ` + `│`
+    let rail = format!("{}{} ", " ".repeat(indent), theme.glyphs.turn_mid);
+    let body_indent = UnicodeWidthStr::width(rail.as_str());
 
     if let Some(diff) = &card.diff {
         let rows: Vec<&str> = diff.lines().collect();
         for line in rows.iter().take(limit) {
             let style = theme.diff_style(line);
-            out.push(diff_row(line, theme, style, width));
+            out.push(diff_row(line, theme, style, width, &rail));
         }
         if rows.len() > limit {
-            out.push(more_rows(rows.len() - limit, theme, width));
+            out.push(more_rows(rows.len() - limit, theme, width, &rail));
         }
     } else if !card.output.trim().is_empty() {
         let rows: Vec<&str> = card
@@ -712,53 +869,49 @@ fn render_tool(
         let base = if card.state == ToolState::Error {
             Style::default().fg(theme.err)
         } else {
-            Style::default().fg(theme.text)
+            Style::default().fg(theme.dim)
         };
         for line in rows.iter().take(limit) {
-            let prefix = vec![Span::styled(
-                format!("  {} ", theme.glyphs.vbar),
-                Style::default().fg(theme.border),
-            )];
-            let cont = vec![Span::styled(
-                format!("  {} ", theme.glyphs.vbar),
-                Style::default().fg(theme.border),
-            )];
-            let mut wrapped = wrap_plain(line, base, width, prefix, cont);
+            let prefix = vec![Span::styled(rail.clone(), Style::default().fg(theme.border))];
+            let cont = vec![Span::styled(rail.clone(), Style::default().fg(theme.border))];
+            let mut wrapped =
+                wrap_plain(line, base, width.saturating_sub(body_indent), prefix, cont);
             out.append(&mut wrapped);
         }
         if rows.len() > limit {
-            out.push(more_rows(rows.len() - limit, theme, width));
+            out.push(more_rows(rows.len() - limit, theme, width, &rail));
         }
-    }
-    if card.state == ToolState::Running && card.output.is_empty() && card.diff.is_none() {
+    } else if card.state == ToolState::Running {
         out.push(Line::styled(
-            format!("  {} …", theme.glyphs.vbar),
+            format!("{rail}{}", theme.glyphs.ellipsis),
             Style::default().fg(theme.border),
         ));
     }
+    // close the card: the rail ends, the next entry starts on clean rows
+    out.push(Line::styled(
+        format!("{}{}", " ".repeat(indent), theme.glyphs.turn_end),
+        Style::default().fg(theme.border),
+    ));
     out.push(Line::default());
 }
 
-fn more_rows(rest: usize, theme: Theme, width: usize) -> Line<'static> {
+fn more_rows(rest: usize, theme: Theme, width: usize, rail: &str) -> Line<'static> {
     let text = format!(
-        "  {} {} more line{} · Ctrl+O or click to open",
+        "{} {} more line{} · Ctrl+O",
         theme.glyphs.ellipsis,
         rest,
         if rest == 1 { "" } else { "s" }
     );
-    Line::from(clip_spans(
-        vec![Span::styled(text, Style::default().fg(theme.faint))],
-        width,
-    ))
+    let mut spans = vec![Span::styled(rail.to_string(), Style::default().fg(theme.border))];
+    spans.push(Span::styled(text, Style::default().fg(theme.faint)));
+    Line::from(clip_spans(spans, width))
 }
 
-fn diff_row(line: &str, theme: Theme, style: Style, width: usize) -> Line<'static> {
+fn diff_row(line: &str, theme: Theme, style: Style, width: usize, rail: &str) -> Line<'static> {
     let line = super::theme::sanitize_terminal(line);
-    let prefix = Span::styled(
-        format!("  {} ", theme.glyphs.vbar),
-        Style::default().fg(theme.border),
-    );
-    let inner = width.saturating_sub(4);
+    let rail_w = UnicodeWidthStr::width(rail);
+    let prefix = vec![Span::styled(rail.to_string(), Style::default().fg(theme.border))];
+    let inner = width.saturating_sub(rail_w);
     let shown = if line.chars().count() > inner {
         let mut s: String = line.chars().take(inner.saturating_sub(1)).collect();
         s.push('…');
@@ -766,7 +919,9 @@ fn diff_row(line: &str, theme: Theme, style: Style, width: usize) -> Line<'stati
     } else {
         line
     };
-    Line::from(vec![prefix, Span::styled(shown, style)])
+    let mut spans = prefix;
+    spans.push(Span::styled(shown, style));
+    Line::from(spans)
 }
 
 /// Wrap plain (non-markdown) text preserving line breaks and indentation.
@@ -924,6 +1079,33 @@ mod tests {
     }
 
     #[test]
+    fn user_turn_tint_fills_its_rows() {
+        let theme = Theme::default();
+        let mut t = Transcript::new();
+        t.push_user("a short question");
+        let r = t.rendered(theme, 80);
+        let bg = theme.surface(theme.user, 14);
+        assert_ne!(bg, ratatui::style::Color::Reset, "dark theme tints");
+        // every span of the turn's own row carries the tint, and the row ends
+        // with a run that reaches the reading column's edge
+        let row = r
+            .lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("a short question")))
+            .expect("the turn's row");
+        let last = row.spans.last().expect("a tail run");
+        assert!(
+            last.content.chars().all(|c| c == ' '),
+            "the tint is carried by a blank run: {last:?}"
+        );
+        assert_eq!(last.style.bg, Some(bg));
+        assert!(
+            row.spans.iter().any(|s| s.style.bg == Some(bg)),
+            "the turn's row is tinted"
+        );
+    }
+
+    #[test]
     fn tool_card_matches_start_and_end_by_id() {
         let theme = Theme::default();
         let mut t = Transcript::new();
@@ -975,9 +1157,10 @@ mod tests {
             let r = t.rendered(theme, 80);
             text_of(&r.lines).clone()
         };
-        assert!(collapsed.contains("more lines · Ctrl+O"));
-        // the fold marker is the card's affordance, drawn before the tool name
-        assert!(collapsed.contains("▸ run_command"), "{collapsed}");
+        assert!(collapsed.contains("more lines · Ctrl+O"), "{collapsed}");
+        // the fold marker is the card's affordance, drawn before the tool
+        // name (inside the card's corner)
+        assert!(collapsed.contains("╭▸ ✓ run_command"), "{collapsed}");
         assert!(!collapsed.contains("line 30"));
         let idx = t.entries.len() - 1;
         assert_eq!(t.toggle_entry(idx), Some(true));

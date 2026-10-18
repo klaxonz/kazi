@@ -6,6 +6,56 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: MINOR = feature batch, PATCH = fixes only — see docs/VERSIONING.md).
 
+## [Unreleased]
+
+The workspace, redesigned: one reading column, turn-shaped transcripts, and an
+`Esc` that reads instead of quitting.
+
+### Changed
+
+- **A two-line session bar.** Line 1 carries identity, permission, session,
+  effort preset and the context gauge; line 2 carries the model, the working
+  directory and the live activity readout. The gauge is measured first and the
+  left facts are dropped whole when they do not fit — it can no longer
+  overprint them. Below 50 columns the gauge degrades to a bare percentage
+  instead of disappearing.
+- **A reading column (96 columns, centred).** The transcript, plan rail,
+  composer, welcome deck and command dropdown all share it, so a wide terminal
+  gets margins rather than 200-column paragraphs.
+- **Turns have shape.** User turns are tinted bands; tool calls are folded
+  rails (`╭▸ ✓ run_file src/x.rs · 0.1s` / `│ …` / `╰`) instead of flat lines.
+  Output follows the rail, error cards keep their red, and the overflow line
+  says how many rows were folded (`… 26 more lines · Ctrl+O`).
+- **The composer is a ruled prompt**, not a bordered box: a hairline carries
+  `ready` / `working` / `N queued` / `approval pending` / `browsing`, and a
+  note explains what `Enter` does in the current state. The footer is a rule
+  plus hints that never end mid-word.
+- **The welcome deck** replaces the welcome panel: a tinted band with three
+  numbered starters sized to the workspace, and command rows that drop whole
+  rather than ellipsizing.
+- **Command dropdown** hangs above the composer's rule in the reading column,
+  measures its help column by remaining width (not half the screen), scrolls
+  to keep the selection visible, and pads commands by display width.
+
+### Added
+
+- **Browse mode.** `Esc` from an empty prompt now moves the keyboard to the
+  transcript instead of quitting: `j`/`k` walk tool cards, `g`/`G` jump to
+  ends, `o`/`space` folds, `y` copies the focused card, `n` copies the newest
+  answer, `i`/`Enter` returns to typing, `q`/`Ctrl+C` quits. The focused card
+  is tinted; the composer and footer both say `browsing`.
+- **A follow-the-tail pill**: while scrolled up, `↓ N new · Ctrl+End` floats on
+  the last transcript row and is clickable.
+- Theme surface tints (`Theme::surface`) so bands sit *behind* text on every
+  palette, including a weight-only mono theme.
+
+### Tests
+
+`cargo test` — 311 passing (was 303): two-line header degradation, browse-mode
+navigation, the new-output pill, user-turn tint coverage, and dropdown width
+handling, alongside the existing suite. `docs/tui/` frames regenerated for all
+seven scenarios at six terminal sizes.
+
 ## [0.26.0] - 2026-10-17
 
 Profiles and the library surface: one config, many setups — and a promise for

@@ -94,6 +94,12 @@ pub struct Glyphs {
     /// Tool card opened / folded (the card's own affordance).
     pub fold_open: &'static str,
     pub fold_closed: &'static str,
+    /// Turn corners of a folded tool rail (╭ title, │ body, ╰ end).
+    pub turn_top: &'static str,
+    pub turn_mid: &'static str,
+    pub turn_end: &'static str,
+    /// Suggestion row marker in the welcome deck.
+    pub arrow: &'static str,
 }
 
 const UNICODE: Glyphs = Glyphs {
@@ -108,6 +114,10 @@ const UNICODE: Glyphs = Glyphs {
     bar_empty: "░",
     fold_open: "▾",
     fold_closed: "▸",
+    turn_top: "╭",
+    turn_mid: "│",
+    turn_end: "╰",
+    arrow: "›",
 };
 
 const ASCII: Glyphs = Glyphs {
@@ -122,6 +132,10 @@ const ASCII: Glyphs = Glyphs {
     bar_empty: ".",
     fold_open: "v",
     fold_closed: ">",
+    turn_top: "+",
+    turn_mid: "|",
+    turn_end: "+",
+    arrow: ">",
 };
 
 /// The full palette for one theme.
@@ -448,6 +462,31 @@ impl Theme {
             self.warn
         } else {
             self.ok
+        }
+    }
+
+    /// A tint of `base` for a band that must read as *behind* the transcript:
+    /// user turns, the welcome deck, the composer's "armed" state. Pulling the
+    /// accent toward the page colour keeps a 10-row tint calm instead of
+    /// shouting, and mono (where every colour is `Reset`) stays weight-only.
+    pub fn surface(self, base: Color, amount: u16) -> Color {
+        if self.name == ThemeName::Mono {
+            return Color::Reset;
+        }
+        let page = match self.name {
+            ThemeName::Light | ThemeName::Solarized => (0xee, 0xf1, 0xf6),
+            _ => (0x18, 0x1b, 0x24),
+        };
+        match base {
+            Color::Rgb(r, g, b) => {
+                let mix = |c: u8, p: u8| {
+                    let c = c as u32;
+                    let p = p as u32;
+                    ((c * amount as u32 + p * (100 - amount as u32)) / 100) as u8
+                };
+                Color::Rgb(mix(r, page.0), mix(g, page.1), mix(b, page.2))
+            }
+            other => other,
         }
     }
 }

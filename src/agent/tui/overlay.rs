@@ -44,8 +44,20 @@ pub const KEY_BINDINGS: &[(&str, &str)] = &[
         "space / a / n",
         "review: toggle file · accept all · reject all",
     ),
-    ("Esc", "close overlay · interrupt a run · quit when idle"),
-    ("Ctrl+C", "quit"),
+    (
+        "Esc",
+        "stop composing and browse the transcript (q quits from there)",
+    ),
+    (
+        "j / k · g / G",
+        "browse: next / previous card · first / newest",
+    ),
+    (
+        "o / y / n",
+        "browse: fold the focused card · copy it · copy the answer",
+    ),
+    ("i / Enter", "browse: back to typing"),
+    ("q", "quit (Ctrl+C also quits)"),
     ("y / a / n", "approval: once / always this command / deny"),
     ("r", "approval: deny and type a reason for the model"),
 ];

@@ -147,22 +147,43 @@ a log:
   `write_file`/`apply_patch` show a coloured unified diff
   with `+added`/`−removed` counts instead of "wrote N bytes", and `/diff` opens
   the newest patch in a full-screen, scrollable reader (`c` copies it).
-- **A header that answers questions**: permission mode, provider/model,
-  session, and a context gauge with percentage that turns yellow near the
-  budget and red before auto-compaction. A live spinner, elapsed seconds and
-  per-round token counts appear while a task runs; after Esc it says
-  `cancelling…`, and the footer keeps the last task's duration. The bar is
-  width-aware: facts are added in priority order and the one that does not fit
-  is dropped whole rather than cut into `deeps…`; below ~84 columns the gauge
-  becomes `73% ctx`.
-- **One screen, four bands.** Header (1 row) · plan rail (1 row) · conversation
-  (the rest) · composer and footer. The model's checklist is a single rail —
-  `plan 2/4 ✓ read ✓ reproduce ❯ patch +1` — instead of one row per step, so a
-  20-row terminal still shows the conversation. Footer hints are chosen to fit
-  and never end in half a word; the right end of the footer carries only what
-  is true right now (a running job, queued follow-ups, a paused tail). A fresh
-  session opens on a welcome panel — where you are, which model, four useful
-  commands, three example tasks — instead of an empty screen.
+- **A two-line session bar.** The first line answers "where am I and how much
+  room is left": `kazi │ edit`, the session name, the effort preset, and a
+  context gauge that turns yellow near the budget and red before
+  auto-compaction. The second answers "what is doing the work": the model
+  (the endpoint only when it fits whole), the working directory, and — while a
+  task runs — a spinner, elapsed seconds, round, tokens and cost. Every fact is
+  all-or-nothing: the gauge is measured first and a fact that does not fit is
+  dropped whole rather than cut into `deeps…`. Below ~50 columns the gauge
+  degrades to a bare percentage, which is never dropped.
+- **A reading column.** Prose is capped at 96 columns and centred, so a 200-
+  column terminal gets margins instead of unreadable long lines. The plan rail,
+  transcript, composer and command dropdown all share that column, so the
+  screen reads as one column of thought rather than three competing layouts.
+- **Turns have shape.** A user turn is a quiet tinted band with a `❯` corner;
+  answers are plain markdown prose; a tool call is a folded rail —
+  `╭▸ ✓ run_file src/x.rs · 0.1s` with its output hanging off `│` and closed by
+  `╰` — so a card reads as *inside* the conversation instead of as a new
+  section. `Ctrl+O` expands everything, `Ctrl+E` the newest card, and clicking
+  a card toggles it. `write_file`/`apply_patch` show a coloured unified diff
+  with `+added`/`−removed` counts, and `/diff` opens the newest patch in a
+  full-screen, scrollable reader (`c` copies it).
+- **Bands, not boxes.** Header · plan rail (one row, with a progress meter) ·
+  transcript · composer · footer. The composer is a *ruled prompt*: one
+  hairline carries its state (`ready` / `working` / `N queued` / `browsing`),
+  the text hangs off a lit `❯`, and a note underneath says what `Enter` will do
+  right now. The footer is a quiet rule plus hints chosen to fit — it never
+  ends in half a word — and its right end carries only what is true right now
+  (a running job, queued follow-ups, a paused tail). A fresh session opens on
+  a tinted welcome deck — what this is, where it points, three numbered
+  starters, and the four commands that matter — instead of an empty screen.
+- **Browse mode.** `Esc` no longer quits from an empty prompt; it moves the
+  keyboard into the transcript so you can read without leaving. `j`/`k` step
+  through tool cards, `g`/`G` jump to the first/newest, `o` or `space` folds
+  the focused card, `y` copies it, `n` copies the newest answer, `i` or `Enter`
+  returns to typing, and `q` (or `Ctrl+C`) leaves the session. While you are
+  scrolled up, a floating `↓ N new · Ctrl+End` pill sits on the last row —
+  click it to re-follow the tail.
 - **The input stays yours.** Click anywhere in the composer to put the caret
   there; `Ctrl+Z`/`Ctrl+Y` undo and redo an editing run, `Ctrl+←/→` move by
   word, `Ctrl+Delete`/`Ctrl+Backspace` delete one. `Enter` while the agent is
@@ -170,8 +191,9 @@ a log:
   when the task ends; `/queue` lists, drops or clears them. `Ctrl+J` starts a
   new line, the box grows to six rows, `↑/↓` walks input history (or lines
   inside a multi-line task), and pasting a block keeps it as one task.
-- **The transcript stays usable.** Scrolling up pauses follow-the-tail and the
-  footer reports `↓ N new` while output keeps arriving; `Ctrl+End` returns.
+- **The transcript stays usable.** Scrolling up pauses follow-the-tail, the
+  footer says `paused`, and the floating pill counts new rows; `Ctrl+End` or a
+  click on the pill returns.
   Right-clicking any entry copies its text.
 
 Keys: `Enter` send · `Ctrl+J` newline · `/` command dropdown · `Tab` completes
@@ -182,9 +204,9 @@ help overlay · `Ctrl+F` transcript search (`F3`/`Shift+F3` repeat it) ·
 preview pane on wide terminals) · `Ctrl+O` full tool output · `Ctrl+E` expand
 newest card · `Ctrl+T` cycle theme · `Ctrl+Z/Y` undo/redo input · `Ctrl+←/→`
 word motion · `PgUp/PgDn` or the mouse wheel scroll (`Ctrl+Home/End` jump) ·
-`Shift+Tab` cycles permission mode · `Esc` closes an overlay, clears a
-half-typed task, interrupts a running one, or quits from an empty prompt ·
-`Ctrl+C` quits. Approval prompts take `y` (once), `a` (always this exact
+`Shift+Tab` cycles permission mode · `Esc` closes an overlay or interrupts a
+running task; from an empty prompt it enters **browse mode** (see above), where
+`i` returns to typing and `q` quits · `Ctrl+C` quits from anywhere. Approval prompts take `y` (once), `a` (always this exact
 command, for the session), `n`/`Esc` (deny), or `r` to deny with a reason the
 model can act on; `PgUp/PgDn` scroll a long command, destructive shapes get a
 red warning line, and `/allow` shows or clears session approvals. The mouse

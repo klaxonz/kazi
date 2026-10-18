@@ -1,20 +1,20 @@
- kazi  edit · deepseek/deepseek-chat              14% ctx   
-  ❯ type a task in your own words and press Enter           
+ kazi  │ edit  fix-flaky-test                           14% 
+ deepseek/deepseek-chat · https://api.deepseek.com/v1       
+  kazi  a coding agent that reads, runs, and edits with you 
                                                             
-  • D:/Code/init/kazi  deepseek/deepseek-chat               
+  │ D:/Code/init/kazi  deepseek/deepseek-chat               
+                                                            
+  › 1  explain the layout of this project                   
+  › 2  find and fix the failing test                        
+  › 3  run the tests and summarise failures                 
                                                             
   /model      pick a provider and model together            
   /sessions   reopen an earlier conversation                
   /permission decide what kazi may do                       
   /help       every key and command                         
                                                             
-  try: explain src/main.rs · fix the failing test · run …   
+───────────────────────────────────────────────────── ready 
+❯ ask kazi to change code, run a command, or explain…       
                                                             
-                                                            
-                                                            
-                                                            
-                                                            
-┌ / command ───────────────────────────────────────────────┐
-│❯ ask kazi to change code, run a command, or explain some…│
-└──────────────────────────────────────────────────────────┘
- Enter send  / commands  Ctrl+K palette  Ctrl+R sessions    
+────────────────────────────────────────────────────────────
+  Enter send  / commands  Ctrl+K palette  Ctrl+R sessions   

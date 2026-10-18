@@ -8,17 +8,18 @@ Regenerate with:
 KAZI_TUI_SNAPSHOT=1 cargo test tui_snapshots
 ```
 
-The test is opt-in so a normal `cargo test` never writes files. Compare a change by regenerating before and after, or by diffing the committed frames.
+The test is opt-in so a normal `cargo test` never writes files. Compare a change by regenerating before and after and diffing the frames: a layout regression shows up as a changed line.
 
 | scenario | what it shows |
 |---|---|
-| `idle` | a fresh session: the welcome panel |
-| `working` | plan rail, tool cards, live header, queued composer |
-| `long` | a scrolled transcript with the paused-tail footer |
+| `idle` | a fresh session: the tinted welcome deck |
+| `working` | plan meter, folded tool rails, two-line session bar, ruled composer |
+| `long` | a scrolled transcript in the reading column |
 | `help` | the help overlay, hanging-indented wrap |
 | `approval` | the approval prompt with its risk note |
 | `palette` | the Ctrl+K command palette |
 | `diff` | the diff reader hugging its content |
+| `browse` | browse mode: a focused card, the new-output pill |
 
 
 `idle`: [60x20](idle-60x20.txt) · [80x24](idle-80x24.txt) · [100x30](idle-100x30.txt) · [120x34](idle-120x34.txt) · [140x40](idle-140x40.txt) · [160x44](idle-160x44.txt)
@@ -34,3 +35,5 @@ The test is opt-in so a normal `cargo test` never writes files. Compare a change
 `palette`: [60x20](palette-60x20.txt) · [80x24](palette-80x24.txt) · [100x30](palette-100x30.txt) · [120x34](palette-120x34.txt) · [140x40](palette-140x40.txt) · [160x44](palette-160x44.txt)
 
 `diff`: [60x20](diff-60x20.txt) · [80x24](diff-80x24.txt) · [100x30](diff-100x30.txt) · [120x34](diff-120x34.txt) · [140x40](diff-140x40.txt) · [160x44](diff-160x44.txt)
+
+`browse`: [60x20](browse-60x20.txt) · [80x24](browse-80x24.txt) · [100x30](browse-100x30.txt) · [120x34](browse-120x34.txt) · [140x40](browse-140x40.txt) · [160x44](browse-160x44.txt)

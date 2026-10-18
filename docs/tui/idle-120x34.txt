@@ -1,19 +1,17 @@
- kazi  edit · deepseek/deepseek-chat · https://api.deepseek.com/v1 · fix-flaky-test          █░░░░░░░  14% 8.4k / 60k   
-  ❯ type a task in your own words and press Enter                                                                       
+ kazi  │ edit  fix-flaky-test                                                                     14% █░░░░░░░ 8.4k/60k 
+ deepseek/deepseek-chat · https://api.deepseek.com/v1  D:/Code/init/kazi                                                
+             kazi  a coding agent that reads, runs, and edits with you                                                  
                                                                                                                         
-  • D:/Code/init/kazi  deepseek/deepseek-chat                                                                           
+             │ D:/Code/init/kazi  deepseek/deepseek-chat                                                                
                                                                                                                         
-  /model      pick a provider and model together                                                                        
-  /sessions   reopen an earlier conversation                                                                            
-  /permission decide what kazi may do                                                                                   
-  /help       every key and command                                                                                     
+             › 1  explain the layout of this project                                                                    
+             › 2  find and fix the failing test                                                                         
+             › 3  run the tests and summarise failures                                                                  
                                                                                                                         
-  try: explain src/main.rs · fix the failing test · run the test suite                                                  
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
+             /model      pick a provider and model together                                                             
+             /sessions   reopen an earlier conversation                                                                 
+             /permission decide what kazi may do                                                                        
+             /help       every key and command                                                                          
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -28,7 +26,9 @@
                                                                                                                         
                                                                                                                         
                                                                                                                         
-┌ / command ───────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│❯ ask kazi to change code, run a command, or explain something…                                                       │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
- Enter send  / commands  Ctrl+K palette  Ctrl+R sessions  Ctrl+O details  Ctrl+F find  F1 help  Esc quit                
+                                                                                                                        
+            ───────────────────────────────────────────────────────────────────────────────────────── ready             
+            ❯ ask kazi to change code, run a command, or explain…                                                       
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Enter send  / commands  Ctrl+K palette  Ctrl+R sessions  Ctrl+O details  Ctrl+F find  F1 help  Esc browse             
