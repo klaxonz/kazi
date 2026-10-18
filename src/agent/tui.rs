@@ -43,9 +43,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-};
+use ratatui::widgets::{Block, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::{Frame, Terminal};
 
 use super::{Agent, AgentEvent};
@@ -1623,10 +1621,7 @@ impl Screen {
         ];
         if headline_w <= width {
             headline.push(Span::styled("  ", Style::default()));
-            headline.push(Span::styled(
-                SUBTITLE,
-                Style::default().fg(theme.text),
-            ));
+            headline.push(Span::styled(SUBTITLE, Style::default().fg(theme.text)));
         }
         lines.push(Line::from(headline));
         lines.push(Line::from(Span::raw(" ".repeat(width))));
@@ -2116,9 +2111,7 @@ impl Screen {
             first = false;
             spans.push(Span::styled(format!("{mark} "), Style::default().fg(color)));
             let text_style = match status.as_str() {
-                "in_progress" => Style::default()
-                    .fg(theme.text)
-                    .add_modifier(Modifier::BOLD),
+                "in_progress" => Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
                 "completed" => Style::default()
                     .fg(theme.faint)
                     .add_modifier(Modifier::CROSSED_OUT),
@@ -2307,7 +2300,10 @@ impl Screen {
                 Style::default().fg(theme.accent),
             )
         } else if self.has_approval() {
-            ("approval pending".to_string(), Style::default().fg(theme.warn))
+            (
+                "approval pending".to_string(),
+                Style::default().fg(theme.warn),
+            )
         } else if self.busy {
             (
                 if self.queued.is_empty() {
@@ -2333,10 +2329,7 @@ impl Screen {
                 Span::styled(dash.repeat(fill), rule_style),
                 Span::styled(format!(" {state} "), state_style),
             ])),
-            Rect {
-                height: 1,
-                ..band
-            },
+            Rect { height: 1, ..band },
         );
 
         // text block: everything between the rule and the footer note
@@ -2447,7 +2440,10 @@ impl Screen {
         // vs. interrupt is the one ambiguity a multi-line composer creates.
         if note_rows > 0 {
             let note = if self.has_approval() {
-                ("y allow · a always · n deny · r reason".to_string(), theme.warn)
+                (
+                    "y allow · a always · n deny · r reason".to_string(),
+                    theme.warn,
+                )
             } else if self.busy {
                 (
                     "Enter queues · Esc interrupts · Ctrl+J newline".to_string(),
@@ -2460,8 +2456,7 @@ impl Screen {
                 )
             } else {
                 (
-                    "Enter sends · Ctrl+J newline · / commands · @file attaches"
-                        .to_string(),
+                    "Enter sends · Ctrl+J newline · / commands · @file attaches".to_string(),
                     theme.faint,
                 )
             };
@@ -2571,10 +2566,7 @@ impl Screen {
                 theme.glyphs.hbar.repeat(area.width as usize),
                 Style::default().fg(theme.border),
             ))),
-            Rect {
-                height: 1,
-                ..area
-            },
+            Rect { height: 1, ..area },
         );
         let line_area = Rect {
             y: area.y + 1,
@@ -6409,7 +6401,8 @@ mod tests {
     fn browse_mode_walks_cards_and_returns_to_typing() {
         let mut s = test_screen();
         for i in 0..3 {
-            s.transcript.start_tool(format!("t{i}"), "read_file", format!("f{i}.rs"));
+            s.transcript
+                .start_tool(format!("t{i}"), "read_file", format!("f{i}.rs"));
             s.transcript
                 .finish_tool(&format!("t{i}"), "read_file", false, "contents", None, 5);
         }
@@ -6456,11 +6449,14 @@ mod tests {
     fn pill_reports_new_rows_and_is_clickable() {
         let mut s = test_screen();
         for i in 0..3 {
-            s.transcript.start_tool(format!("t{i}"), "run_command", format!("cmd {i}"));
-            s.transcript.finish_tool(&format!("t{i}"), "run_command", false, "ok", None, 200);
+            s.transcript
+                .start_tool(format!("t{i}"), "run_command", format!("cmd {i}"));
+            s.transcript
+                .finish_tool(&format!("t{i}"), "run_command", false, "ok", None, 200);
         }
         for i in 0..12 {
-            s.transcript.push_notice(Level::Info, format!("filler line {i}"));
+            s.transcript
+                .push_notice(Level::Info, format!("filler line {i}"));
         }
         s.browse.set(true);
         s.focus.set(Some(1));
@@ -7196,7 +7192,11 @@ mod tests {
         std::fs::create_dir_all(dir).unwrap();
         // (name, paint function, one-line description for the index)
         let scenarios: Vec<(&str, Snapshot, &str)> = vec![
-            ("idle", snap_idle, "a fresh session: the tinted welcome deck"),
+            (
+                "idle",
+                snap_idle,
+                "a fresh session: the tinted welcome deck",
+            ),
             (
                 "working",
                 snap_working,

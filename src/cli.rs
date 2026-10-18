@@ -826,7 +826,7 @@ fn read_line_hidden(out: &mut String) -> std::io::Result<()> {
         // termios echo toggle, no external crate
         use std::os::fd::AsRawFd;
         let fd = std::io::stdin().as_raw_fd();
-        let mut t: libc_termios = unsafe { std::mem::zeroed() };
+        let mut t: Termios = unsafe { std::mem::zeroed() };
         unsafe { tcgetattr(fd, &mut t) };
         let saved = t;
         t.c_lflag &= !ECHO;
@@ -855,6 +855,7 @@ mod windows_hidden {
 mod libc_termios_shim {
     // termios via libc types re-declared locally to avoid a dependency
     #[repr(C)]
+    #[derive(Clone, Copy)]
     pub struct Termios {
         pub c_iflag: u32,
         pub c_oflag: u32,

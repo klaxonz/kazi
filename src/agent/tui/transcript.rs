@@ -401,7 +401,11 @@ impl Transcript {
             if actionable(i) {
                 return Some(i);
             }
-            idx = if forward { Some(i + 1) } else { i.checked_sub(1) };
+            idx = if forward {
+                Some(i + 1)
+            } else {
+                i.checked_sub(1)
+            };
         }
         None
     }
@@ -605,12 +609,7 @@ pub fn column(width: usize) -> (usize, usize) {
 /// text stops mid-row and looks torn. Each row is therefore: the page margin
 /// (no tint) → one run that carries the tint from the band's left edge past
 /// the text → the turn's own spans on top of it, with their foreground kept.
-fn banded(
-    lines: Vec<Line<'static>>,
-    bg: Color,
-    indent: usize,
-    width: usize,
-) -> Vec<Line<'static>> {
+fn banded(lines: Vec<Line<'static>>, bg: Color, indent: usize, width: usize) -> Vec<Line<'static>> {
     let band_w = width.saturating_sub(indent);
     lines
         .into_iter()
@@ -686,9 +685,7 @@ fn render_entry_at(
                         Span::styled(" ".repeat(PAD), Style::default()),
                         Span::styled(
                             theme.glyphs.prompt.to_string(),
-                            Style::default()
-                                .fg(theme.user)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(theme.user).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(" ", Style::default()),
                     ]
@@ -872,8 +869,14 @@ fn render_tool(
             Style::default().fg(theme.dim)
         };
         for line in rows.iter().take(limit) {
-            let prefix = vec![Span::styled(rail.clone(), Style::default().fg(theme.border))];
-            let cont = vec![Span::styled(rail.clone(), Style::default().fg(theme.border))];
+            let prefix = vec![Span::styled(
+                rail.clone(),
+                Style::default().fg(theme.border),
+            )];
+            let cont = vec![Span::styled(
+                rail.clone(),
+                Style::default().fg(theme.border),
+            )];
             let mut wrapped =
                 wrap_plain(line, base, width.saturating_sub(body_indent), prefix, cont);
             out.append(&mut wrapped);
@@ -902,7 +905,10 @@ fn more_rows(rest: usize, theme: Theme, width: usize, rail: &str) -> Line<'stati
         rest,
         if rest == 1 { "" } else { "s" }
     );
-    let mut spans = vec![Span::styled(rail.to_string(), Style::default().fg(theme.border))];
+    let mut spans = vec![Span::styled(
+        rail.to_string(),
+        Style::default().fg(theme.border),
+    )];
     spans.push(Span::styled(text, Style::default().fg(theme.faint)));
     Line::from(clip_spans(spans, width))
 }
@@ -910,7 +916,10 @@ fn more_rows(rest: usize, theme: Theme, width: usize, rail: &str) -> Line<'stati
 fn diff_row(line: &str, theme: Theme, style: Style, width: usize, rail: &str) -> Line<'static> {
     let line = super::theme::sanitize_terminal(line);
     let rail_w = UnicodeWidthStr::width(rail);
-    let prefix = vec![Span::styled(rail.to_string(), Style::default().fg(theme.border))];
+    let prefix = vec![Span::styled(
+        rail.to_string(),
+        Style::default().fg(theme.border),
+    )];
     let inner = width.saturating_sub(rail_w);
     let shown = if line.chars().count() > inner {
         let mut s: String = line.chars().take(inner.saturating_sub(1)).collect();
@@ -1091,7 +1100,11 @@ mod tests {
         let row = r
             .lines
             .iter()
-            .find(|l| l.spans.iter().any(|s| s.content.contains("a short question")))
+            .find(|l| {
+                l.spans
+                    .iter()
+                    .any(|s| s.content.contains("a short question"))
+            })
             .expect("the turn's row");
         let last = row.spans.last().expect("a tail run");
         assert!(
